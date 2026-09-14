@@ -1,0 +1,798 @@
+/* ============================================================
+   Elenvind — 全站样式表（零 JS）
+   风格：仿 hexo-theme-cactus / cactus-white
+   设计语言：纯白底、等宽字体、绿 #2bbc8a 点缀、粉 #d480aa hover、
+             顶部 2px 黑线、虚线分隔、渐变式链接下划线
+   部署：与 favicon.ico 一起放在站点根，由 Nginx 托管
+   ============================================================ */
+
+/* ---------- 主题变量：cactus 色板（浅色 / 深色） ---------- */
+:root {
+    --bg:            #ffffff;
+    --surface:       #ffffff;
+    --text:          #383838;
+    --muted:         #666666;
+    --faint:         #8c8c8c;
+    --border:        #8c8c8c;   /* 虚线/输入框等中性描边 */
+    --line:          #e6e6e6;   /* 极浅分隔线 */
+    --accent:        #2bbc8a;   /* 主绿 */
+    --accent-hover:  #d480aa;   /* 粉：链接 hover */
+    --danger:        #be4678;
+    --ok:            #2a9292;
+    --topline:       #383838;   /* 页面顶部 2px 线 */
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg:            #1b1b1f;
+        --surface:       #202025;
+        --text:          #d8d8d4;
+        --muted:         #a8a8a2;
+        --faint:         #8f8f8a;
+        --border:        #6a6a66;
+        --line:          #333338;
+        --accent:        #4fd6a0;
+        --accent-hover:  #f48fbe;
+        --danger:        #f28b82;
+        --ok:            #4ade80;
+        --topline:       #2bbc8a;
+    }
+}
+
+/* ---------- 手动白/夜切换（/theme 写入 theme Cookie，渲染为 <html data-theme=…>） ----------
+   优先级高于上面的系统偏好：带 data-theme 时以手动选择为准；
+   不带 data-theme（无 Cookie）时仍由 prefers-color-scheme 自动跟随。 */
+html[data-theme="light"] {
+    --bg:            #ffffff;
+    --surface:       #ffffff;
+    --text:          #383838;
+    --muted:         #666666;
+    --faint:         #8c8c8c;
+    --border:        #8c8c8c;
+    --line:          #e6e6e6;
+    --accent:        #2bbc8a;
+    --accent-hover:  #d480aa;
+    --danger:        #be4678;
+    --ok:            #2a9292;
+    --topline:       #383838;
+}
+html[data-theme="dark"] {
+    --bg:            #1b1b1f;
+    --surface:       #202025;
+    --text:          #d8d8d4;
+    --muted:         #a8a8a2;
+    --faint:         #8f8f8a;
+    --border:        #6a6a66;
+    --line:          #333338;
+    --accent:        #4fd6a0;
+    --accent-hover:  #f48fbe;
+    --danger:        #f28b82;
+    --ok:            #4ade80;
+    --topline:       #2bbc8a;
+}
+
+/* ---------- 基础 ---------- */
+* { box-sizing: border-box; }
+
+html {
+    border-top: 2px solid var(--topline);
+    -webkit-text-size-adjust: 100%;
+}
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono",
+                 "Cascadia Mono", "Noto Sans Mono CJK SC", "PingFang SC",
+                 "Microsoft YaHei", monospace;
+    font-size: 14px;
+    line-height: 1.75;
+    font-weight: 400;
+    text-rendering: geometricPrecision;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+}
+
+/* 主内容列：窄栏、居中（对应 cactus .max-width 48rem） */
+main {
+    max-width: 48rem;
+    margin: 0 auto;
+    padding: 2rem 1.5rem 4rem;
+    overflow-wrap: break-word;
+}
+
+@media (max-width: 480px) {
+    main { padding: 1.25rem 1rem 3rem; }
+}
+@media (min-width: 480px) {
+    main p, article p, .comment-body { text-align: justify; }
+}
+
+/* 链接：渐变底纹模拟下划线（cactus 手法），hover 变粉 */
+a {
+    color: var(--text);
+    text-decoration: none;
+    background-image: linear-gradient(transparent, transparent 5px,
+                                      var(--text) 5px, var(--text));
+    background-position: bottom;
+    background-size: 100% 6px;
+    background-repeat: repeat-x;
+    text-underline-offset: 3px;
+}
+a:hover {
+    color: var(--text);
+    background-image: linear-gradient(transparent, transparent 4px,
+                                      var(--accent-hover) 4px, var(--accent-hover));
+}
+/* 链接颜色由父容器语义控制时：绿字 + 绿色下划线 */
+a:not(header a):not(nav a):not(footer a) { color: inherit; }
+
+:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+::selection { background: var(--accent); color: #fff; }
+
+img, video { max-width: 100%; height: auto; }
+
+p, li, td, th, .comment-body { overflow-wrap: break-word; }
+
+/* ---------- 页头（仿 hexo-theme-cactus）：站标+站名一体居左，菜单居右 ---------- */
+header {
+    display: flex;
+    flex-direction: column;
+    flex-wrap: wrap;
+    gap: .5rem 1.2rem;
+    margin: 0 auto 0 0;
+    padding: 1.6rem 1.5rem .9rem;
+}
+
+/* 品牌区：图标与站名组成一个整体链接（cactus #header > a） */
+.header-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: .65rem;
+    min-width: 0;
+    background: none;
+}
+.header-brand:hover { background: none; }
+.header-brand img {
+    width: 2rem;
+    height: 2rem;
+    border-radius: 5px;
+    object-fit: contain;
+    flex: none;
+}
+.header-title {
+    font-family: ui-monospace, Menlo, Consolas, "PingFang SC", monospace;
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: .01em;
+    line-height: 1.35;
+    color: var(--text);
+    background: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 菜单：cactus 风格 —— 小号绿字，项间点状竖线分隔，hover 出绿色下划线（无动画） */
+.header-nav {
+    font-size: .8rem;
+    letter-spacing: .01em;
+}
+.header-nav ul {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+.header-nav li {
+    margin-right: .9rem;
+    padding-right: .9rem;
+    border-right: 1px dotted var(--accent);
+}
+.header-nav li:last-child {
+    margin-right: 0;
+    padding-right: 0;
+    border-right: none;
+}
+.header-nav a:hover {
+    background-image: linear-gradient(transparent, transparent 4px,
+                                      var(--accent) 4px, var(--accent));
+}
+/* 管理员徽章在 .8rem 菜单环境下单独提到可读字号 */
+.header-nav .badge-admin { font-size: .72rem; }
+/* 窄屏菜单换行时去掉竖线，仅留间距 */
+@media (max-width: 560px) {
+    .header-nav li {
+        margin-right: .6rem;
+        padding-right: 0;
+        border-right: none;
+    }
+}
+
+/* ---------- 页脚（cactus：#footer 灰小字、分隔项） ---------- */
+footer {
+    margin: 0 auto;
+    padding: .8rem 1.5rem 2.2rem;
+    max-width: 48rem;
+    color: var(--muted);
+    font-size: .72rem;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: .4rem 1rem;
+}
+footer a {
+    color: var(--muted);
+    text-decoration: underline;
+    background: none;
+}
+footer a:hover { color: var(--accent-hover); }
+.footer-top {
+    text-transform: uppercase;
+    letter-spacing: .12em;
+}
+
+/* ---------- 首页：文章列表（cactus .post-list：日期灰 + 标题） ---------- */
+.article-list h2 { color: var(--accent); }
+
+.article-list ul {
+    list-style: none;
+    margin: .8rem 0 1.5rem;
+    padding: 0;
+}
+.article-list li {
+    display: flex;
+    align-items: baseline;
+    gap: 1rem;
+    padding: .35rem 0;
+}
+@media (max-width: 540px) {
+    .article-list li { display: block; }
+}
+.article-date {
+    flex: none;
+    min-width: 6.5rem;
+    color: var(--muted);
+    font-size: .85rem;
+    font-variant-numeric: tabular-nums;
+}
+@media (max-width: 540px) {
+    .article-date { margin-bottom: .05rem; font-size: .78rem; }
+}
+.article-list li a {
+    color: var(--text);
+    font-weight: 700;
+}
+.article-list li a:hover {
+    background-image: linear-gradient(transparent, transparent 4px,
+                                      var(--accent-hover) 4px, var(--accent-hover));
+}
+
+.pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: .6rem;
+    margin-top: 2rem;
+    color: var(--faint);
+    font-size: .8rem;
+}
+.pagination a { padding: .1rem .2rem; background: none; }
+.pagination a:hover {
+    color: var(--accent);
+    background-image: linear-gradient(transparent, transparent 4px,
+                                      var(--accent) 4px, var(--accent));
+}
+
+/* ---------- 文章正文排版 ---------- */
+article { font-size: .95rem; }
+
+/* 文章标题（第一个 h2）＝ cactus .posttitle：黑、大 */
+article > h2:first-of-type {
+    margin: 0 0 .6rem;
+    color: var(--text);
+    font-size: 1.5em;
+    line-height: 1.3;
+    font-weight: 700;
+}
+.article-meta {
+    margin: .15rem 0;
+    color: var(--faint);
+    font-size: .82rem;
+}
+.article-meta span { text-transform: none; }
+
+/* 正文标题（h2 起）＝ cactus：h2 黑 bold + 绿色 # 前缀；h3 下划线；小标题灰 */
+article h2 {
+    position: relative;
+    margin: 1.8rem 0 .5rem;
+    color: var(--text);
+    font-weight: 700;
+    font-size: 1.15em;
+}
+article h2::before {
+    content: "#";
+    margin-right: .35em;
+    color: var(--accent);
+    font-weight: 700;
+}
+article h3 {
+    margin: 1.4rem 0 .4rem;
+    color: var(--text);
+    text-decoration: underline;
+    text-underline-offset: 4px;
+    font-weight: 700;
+    font-size: .95em;
+}
+article h4, article h5, article h6 {
+    display: inline;
+    margin: .9rem 0 .5rem;
+    color: var(--faint);
+    font-weight: 700;
+    font-size: .85em;
+}
+
+article p { margin: .85rem 0; }
+article ul, article ol { margin: .8rem 0; padding-left: 1.7em; }
+article li { margin: .25rem 0; }
+
+/* 分隔线：cactus 虚线 */
+article hr {
+    border: none;
+    border-top: .5px dashed var(--faint);
+    opacity: .55;
+    margin: 1.6rem auto;
+    width: 100%;
+}
+
+/* 引用：cactus 绿色加粗 + 前导引号 */
+article blockquote {
+    margin: 1rem 10px;
+    padding: .4em 10px;
+    background: none;
+    color: var(--accent);
+    font-weight: 700;
+    quotes: "\201C" "\201D" "\2018" "\2019";
+}
+article blockquote p { margin: .3rem 0; }
+article blockquote::before {
+    content: "\201C";
+    margin-right: .2em;
+    vertical-align: -.35em;
+    font-size: 2em;
+    line-height: .1em;
+    color: var(--accent);
+}
+
+/* 代码：cactus 点线框、无底色 */
+code {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+    padding: 0 5px;
+    border: 1px dotted var(--border);
+    border-radius: 2px;
+    overflow-wrap: break-word;
+}
+p code, li code, td code, th code, blockquote code { font-size: .88em; }
+
+pre {
+    overflow-x: auto;
+    margin: 1.1rem 0;
+    padding: 10px 15px;
+    border: 1px dotted var(--border);
+    border-radius: 4px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.7;
+}
+pre code {
+    display: block;
+    padding: 0;
+    border: none;
+    font-size: inherit;
+}
+
+/* 图片/视频（@{img} / @{video} 输出）：居中、自适应（cactus 惯例） */
+figure { margin: 1.2rem 0; }
+figure img { border-radius: 0; }
+
+/* ---- v2 图片语法：@{img,url[,NN%]} ---- */
+/* --img-gap 是图间间隙常量：解析器生成的 flex-basis 使用同一变量做 calc
+   换算（把间隙从行宽预算中扣除），2 x 50% 的总表现宽度与 1 x 100% 一致。 */
+.img-row {
+    --img-gap: 1rem;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: flex-start;
+    column-gap: var(--img-gap);
+    row-gap: .6rem;
+    margin: 1.2rem 0;
+}
+.img-row figure {
+    margin: 0;
+    flex-shrink: 1;
+    min-width: 0;
+}
+.img-row figure img {
+    display: block;
+    width: 100%;
+    height: auto;
+}
+figure.img-single {
+    text-align: center;
+    margin: 1.2rem 0;
+}
+figure.img-single img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 0 auto;
+}
+
+/* 移动端：并排图改为纵向，每张占满一行 */
+@media (max-width: 700px) {
+    .img-row figure { flex-basis: 100% !important; }
+    .img-row { column-gap: 0; row-gap: .5rem; }
+}
+
+video {
+    display: block;
+    width: 100%;
+    margin: 1.2rem auto;
+    border: 1px dotted var(--border);
+    background: #000;
+}
+
+/* 表格（@{table} 输出）：cactus 风格——细、表头虚线、无底色条纹 */
+article table {
+    display: block;
+    overflow-x: auto;
+    width: 100%;
+    margin: 1.2rem 0;
+    border-collapse: collapse;
+    font-size: 12px;
+    text-align: left;
+}
+article th {
+    padding: 8px;
+    border-bottom: 1px dashed var(--border);
+    color: var(--text);
+    font-weight: 700;
+    font-size: 13px;
+    white-space: nowrap;
+}
+article td {
+    padding: 4px 8px;
+    border-bottom: 1px dotted var(--line);
+}
+/* 表格对齐（解析器输出 cell-left/center/right 类，替代内联 style） */
+article th.cell-left,  article td.cell-left  { text-align: left; }
+article th.cell-center, article td.cell-center { text-align: center; }
+article th.cell-right, article td.cell-right { text-align: right; }
+
+/* 脚注 */
+sup.footnote-ref a {
+    font-size: .72em;
+    color: var(--accent);
+    background: none;
+}
+sup.footnote-ref a:hover { color: var(--accent-hover); }
+
+section.footnotes {
+    margin-top: 2.4rem;
+    padding-top: .6rem;
+    border-top: 1px dotted var(--border);
+    font-size: .8rem;
+    color: var(--muted);
+}
+section.footnotes h2 { color: var(--accent); font-size: .95em; }
+section.footnotes ol { padding-left: 1.5em; }
+section.footnotes li { margin: .2rem 0; }
+a.footnote-backref { color: var(--muted); background: none; }
+a.footnote-backref:hover { color: var(--accent-hover); }
+li[id^="fn-"]:target, sup:target {
+    background: var(--line);
+    scroll-margin-top: 2rem;
+}
+
+/* ---------- 评论区（扁平化：无卡片、虚线分隔、cactus 配色） ---------- */
+.comments { margin-top: 3rem; scroll-margin-top: 1.5rem; }
+.comments h2 {
+    color: var(--accent);
+    font-size: 1.15em;
+    padding-bottom: .3rem;
+    border-bottom: 1px dashed var(--border);
+}
+
+.comment {
+    margin: .8rem 0 0;
+    padding: .7rem .1rem .5rem;
+    border-bottom: 1px dotted var(--line);
+}
+.comment-reply {
+    margin-left: 1.5rem;
+    font-size: .92em;
+}
+.comment .meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: .4rem 1rem;
+    color: var(--muted);
+    font-size: .8rem;
+}
+.comment-actions {
+    display: flex;
+    align-items: center;
+    gap: .9rem;
+}
+
+.badge-admin {
+    margin-left: .5rem;
+    color: var(--accent);
+    font-size: .72em;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    border: 1px dotted var(--accent);
+    border-radius: 3px;
+    padding: 0 .35em;
+}
+
+.comment-body { margin: .3rem 0 0; line-height: 1.75; }
+.reply-to { color: var(--faint); }
+.comment-content { white-space: normal; }
+.comment-content.is-deleted { text-decoration: line-through; }
+.comment-form { display: inline; }   /* 删除/恢复表单与 Reply 链接同排 */
+
+/* 评论操作：链接化按钮，套用链接皮肤 */
+.comment-actions button {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    font-size: .82rem;
+    cursor: pointer;
+    background-image: linear-gradient(transparent, transparent 5px,
+                                      var(--muted) 5px, var(--muted));
+    background-position: bottom;
+    background-size: 100% 6px;
+    background-repeat: repeat-x;
+}
+.comment-actions button:hover { color: var(--danger); }
+button.delete-link { color: var(--danger); }
+button.restore-link { color: var(--ok); }
+a.reply-link {
+    color: var(--accent);
+    background: none;
+    font-size: .82rem;
+}
+a.reply-link:hover {
+    background-image: linear-gradient(transparent, transparent 4px,
+                                      var(--accent-hover) 4px, var(--accent-hover));
+}
+
+.comments h3 { color: var(--accent); margin: 1.6rem 0 .4rem; }
+
+/* 表单控件：cactus search-input 风格 */
+textarea {
+    width: 100%;
+    min-height: 6rem;
+    padding: 4px 7px;
+    font: inherit;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--faint);
+    border-radius: 4px;
+    resize: vertical;
+}
+textarea:focus, input:focus {
+    border-color: var(--accent);
+    outline: none;
+}
+form label { display: block; margin: .7rem 0 .2rem; font-size: .9rem; }
+form input[type="text"],
+form input[type="email"],
+form input[type="password"] {
+    width: 100%;
+    max-width: 26rem;
+    padding: 4px 7px;
+    font: inherit;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--faint);
+    border-radius: 4px;
+}
+
+/* 按钮：白底细框（cactus 无实心按钮），hover 绿 */
+button[type="submit"] {
+    margin-top: .8rem;
+    padding: .3rem 1.1rem;
+    font: inherit;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--faint);
+    border-radius: 4px;
+    cursor: pointer;
+}
+button[type="submit"]:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+/* 正文里的链接样按钮（如 /user 页 Logout） */
+button.text-link-button {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    font-size: .9rem;
+    color: var(--text);
+    cursor: pointer;
+    background-image: linear-gradient(transparent, transparent 5px,
+                                      var(--text) 5px, var(--text));
+    background-position: bottom;
+    background-size: 100% 6px;
+    background-repeat: repeat-x;
+}
+button.text-link-button:hover {
+    background-image: linear-gradient(transparent, transparent 4px,
+                                      var(--accent-hover) 4px, var(--accent-hover));
+}
+
+/* 个人中心区块标题 */
+main section { margin: 1.6rem 0; }
+main section h2 {
+    color: var(--accent);
+    font-size: 1.05em;
+    margin: 0 0 .3rem;
+    padding-bottom: .2rem;
+    border-bottom: 1px dashed var(--border);
+}
+
+/* ---------- 通用页面标题（cactus：h1 绿） ---------- */
+main > h1 {
+    color: var(--accent);
+    font-size: 1.5em;
+    letter-spacing: .01em;
+    margin: 0 0 1.2rem;
+}
+.article-list h2, .comments h2 { font-size: 1.3em; }
+
+/* 404 等页面的区块标题跟随页面 h1 风格 */
+main > h1, .article-list h2:first-child { margin-top: 0; }
+
+/* ---------- 首页 about 区（cactus 首页：介绍段 + "Find me on" 社交行） ---------- */
+.home-about { margin-top: 0; }   /* 首页首个区块，抵消 main section 顶部的默认大间距 */
+
+/* 社交链接行：图标与文字垂直居中，行内不做两端对齐（避免图标被拉开） */
+.socials { margin: 1.2rem 0 0; text-align: left; }
+.socials a,
+.socials a:hover { background: none; }
+.socials img {
+    width: auto;
+    height: 1.05em;
+    margin: 0 .12em;
+    vertical-align: middle;   /* 图标中心与文字中心对齐，消除高低错落 */
+}
+.socials a:hover img { opacity: .6; }
+
+/* ---------- 首页 Projects 区（cactus .project-list：加粗名称链接 + 描述） ---------- */
+.project-list h2 { font-size: 1.3em; }   /* 与 writing 标题同尺寸（颜色/虚线下框走通用 main section h2） */
+.project-list ul {
+    list-style: none;
+    margin: .5rem 0 0;
+    padding: 0;
+}
+.project-list li { padding: .25rem 0; }
+.project-list a,
+.project-name { font-weight: 700; }
+
+/* ---------- 表单消息条（登录 / 注册 / 个人中心通用） ---------- */
+.form-msg {
+    margin: .2rem 0 1.2rem;
+    padding: .35rem .7rem;
+    border: 1px dotted;
+    border-radius: 4px;
+    font-size: .9rem;
+}
+.form-msg.error { color: var(--danger); border-color: var(--danger); }
+.form-msg.success { color: var(--ok); border-color: var(--ok); }
+
+/* ---------- 字段网格（/login /register /user 通用）：标签列与控件列对齐 ---------- */
+.field-grid { max-width: 36rem; }
+.field-row {
+    display: grid;
+    grid-template-columns: 11rem minmax(0, 1fr);
+    column-gap: 1rem;
+    align-items: center;
+    padding: .55rem 0;
+    border-bottom: 1px dotted var(--line);
+}
+.field-row:last-child { border-bottom: none; }
+/* 标签列：右对齐灰字；含 hint 时标签与说明在列内纵向排列 */
+.field-label {
+    display: block;
+    margin: 0;                     /* 覆盖 form label 的全局外边距 */
+    text-align: right;
+    color: var(--muted);
+    font-size: .9rem;
+}
+.field-label label { margin: 0; }
+.field-hint {
+    display: block;
+    font-size: .72rem;
+    color: var(--faint);
+}
+/* 控件列：取值/长文本可换行，输入框占满单元格 */
+.field-value { min-width: 0; overflow-wrap: anywhere; }
+.field-row input { max-width: none; }
+
+/* 表单底部操作行（按钮 / 登出伪链接） */
+.field-action { margin: 1rem 0 0; }
+.field-action button[type="submit"],
+.field-action .text-link-button { margin-top: 0; }
+
+/* 危险操作区（删除账号）：红虚线框 + 红色按钮；支持 details 折叠面板形态 */
+section.danger-zone,
+details.danger-zone {
+    border: 1px dotted var(--danger);
+    border-radius: 4px;
+    padding: .2rem 1.1rem 1rem;
+}
+section.danger-zone h2,
+details.danger-zone > summary h2 {
+    color: var(--danger);
+    border-color: var(--danger);
+}
+.danger-note { margin: .3rem 0 .6rem; font-size: .9rem; color: var(--muted); }
+button[type="submit"].btn-danger { color: var(--danger); border-color: var(--danger); }
+button[type="submit"].btn-danger:hover {
+    color: var(--bg);
+    background: var(--danger);
+    border-color: var(--danger);
+}
+
+/* ---------- 可折叠面板（/user 页三区块，details/summary 零 JS） ---------- */
+details.panel { margin: 1.6rem 0; }
+details.panel > summary {
+    list-style: none;            /* 去掉浏览器默认三角 */
+    cursor: pointer;
+    user-select: none;
+}
+details.panel > summary::-webkit-details-marker { display: none; }
+/* 标题与 Profile 区同款：绿字 + 虚线底；前面带 +/− 展开指示符 */
+details.panel > summary h2 {
+    display: block;
+    margin: 0 0 .3rem;
+    padding-bottom: .2rem;
+    border-bottom: 1px dashed var(--border);
+    color: var(--accent);
+    font-size: 1.05em;
+}
+details.panel > summary h2::before {
+    content: "+ ";
+    font-weight: 700;
+}
+details.panel[open] > summary h2::before { content: "− "; }
+
+/* 窄屏：字段行改为标签在上、控件在下 */
+@media (max-width: 560px) {
+    .field-row {
+        grid-template-columns: 1fr;
+        row-gap: .1rem;
+    }
+    .field-label,
+    .field-label label,
+    .field-label .field-hint { text-align: left; }
+    .field-action { margin-top: .8rem; }
+}

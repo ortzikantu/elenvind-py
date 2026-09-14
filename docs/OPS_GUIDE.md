@@ -1,0 +1,131 @@
+# 运维使用指南
+
+面向日常维护：内容管理、用户与评论、日志、数据库、限流与常见问题。
+部署相关见《站点部署指南》，配置文件说明见《配置文件使用指南》。
+
+---
+
+## 一、进程与日志
+
+### 启停
+
+```bash
+# 前台（调试）
+cd /opt/elenvind-py && .venv/bin/python run.py
+
+# systemd（生产）
+sudo systemctl start|stop|restart elenvind
+sudo systemctl status elenvind
+journalctl -u elenvind -n 100 --no-pager      # 看 systemd 侧输出
+```
+
+### 日志文件
+
+- 位置：`logs/app.log`（`[logging].file` 可改），同时输出到控制台；
+- 轮转：单文件 10 MB、保留 5 份（`max_bytes` / `backup_count` 可调）；
+- 级别：默认 `info`；排查问题时临时调 `debug` 可看到文章索引扫描等细节，记得改回；
+- 值得关注的日志：文章/自定义页面解析失败（`error` 级、含文件名）、
+  评论限流命中（`warning` 级、含 user_id/ip/slug）、未捕获异常（`exception` 级完整堆栈）。
+
+## 二、内容管理（热更新，无需重启）
+
+### 文章
+
+- 目录：`articles/`，每篇一个 `.evmd` 文件（文件名即 URL slug），
+  语法与文档头字段见 `docs/EVMD_SPEC.md`；
+- **增、删、改即时生效**：索引按目录文件状态（mtime/size）自动重扫，
+  正文按文件状态缓存，改完保存即可，无需重启；
+- 首页按文档头 `date` 倒序排列（缺 date 视为最早）；
+- 单文件上限 1 MB，超出会拒绝解析并在日志报错；
+- 图片/视频等媒体请放静态托管处，正文里用 `@{img,url}` 方言引用绝对 URL。
+
+### 自定义页面
+
+- 目录：`usrpages/`，文件名即路由（`about.evmd` → `/about`），同样热更新；
+- 页面为纯正文（无文档头），整页渲染为文章排版。
+
+### 静态资源
+
+CSS/图标/图片由 Nginx 托管，与应用无关；同步文件后即可，
+浏览器侧强缓存资源（图片 7 天、CSS 1 小时）想立即看到效果可临时改 URL 加查询串。
+
+## 三、用户与评论
+
+### 管理员
+
+- 数据库中 `id = 1` 的用户即站长：导航带徽章、可删除任意评论、可恢复已删评论；
+- 恢复/删除是**软删除**：访客看到等长方块打码，站长看到删除线，可随时恢复；
+- 物理清除：`python purge.py`（交互式列出软删除评论并按 ID 永久删除，
+  不可恢复，仅建议在确认违规内容后使用）。
+
+### 账号注销（用户自行操作）
+
+- 逻辑删除：昵称清空、登录失效、`is_deleted=1`；其评论保留并显示
+  `deleted_user_nickname`（默认 "Journeyed On"）占位；
+- 被删账号的邮箱不可再注册（占位邮箱隔离 UNIQUE 约束）。
+
+### 会话
+
+- 登录会话 7 天过期；登录会先清除该账号旧会话（防会话固定）；
+- 修改密码 / 注销账号会**立即踢掉该账号全部会话**并清除浏览器 Cookie，
+  表现为"被强制回到登录页"，属预期行为。
+
+## 四、数据库
+
+- 文件：项目根 `sqlite.db`（`ELENVIND_DB` 可覆盖），WAL 模式，启动自动建表/补索引；
+- 备份（WAL 下勿直接拷贝）：
+
+```bash
+sqlite3 sqlite.db ".backup 'backup-2026-01-01.db'"
+```
+
+- 恢复：停服 → 用备份文件替换 `sqlite.db`（同时删除残留的 `-wal`/`-shm`）→ 启动；
+- 主要表：`user`、`session`、`login_attempts`、`comment`、`comment_rate`。
+  不要手工改 `user.password`（PBKDF2 格式 `盐$摘要`）。
+
+## 五、限流策略与误锁处理
+
+| 场景 | 维度与阈值 | 说明 |
+|---|---|---|
+| 登录 | 单邮箱 24h 内 5 次失败 | 主防线，防定向爆破；邮箱匹配不区分大小写 |
+| 登录 | 单 IP 15 分钟 20 次失败 | 短窗口防脚本轮询，NAT 用户不易被长期误锁 |
+| 登录 | 全站 15 分钟 200 次失败 | 分布式爆破最后闸门 |
+| 评论 | 单用户 60 秒 5 条 / 单 IP 60 秒 10 条 | 命中即 429 并写 warning 日志 |
+
+误锁/需要立即解锁（例如家庭 NAT 被他人拖累）：
+
+```bash
+sqlite3 sqlite.db "DELETE FROM login_attempts WHERE email = '你@邮箱.com';"   # 解单账号
+sqlite3 sqlite.db "DELETE FROM login_attempts WHERE ip = '1.2.3.4';"          # 解单 IP
+# 注：登录成功后该账号失败流水自动清除，一般无需手工干预
+```
+
+评论限流窗口仅 60 秒，等一分钟即可，无需处理。
+
+## 六、主题与偏好
+
+- 白/夜切换记录在 `theme` Cookie（1 年），无该 Cookie 时跟随系统 `prefers-color-scheme`；
+- 手动清除方式：浏览器删除站点 Cookie，或访问 `/theme?mode=light|dark` 覆盖；
+- 该 Cookie 与登录会话无关，登出不影响主题选择。
+
+## 七、常见问题（FAQ）
+
+| 现象 | 原因与处理 |
+|---|---|
+| 启动即退出，日志提示 `SECRET_KEY environment variable is not set` | 漏设环境变量；生成随机串后 export（见部署文档） |
+| `Address already in use` | 端口被占：`ss -ltnp | grep 6789`，或改 `[server].port` |
+| 页面 500 | 先看 `logs/app.log` 尾部堆栈：文章语法错误会在日志点名文件；修复即热更新 |
+| 控制台报 CSP 拦截 inline script | 页面本身零脚本；通常是**浏览器扩展**注入被 `script-src 'none'` 正确拦下，忽略即可 |
+| 评论图标/社交图标裂图 | `params.social.icon` 或 `[static]` URL 与 Nginx 实际路径不一致；先 curl 该 URL |
+| 登录后提示 "Too many failed attempts for this account…" | 单邮箱失败 5 次；等 24 小时窗口或按第五节 SQL 清除 |
+| 改了 config.toml 没生效 | 配置非热加载，需重启 |
+| 图片并排错位 | 检查图片行是否用 `@{img,url,NN%}` 方言且各份额和 ≤100（含间隙预算），语法见 EVMD_SPEC |
+| 日期显示不对 | 文章文档头 `date` 请写带时区的 ISO 格式（如 `2026-01-05T10:00:00+08:00`），显示统一为本地 YYYY-MM-DD |
+
+## 八、日常安全检查清单
+
+1. 应用端口未被公网直连（`host=127.0.0.1` 或防火墙）；确认 `trusted_proxies` 只含真实代理；
+2. 全站 HTTPS 可达，登录 Cookie 带 `Secure`；
+3. 定期 `git pull` 跟进安全修复，升级前备份数据库；
+4. 偶尔翻阅 `login_attempts` 里的失败流水是否有异常来源 IP；
+5. 软删除评论积累后跑一次 `purge.py` 清理（可选）。

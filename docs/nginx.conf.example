@@ -1,0 +1,117 @@
+# ============================================================
+# Elenvind 生产部署 Nginx 配置案例（HTTPS 反代 + 静态资源分离）
+#
+# 拓扑假设（与本项目代码的安全边界一一对应）：
+#   浏览器 → Nginx(443/80, 静态资源+反代) → 127.0.0.1:6789 (uvicorn/Elenvind)
+#
+# 目录假设（Nginx 站点根 /var/www/elenvind，按需调整）：
+#   /var/www/elenvind/static/style.css      <- 项目 style.css（对应 config [static].css）
+#   /var/www/elenvind/favicon.ico           <- 项目 favicon.ico（config [static].favicon）
+#   /var/www/elenvind/logo.png              <- 项目 logo.png（config [static].logo）
+#   /var/www/elenvind/assets/pics/...       <- 社交图标等（config 中 icon 相对路径）
+#
+# 重要（与应用代码联动，勿跳过）：
+# 1. 应用侧安全边界假设“直连对端是受信代理（默认 127.0.0.1）才信任 X-Forwarded-*”。
+#    因此 Nginx 必须只在本机回源；生产环境请把 config.toml 的
+#    [server] host 改为 "127.0.0.1"（或保持 0.0.0.0 但用防火墙封闭 6789 的外网访问）。
+# 2. uvicorn 侧已启用 proxy_headers + forwarded_allow_ips=127.0.0.1（run.py），
+#    会依据下方 X-Forwarded-Proto 把请求标记为 https：Secure Cookie、HSTS 自动生效。
+# 3. 安全响应头（CSP/nosniff/COOP 等）已由应用在 HTTP 层统一下发，
+#    Nginx 不要重复添加 CSP（多个 CSP 头会取并集，容易误伤页面样式）。
+# ============================================================
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name example.com;          # ← 改成你的域名
+
+    # HTTP 一律跳 HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
+
+    # Let's Encrypt 证书续期（certbot 用 webroot 模式时保留；用其他方式可删）
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/elenvind;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name example.com;          # ← 改成你的域名
+
+    # ---------- TLS ----------
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;   # ← 证书路径
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # ---------- 基础 ----------
+    server_tokens off;                # 隐藏 Nginx 版本号
+    client_max_body_size 1m;          # 与应用 MAX_BODY_SIZE(1MB) 一致，超限直接 413
+
+    # 访问日志（应用日志在 logs/app.log，这里只管 HTTP 层）
+    access_log /var/log/nginx/elenvind.access.log;
+    error_log  /var/log/nginx/elenvind.error.log;
+
+    # ---------- 静态资源（由 Nginx 直接服务，应用不参与） ----------
+    # 图标 / 图片等带 hash/稳定的资源：长缓存
+    location ~* \.(?:ico|png|jpg|jpeg|webp|gif|svg|woff2?)$ {
+        root /var/www/elenvind;
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+
+    # 样式表：迭代期较短缓存（改完 CSS 记得重命名/刷新即可看到新样式）
+    location ~* \.(?:css)$ {
+        root /var/www/elenvind;
+        expires 1h;
+        add_header Cache-Control "public";
+        try_files $uri =404;
+    }
+
+    # /assets 下其它文件（按需补充 mime，例如 webmanifest 等）
+    location /assets/ {
+        root /var/www/elenvind;
+        expires 7d;
+        add_header Cache-Control "public";
+    }
+
+    # ---------- 反代：全部动态页面与 API 交给 Elenvind ----------
+    # robots.txt / sitemap.xml 也由应用输出（含各自 Cache-Control），一并反代
+    location / {
+        proxy_pass http://127.0.0.1:6789;
+        proxy_http_version 1.1;
+
+        # 透传真实客户端信息；应用只在“直连对端=127.0.0.1”时信任它们
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 应用是纯流式 SSR，无需缓冲调整；超时给足（EVMD 渲染很快，默认即可）
+        proxy_connect_timeout 5s;
+        proxy_read_timeout    30s;
+
+        # 登录/评论等 POST 由应用校验 CSRF；Nginx 不做额外改写
+    }
+}
+
+# ---------- 可选：静态文件压缩（配合上述 location 生效） ----------
+# gzip on;
+# gzip_types text/css application/xml application/javascript image/svg+xml;
+# gzip_min_length 1024;
+
+# ============================================================
+# 上线自检清单（改完配置后逐条确认）：
+#   nginx -t                                    # 语法检查
+#   curl -I https://example.com/                # 200 + 无 server 版本泄露
+#   curl -I https://example.com/robots.txt      # cache-control: public, max-age=3600
+#   curl -s https://example.com/sitemap.xml | head -3
+#   登录页 Set-Cookie 应带 Secure（经 https 访问时）
+#   sqlite.db 备份：sqlite3 sqlite.db ".backup 'backup.db'"（WAL 模式下勿直接拷贝）
+# ============================================================
