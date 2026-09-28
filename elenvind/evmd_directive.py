@@ -23,7 +23,6 @@
 - 图片/视频指令必须独占一行；URL 拼入属性前做 HTML 转义 + 协议白名单。
 - 排版只依赖 .img-row 的 CSS 与行内 flex-basis，响应式覆盖简单可靠。
 """
-import html
 import re
 
 from .evmd_inline import escape_html, safe_url
@@ -34,6 +33,17 @@ _IMG_PCT_RE = re.compile(r'^@\{img,\s*([^,}]+?)\s*,\s*(\d{1,3})\s*%\s*\}$')
 _IMG_PLAIN_RE = re.compile(r'^@\{img,\s*([^,}]+?)\s*\}$')
 # @{video,url}
 _VIDEO_RE = re.compile(r'^@\{video,\s*([^,}]+?)\s*\}$')
+
+# 单行指令的长度上限：真实指令行只有几十字符，超长行直接不匹配，
+# 避免在畸形超长输入上做无意义的正则回溯。
+MAX_DIRECTIVE_LINE = 2048
+
+
+def _esc_url(url: str):
+    """URL 协议白名单校验 + 属性转义；不合法返回 None。"""
+    if not safe_url(url):
+        return None
+    return escape_html(url)
 
 
 def _esc_url(url: str):
@@ -52,6 +62,8 @@ def match_modern_img(line: str):
     旧式对齐参数（left/right/center 等）不再受支持，按普通文本处理。
     """
     line = line.strip()
+    if len(line) > MAX_DIRECTIVE_LINE:
+        return None
     m = _IMG_PCT_RE.match(line)
     if m:
         pct = int(m.group(2))
@@ -132,6 +144,8 @@ def _render_video(url: str) -> str:
 def parse_directive_line(line: str):
     """解析视频指令行；非视频指令返回 None（图片由 match_modern_img 先行处理）。"""
     line = line.strip()
+    if len(line) > MAX_DIRECTIVE_LINE:
+        return None
     m = _VIDEO_RE.match(line)
     if m:
         return _render_video(m.group(1).strip())

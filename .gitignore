@@ -10,3 +10,5 @@ dist/
 *.db
 *.db-*
 logs/
+.testtmp/
+.smoketmp/

@@ -19,7 +19,7 @@ Everything in Chinese, because we're classy like that:
 - [Configuration Guide](docs/CONFIGURATION.md) — every knob in config.toml
 - [Deployment Guide](docs/DEPLOYMENT.md) — systemd, Nginx, HTTPS, backups
 - [Nginx Config Example](docs/nginx.conf.example) — copy, paste, adjust, ship
-- [Ops Guide](docs/OPS_GUIDE.md) — articles, comments, logs, rate limits, FAQ
+- [Ops Guide](docs/OPS_GUIDE.md) — articles, comments, logs, rate limits, tests, FAQ
 
 ## Getting started
 
@@ -35,8 +35,17 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Requires **Python 3.11+** (`tomllib` in the standard library).
+Then copy the template config and edit it before the first run:
+
+```bash
+cp config.example.toml config.toml
+# at minimum: site_url, title, [static] URLs
+```
+
 For CSS, images, and whatnot, you're on your own. Set up Nginx (or equivalent) or a CDN. I can't be bothered.
 Static URLs live in `config.toml` (`[static]` + `params.social.icon`). See the Configuration Guide.
+`config.toml` is validated once at startup: a typo means a refused start with a reason, not a 500 later.
 
 ## Any Tips
 
@@ -66,6 +75,20 @@ sudo certbot certonly --standalone -d yourdomain.com -d www.yourdomain.com
 ```
 
 Serve it forever with systemd, back up the SQLite database with `.backup` (WAL mode, don't raw-copy the file), and go touch grass. Details in the Deployment Guide.
+
+## Tests
+
+Standard-library `unittest`, no extra dependencies. Temp DB and temp content dirs only —
+your real `sqlite.db` and `articles/` are never touched.
+
+```bash
+python -m unittest discover -s tests -t .        # everything
+python -m unittest tests.test_evmd_block -v      # one module
+```
+
+Covers the HTTP body parser, CSRF, sessions, auth, comments, the article/page caches,
+SEO, config validation, the EVMD parser (plus a seeded fuzz harness) and an
+end-to-end cold start walkthrough.
 
 No PRs, please.  
 Patches only.  

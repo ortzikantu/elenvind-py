@@ -53,10 +53,12 @@ CSS/图标/图片由 Nginx 托管，与应用无关；同步文件后即可，
 
 ### 管理员
 
-- 数据库中 `id = 1` 的用户即站长：导航带徽章、可删除任意评论、可恢复已删评论；
+- `config.toml` 顶层 `admin_user_id` 指定的用户即站长（默认 `1`，即最早注册的账号）：
+  导航带徽章、可删除任意评论、可恢复已删评论；把该项删掉或改成非法值 = **没有管理员**；
 - 恢复/删除是**软删除**：访客看到等长方块打码，站长看到删除线，可随时恢复；
 - 物理清除：`python purge.py`（交互式列出软删除评论并按 ID 永久删除，
-  不可恢复，仅建议在确认违规内容后使用）。
+  不可恢复，仅建议在确认违规内容后使用）。物理删除父评论时，其子评论的
+  `parent_id` 由数据库 `ON DELETE SET NULL` 自动置空，子评论升级为顶层评论，不会消失。
 
 ### 账号注销（用户自行操作）
 
@@ -72,7 +74,11 @@ CSS/图标/图片由 Nginx 托管，与应用无关；同步文件后即可，
 
 ## 四、数据库
 
-- 文件：项目根 `sqlite.db`（`ELENVIND_DB` 可覆盖），WAL 模式，启动自动建表/补索引；
+- 文件：`config.toml` 顶层 `database`（默认项目根 `sqlite.db`；`ELENVIND_DB` 环境变量可覆盖），
+  WAL 模式，每个连接都开启 `PRAGMA foreign_keys=ON`，启动自动建表/补索引/执行迁移；
+- schema 版本记录在 `PRAGMA user_version`（当前版本见 `db_base.SCHEMA_VERSION`）。
+  启动时若版本落后，会自动执行迁移（含重建表）并更新版本号，**幂等、可重复执行**，
+  旧库无需手工处理；升级前仍建议备份；
 - 备份（WAL 下勿直接拷贝）：
 
 ```bash
@@ -80,8 +86,36 @@ sqlite3 sqlite.db ".backup 'backup-2026-01-01.db'"
 ```
 
 - 恢复：停服 → 用备份文件替换 `sqlite.db`（同时删除残留的 `-wal`/`-shm`）→ 启动；
-- 主要表：`user`、`session`、`login_attempts`、`comment`、`comment_rate`。
-  不要手工改 `user.password`（PBKDF2 格式 `盐$摘要`）。
+- 主要表：`user`、`session`、`login_attempts`、`register_attempts`、`comment`、`comment_rate`。
+  不要手工改 `user.password`：密码哈希是自描述格式
+  （`scrypt$ln=15,r=8,p=1$盐$摘要`；历史 `盐$摘要` 为 PBKDF2-SHA256 10 万次），
+  填错会导致该账号无法登录。改算法/参数由代码负责，旧哈希会在用户下次成功登录时
+  自动重新哈希（渐进式升级，不需要强制全员改密）。
+
+## 四之二、测试
+
+项目自带标准库 `unittest` 测试套件（无第三方测试依赖）：
+
+```bash
+cd /opt/elenvind-py
+python -m unittest discover -s tests -t .          # 全部测试
+python -m unittest tests.test_http -v              # 单个模块
+```
+
+测试使用临时数据库与临时内容目录（`.testtmp/`，已在 .gitignore 中），
+**不会触碰生产数据库与文章目录**。升级代码后建议先跑一遍。
+
+需要一次"真实 uvicorn 冷启动"验证时（例如换机器、换 Python 版本后），
+可以跑仓库根目录的一次性冒烟驱动：
+
+```bash
+SECRET_KEY=任意随机串 python smoke_driver.py   # 需要环境里已安装 uvicorn
+```
+
+它会在临时目录（`.smoketmp/`）里起一个真实服务，走完首页 / 文章 / EVMD /
+登录 / 注册 / 注销 / 改密 / 评论 / 删除 / 恢复 / SEO / 主题 / 404 / 405
+以及请求体边界（411 / 413 / 415）与 Host 头投毒共 30 余项断言，
+结束后清理临时目录，不影响生产数据。
 
 ## 五、限流策略与误锁处理
 
@@ -91,6 +125,10 @@ sqlite3 sqlite.db ".backup 'backup-2026-01-01.db'"
 | 登录 | 单 IP 15 分钟 20 次失败 | 短窗口防脚本轮询，NAT 用户不易被长期误锁 |
 | 登录 | 全站 15 分钟 200 次失败 | 分布式爆破最后闸门 |
 | 评论 | 单用户 60 秒 5 条 / 单 IP 60 秒 10 条 | 命中即 429 并写 warning 日志 |
+| 注册 | 单 IP 1 小时 5 次尝试 | 命中显示"注册尝试过于频繁"；可整体关闭注册 |
+
+以上阈值都可在 `config.toml` 的 `[login_limits]` / `[comment_limits]` /
+`[register_limits]` 段落调整（见《配置文件使用指南》）。
 
 误锁/需要立即解锁（例如家庭 NAT 被他人拖累）：
 

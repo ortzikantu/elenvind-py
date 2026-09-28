@@ -1,0 +1,292 @@
+"""安全回归测试（端到端）：存储型/反射型 XSS、CRLF 注入、缓存泄漏、错误处理。
+
+XSS 断言用标准库 HTMLParser 解析真实响应，检查"是否真的产生了可执行标签/事件属性"，
+而不是做字符串包含匹配——转义后的文本（如 &lt;img onerror=...&gt;）是安全的，
+字符串匹配会误报。
+"""
+import unittest
+from html.parser import HTMLParser
+
+from tests.support import ElenvindTestCase
+
+XSS_PAYLOADS = (
+    "<script>alert(1)</script>",
+    "<img src=x onerror=alert(1)>",
+    "<svg/onload=alert(1)>",
+    "javascript:alert(1)",
+    '"><script>alert(1)</script>',
+    "'><img src=x onerror=alert(1)>",
+    "<iframe src=javascript:alert(1)></iframe>",
+    "<body onload=alert(1)>",
+    "{{7*7}}",
+    "${alert(1)}",
+    "%3Cscript%3Ealert(1)%3C/script%3E",
+    "\\<script\\>alert(1)\\<\\/script\\>",
+)
+
+# 一旦由用户输入产生就是 XSS 的标签（模板自己不会输出这些）
+FORBIDDEN_TAGS = {"script", "iframe", "object", "embed", "base", "style", "math",
+                  "applet", "frame", "frameset", "noscript", "template", "marquee"}
+
+# 安全属性白名单之外的事件属性
+EVENT_ATTR_PREFIX = "on"
+
+
+class _HtmlAudit(HTMLParser):
+    """收集文档里出现的标签、事件属性与 URL 属性。"""
+
+    URL_ATTRS = {"href", "src", "action", "poster", "data", "formaction", "srcset"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tags = []
+        self.event_attrs = []
+        self.forbidden = []
+        self.url_attrs = []
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append(tag)
+        if tag in FORBIDDEN_TAGS:
+            self.forbidden.append(tag)
+        for name, value in attrs:
+            lowered = name.lower()
+            if lowered.startswith(EVENT_ATTR_PREFIX):
+                self.event_attrs.append((tag, name, value))
+            if lowered in self.URL_ATTRS and value:
+                self.url_attrs.append((tag, lowered, value))
+
+    handle_startendtag = handle_starttag
+
+
+def audit_html(text):
+    parser = _HtmlAudit()
+    parser.feed(text)
+    parser.close()
+    return parser
+
+
+class StoredXssTests(ElenvindTestCase):
+    """评论内容、昵称、文章元数据都是用户/运营可控输入，输出必须安全。"""
+
+    def setUp(self):
+        super().setUp()
+        self.write_article("post", "article body", {"title": "Post", "date": "2026-01-01"})
+
+    def _assert_no_injection(self, html, payload):
+        audit = audit_html(html)
+        self.assertEqual(audit.event_attrs, [],
+                         f"payload {payload!r} produced event attributes {audit.event_attrs}")
+        self.assertEqual(audit.forbidden, [],
+                         f"payload {payload!r} produced forbidden tags {audit.forbidden}")
+        # 危险协议不得进入任何 URL 属性
+        for tag, name, value in audit.url_attrs:
+            lowered = value.strip().lower()
+            self.assertFalse(
+                lowered.startswith(("javascript:", "vbscript:", "data:text/html")),
+                f"payload {payload!r} produced dangerous {name} on <{tag}>: {value!r}")
+        # 含 HTML 元字符的载荷必须被转义，不得原样出现
+        if any(char in payload for char in '<>"\''):
+            self.assertNotIn(payload, html,
+                             f"payload {payload!r} was reflected verbatim")
+
+    def test_comment_payloads_are_escaped(self):
+        from elenvind.db_comment import create_comment
+
+        user_id, _ = self.create_user(nickname="Ann", email="ann@example.com")
+        for payload in XSS_PAYLOADS:
+            with self.subTest(payload=payload):
+                create_comment("post", user_id, payload)
+        response = self.app.request("GET", "/article/post")
+        self.assertEqual(response.status, 200)
+        for payload in XSS_PAYLOADS:
+            self._assert_no_injection(response.text, payload)
+
+    def test_nickname_payloads_are_escaped_everywhere(self):
+        for payload in XSS_PAYLOADS:
+            with self.subTest(payload=payload):
+                user_id = self._make_user(payload)
+                session, csrf = self.login_ok(f"user{user_id}@example.com", "password-123")
+                for path in ("/", "/article/post", "/user"):
+                    response = self.app.request("GET", path,
+                                                cookies=self.app_cookies(session=session,
+                                                                         csrf=csrf))
+                    self.assertEqual(response.status, 200)
+                    self._assert_no_injection(response.text, payload)
+
+    def test_article_title_payload_is_escaped(self):
+        for index, payload in enumerate(XSS_PAYLOADS):
+            with self.subTest(payload=payload):
+                slug = f"xss{index}"
+                self.write_article(slug, "body", {"title": payload, "date": "2026-01-01"})
+                response = self.app.request("GET", f"/article/{slug}")
+                self._assert_no_injection(response.text, payload)
+
+    def test_custom_page_body_payload_is_not_raw_html(self):
+        for payload in XSS_PAYLOADS:
+            with self.subTest(payload=payload):
+                self.write_page("hostile", payload)
+                response = self.app.request("GET", "/hostile")
+                self.assertEqual(response.status, 200)
+                self._assert_no_injection(response.text, payload)
+
+    def test_user_page_reflects_escaped_values(self):
+        payload = '"><script>alert(1)</script>'
+        user_id = self._make_user(payload)
+        session, csrf = self.login_ok(f"user{user_id}@example.com", "password-123")
+        response = self.app.request("GET", "/user",
+                                    cookies=self.app_cookies(session=session, csrf=csrf))
+        self._assert_no_injection(response.text, payload)
+
+    def _make_user(self, nickname):
+        from elenvind.db_user import create_user
+        from elenvind.security import hash_password
+        existing = len(self._all_emails())
+        email = f"user{existing + 1}@example.com"
+        return create_user(nickname, email, hash_password("password-123"))
+
+    def _all_emails(self):
+        from elenvind.db_base import get_connection
+        with get_connection() as conn:
+            return [row["email"] for row in conn.execute("SELECT email FROM user")]
+
+
+class ReflectedXssTests(ElenvindTestCase):
+    def test_query_string_is_not_reflected_raw(self):
+        payloads = ('"><script>alert(1)</script>', "<script>alert(1)</script>",
+                    "'><img src=x onerror=alert(1)>")
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                response = self.app.request("GET", "/", query={"page": payload,
+                                                               "reply_to": payload,
+                                                               "x": payload})
+                self.assertEqual(response.status, 200)
+                audit = audit_html(response.text)
+                self.assertEqual(audit.event_attrs, [])
+                self.assertEqual(audit.forbidden, [])
+
+    def test_theme_next_is_not_reflected(self):
+        payload = '"><script>alert(1)</script>'
+        response = self.app.request("GET", "/theme",
+                                    query={"mode": "dark", "next": payload})
+        self.assertEqual(response.status, 302)
+        self.assertEqual(response.header("location"), "/")
+        self.assertNotIn("<script", response.text)
+
+    def test_unknown_path_with_payload_returns_404(self):
+        response = self.app.request("GET", '/<script>alert(1)</script>')
+        self.assertEqual(response.status, 404)
+        self.assertNotIn("<script>alert(1)</script>", response.text)
+
+    def test_error_pages_escape_messages(self):
+        from elenvind.http_article import _error_page
+        from elenvind.http_base import RequestContext
+
+        ctx = RequestContext(scope={"headers": []}, cookies={}, session_token=None,
+                             user=None, client_ip="1.2.3.4", secure=False, method="POST",
+                             path="/article/post/comment", query={}, form={})
+        response = _error_page(ctx, '<script>alert(1)</script>', 400)
+        body = response.body.decode("utf-8")
+        self.assertNotIn("<script>alert(1)</script>", body)
+        self.assertIn("&lt;script&gt;", body)
+
+
+class CrlfInjectionTests(ElenvindTestCase):
+    def test_cookie_values_with_control_characters_are_rejected(self):
+        """值含控制字符时 http.cookies 直接拒绝，从根上杜绝响应头注入。"""
+        from http.cookies import CookieError
+
+        from elenvind.security import csrf_cookie_header, set_cookie_header
+
+        for value in ("abc\r\nX-Injected: 1", "abc\ndef", "abc\rdef", "a\x00b"):
+            with self.subTest(value=value):
+                for builder in (set_cookie_header, csrf_cookie_header):
+                    with self.assertRaises(CookieError):
+                        builder(value)
+
+    def test_suspicious_values_are_quoted_not_split(self):
+        from elenvind.security import set_cookie_header
+
+        header = set_cookie_header("abc; Path=/evil")
+        self.assertNotIn(b"\r", header[1])
+        self.assertNotIn(b"\n", header[1])
+        # 分号被值引用/转义，不会在响应头里变成新的属性分隔
+        self.assertTrue(header[1].startswith(b'session="abc'), header[1])
+        self.assertEqual(header[1].count(b"; Path=/;"), 1)   # 只有模板自带的 Path 属性
+
+    def test_redirect_location_has_no_crlf(self):
+        for value in ("/x\r\nX-Injected: 1", "/x\ny", "//evil\r\n"):
+            with self.subTest(value=value):
+                response = self.app.request("GET", "/theme",
+                                            query={"mode": "dark", "next": value})
+                location = response.header("location")
+                self.assertNotIn("\r", location)
+                self.assertNotIn("\n", location)
+
+    def test_cookie_header_parsing_ignores_malformed_pairs(self):
+        from elenvind.security import parse_cookies
+
+        scope = {"headers": [(b"cookie", b"session=abc; =broken; csrf=xyz; session=def")]}
+        cookies = parse_cookies(scope)
+        self.assertEqual(cookies.get("session"), "def")   # 同名取最后一个
+        self.assertEqual(cookies.get("csrf"), "xyz")
+
+    def test_multiple_cookie_headers_are_merged(self):
+        from elenvind.security import parse_cookies
+
+        scope = {"headers": [(b"cookie", b"session=abc"), (b"cookie", b"csrf=xyz")]}
+        cookies = parse_cookies(scope)
+        self.assertEqual(cookies, {"session": "abc", "csrf": "xyz"})
+
+
+class CacheLeakTests(ElenvindTestCase):
+    def test_logged_in_pages_are_not_cacheable(self):
+        self.create_user(email="cache@example.com")
+        session, csrf = self.login_ok("cache@example.com", "correct horse battery")
+        for path in ("/", "/user", "/login"):
+            with self.subTest(path=path):
+                response = self.app.request("GET", path,
+                                            cookies=self.app_cookies(session=session, csrf=csrf))
+                self.assertEqual(response.header("cache-control"), "no-store")
+
+    def test_public_metadata_is_cacheable_but_generic(self):
+        self.create_user(email="cache2@example.com")
+        session, _ = self.login_ok("cache2@example.com", "correct horse battery")
+        response = self.app.request("GET", "/robots.txt",
+                                    cookies=self.app_cookies(session=session))
+        self.assertEqual(response.header("cache-control"), "public, max-age=3600")
+        self.assertNotIn("cache2@example.com", response.text)
+
+
+class ErrorHandlingTests(ElenvindTestCase):
+    def test_unexpected_exception_becomes_500_without_leaking_details(self):
+        from elenvind import http as http_module
+
+        original = http_module._route_get
+
+        def boom(ctx):
+            raise RuntimeError("internal detail: /etc/passwd")
+
+        http_module._route_get = boom
+        try:
+            response = self.app.request("GET", "/")
+        finally:
+            http_module._route_get = original
+
+        self.assertEqual(response.status, 500)
+        self.assertEqual(response.text, "Internal Server Error")
+        self.assertNotIn("/etc/passwd", response.text)
+        self.assertNotIn("Traceback", response.text)
+
+    def test_404_page_is_rendered_html(self):
+        response = self.app.request("GET", "/nope")
+        self.assertEqual(response.status, 404)
+        self.assertIn("<!DOCTYPE html>", response.text)
+
+    def test_response_headers_are_not_duplicated(self):
+        response = self.app.request("GET", "/")
+        names = [name for name, _ in response.headers]
+        self.assertEqual(len(names), len(set(names)))
+
+
+if __name__ == "__main__":
+    unittest.main()

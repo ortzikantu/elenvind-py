@@ -20,11 +20,13 @@ def render(lang: str = "en") -> str:
     links = [_nav_link_html(item) for item in (params.get("nav") or [])]
     nav_list = "\n".join(f"{link}" for link in links if link)
 
-    copyright_name = escape_html(config.get("copyright", "title"))
+    # 文案用 raw 值格式化，格式化完成后再整体转义一次：
+    # 否则配置里的 & < 会被转义两次，页面上出现 &amp; 字面量
+    copyright_name = str(config.get("copyright", "title"))
     year = datetime.now().year
-    users_line = t(lang, "footer_users", total=get_user_number())
-    rights_line = t(lang, "footer_rights", year=year, name=copyright_name)
-    powered_line = t(lang, "footer_powered", version=get_version())
+    users_line = escape_html(t(lang, "footer_users", total=get_user_number()))
+    rights_line = escape_html(t(lang, "footer_rights", year=year, name=copyright_name))
+    powered_line = escape_html(t(lang, "footer_powered", version=get_version()))
 
     return f"""
     <footer>

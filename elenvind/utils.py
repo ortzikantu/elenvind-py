@@ -39,14 +39,30 @@ def get_client_ip(scope):
     return peer_ip
 
 
+# 受信代理列表缓存：配置只在启动时加载一次，无需每个请求重新解析
+_TRUSTED_CACHE = None
+_TRUSTED_SOURCE = object()
+
+
 def _trusted_proxies() -> tuple:
-    """解析受信代理配置：config.toml [server].trusted_proxies，默认仅回环地址。"""
+    """解析受信代理配置：config.toml [server].trusted_proxies，默认仅回环地址。
+
+    结果按配置内容缓存：配置只在启动时加载一次，无需每个请求重新解析。
+    """
+    global _TRUSTED_CACHE, _TRUSTED_SOURCE
     configured = config.get("server", {}).get("trusted_proxies")
+    if _TRUSTED_CACHE is not None and _TRUSTED_SOURCE == configured:
+        return _TRUSTED_CACHE
     if configured is None:
-        return ("127.0.0.1", "::1")
-    if isinstance(configured, str):
-        return tuple(ip.strip() for ip in configured.split(",") if ip.strip())
-    return tuple(str(ip).strip() for ip in configured if str(ip).strip())
+        resolved = ("127.0.0.1", "::1")
+    elif isinstance(configured, str):
+        resolved = tuple(ip.strip() for ip in configured.split(",") if ip.strip())
+    else:
+        resolved = tuple(str(ip).strip() for ip in configured if str(ip).strip())
+    _TRUSTED_CACHE = resolved
+    _TRUSTED_SOURCE = configured
+    return resolved
+
 
 def truncate(text, length=100, suffix="..."):
     """将文本截断至指定长度，超出部分追加后缀"""
@@ -68,8 +84,8 @@ def format_datetime(value):
     elif isinstance(value, str):
         try:
             dt = datetime.fromisoformat(value)
-        except Exception:
-            return value  # 解析失败时返回原始字符串
+        except ValueError:
+            return value  # 解析失败时原样返回（不属于程序缺陷）
     else:
         return str(value)
     return dt.strftime("%Y-%m-%d %H:%M")
@@ -87,7 +103,7 @@ def format_date(value):
     elif isinstance(value, str):
         try:
             dt = datetime.fromisoformat(value).date()
-        except Exception:
+        except ValueError:
             return value
     else:
         return str(value)

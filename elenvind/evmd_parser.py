@@ -31,6 +31,15 @@ FENCE = "```"                # 围栏代码块标记
 TABLE_MARKER = "@{table}"    # 表格方言起始行
 HARD_BREAK = "\ue001"        # 硬换行占位符（在行内解析完成后替换为 <br>）
 
+# ----- 解析资源上限（防恶意/异常输入造成极端 CPU / 内存消耗） -----
+# 文章文件本身已有 1 MB 上限，这里再对"结构性数量"设闸，正常文章远远够用。
+MAX_DOCUMENT_LINES = 50_000    # 单文档最大行数
+MAX_TABLE_ROWS = 500          # 单个表格最大行数（含表头）
+MAX_TABLE_COLUMNS = 64        # 单个表格最大列数
+MAX_FOOTNOTES = 200           # 单文档最多脚注定义数
+MAX_IMAGE_RUN = 200           # 连续图片行最多合并数量
+MAX_CODE_BLOCK_LINES = 20_000  # 单个代码块最大行数
+
 # ATX 标题：1-6 个 # 后跟空格
 _HEADING_RE = re.compile(r'^(#{1,6})\s+(.*)')
 # Setext 标题下划线：===（h1）/ ---（h2），数量不限
@@ -47,6 +56,8 @@ _FOOTNOTE_DEF_RE = re.compile(r'^@\{footnote,\s*([A-Za-z0-9_-]{1,32})\s*,\s*(.*?
 _REF_TOKEN_RE = re.compile('\ue300([A-Za-z0-9_-]{1,32})\ue301')
 # 表格分隔行单元格：:--- / ---: / :---: / ---
 _TABLE_ALIGN_RE = re.compile(r'^:?-+:?$')
+# 私有区占位符过滤：除硬换行 HARD_BREAK(\ue001) 外，用户输入里的 \ue000-\ue4ff 全清掉
+_PUA_RE = re.compile("[\ue000-\ue000\ue002-\ue4ff]")
 
 
 def document_meta(text: str, *, require_header: bool = False) -> dict:
@@ -71,8 +82,19 @@ def parse_document(text: str, *, require_header: bool = False):
 
 def evmd_to_html(text: str) -> str:
     """把 EVMD 正文渲染为 HTML（不含文档头）。"""
+    if not isinstance(text, str):
+        raise EvmdError(f"document body must be a string, got {type(text).__name__}")
+    lines = text.splitlines()
+    if len(lines) > MAX_DOCUMENT_LINES:
+        raise EvmdError(
+            f"document too long: {len(lines)} lines (limit {MAX_DOCUMENT_LINES})"
+        )
+    # 清掉用户输入里的私有区字符：占位符（HARD_BREAK / 脚注引用 / 代码跨度 / 转义）
+    # 全部使用私有区码位，若不过滤，用户可以伪造出内部占位符导致内容错位或异常。
+    text = _PUA_RE.sub("\U000f0000", text) if _PUA_RE.search(text) else text
+    lines = text.splitlines()
     footnotes = []                      # [(id, 原始文本)]，按定义顺序编号
-    output = _render_lines(text.splitlines(), footnotes)
+    output = _render_lines(lines, footnotes)
     html_text = "\n".join(output)
     return _finalize_footnotes(html_text, footnotes)
 
@@ -145,6 +167,12 @@ def _render_lines(lines, footnotes):
                 continue
             code_lines.append(line)
             i += 1
+            if len(code_lines) >= MAX_CODE_BLOCK_LINES:
+                # 未闭合围栏 + 超长内容：提前收尾，避免无上限累积
+                output.append(f"<pre><code{class_attr(code_lang)}>{escape_html('\n'.join(code_lines))}</code></pre>")
+                in_code = False
+                code_lines = []
+                code_lang = ""
             continue
         if stripped.startswith(FENCE):
             # 开启围栏前先结束当前段落，避免代码块前后文字被错误拼进同一段
@@ -165,7 +193,7 @@ def _render_lines(lines, footnotes):
             _flush_paragraph(output, paragraph)
             items = [modern_img]
             i += 1
-            while i < len(lines):
+            while i < len(lines) and len(items) < MAX_IMAGE_RUN:
                 nxt = match_modern_img(lines[i])
                 if nxt is None:
                     break
@@ -201,7 +229,7 @@ def _render_lines(lines, footnotes):
         if footnote_match:
             _flush_paragraph(output, paragraph)
             fid, text = footnote_match.group(1), footnote_match.group(2)
-            if not any(existing_id == fid for existing_id, _ in footnotes):
+            if len(footnotes) < MAX_FOOTNOTES and not any(existing_id == fid for existing_id, _ in footnotes):
                 footnotes.append((fid, text))
             i += 1
             continue
@@ -318,7 +346,7 @@ def _try_parse_table(lines, i):
     while j < len(lines) and lines[j].strip().startswith("|"):
         rows.append(lines[j].strip())
         j += 1
-        if len(rows) >= 500:  # 防御性上限
+        if len(rows) >= MAX_TABLE_ROWS:  # 防御性上限
             break
 
     if len(rows) < 2:          # 至少需要表头 + 一行内容
@@ -327,6 +355,8 @@ def _try_parse_table(lines, i):
     header = _split_table_row(rows[0])
     if not header or not any(header):
         return None, i
+    if len(header) > MAX_TABLE_COLUMNS:
+        header = header[:MAX_TABLE_COLUMNS]
 
     aligns = [None] * len(header)
     data_rows = rows[1:]

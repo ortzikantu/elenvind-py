@@ -21,14 +21,16 @@ def _external_attrs(url: str) -> str:
     return ""
 
 def _hero_html() -> str:
-    """hero 区：全宽背景图，位于 about 之上。配置项为 params.hero（图片 URL）。"""
+    """hero 区：全宽背景图，位于 about 之上。配置项为 static.hero（图片 URL）。"""
     static_cfg = config.get("static", {})
     hero = static_cfg.get("hero") or ""
     if not hero:
         return ""
-    # 对 URL 进行 HTML 转义，防止特殊字符破坏属性
-    safe_hero = escape_html(hero)
-    return f'<section class="home-hero"><div class="hero" style="background-image:url({safe_hero})" loading="lazy"></div></section>'
+    # 内联 style 里的 url(...) 用引号包裹并转义：既防属性逃逸，也防 CSS 值逃逸
+    # （未加引号的 url() 允许 ) 与 ; 提前闭合，属于 CSS 注入面）。
+    safe_hero = escape_html(str(hero)).replace("'", "&#39;")
+    return (f'<section class="home-hero"><div class="hero" '
+            f'style="background-image:url(\'{safe_hero}\')"></div></section>')
 
 def _intro_html(params) -> str:
     """about 区介绍段落：params.intro 存在时才输出。"""

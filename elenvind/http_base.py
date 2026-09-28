@@ -8,9 +8,11 @@
 """
 from .security import (
     CSRF_COOKIE,
+    csrf_cookie_header,
     generate_csrf_token,
     is_valid_csrf_token,
-    csrf_cookie_header,
+    pick_cookie,
+    verify_csrf_token,
 )
 
 class Response:
@@ -54,14 +56,14 @@ class RequestContext:
         self.query = query            # GET 查询参数（list 值，与 parse_qs 一致）
         self.form = form              # POST 表单（已取首个值）
         self.theme = theme            # 手动主题偏好："light"/"dark"，未设置时 None（跟随系统）
-        self.lang = lang              # 界面语言：en/zh/ja（Cookie -> Accept-Language -> 配置）
+        self.lang = lang              # 界面语言：en/zh/ja（配置决定）
         self._csrf = None
         self._csrf_dirty = False
 
     def csrf(self):
         """返回 Cookie 中已有的合法 CSRF 令牌；不存在或格式非法返回 None"""
         if self._csrf is None:
-            token = self.cookies.get(CSRF_COOKIE)
+            token = pick_cookie(self.cookies, CSRF_COOKIE)
             self._csrf = token if is_valid_csrf_token(token) else None
         return self._csrf
 
@@ -74,9 +76,13 @@ class RequestContext:
             self._csrf_dirty = True
         return token
 
+    def csrf_ok(self) -> bool:
+        """校验本次 POST 表单里的令牌是否与 Cookie 一致（常量时间比对）。"""
+        return verify_csrf_token(self.form.get("csrf_token", ""), self.csrf())
+
     def take_csrf_cookie_header(self):
         """若本请求生成了新令牌，返回对应的 Set-Cookie 头（仅一次，供分发器附加）"""
         if self._csrf_dirty:
             self._csrf_dirty = False
-            return csrf_cookie_header(self._csrf, secure=self.secure)
+            return csrf_cookie_header(self._csrf, secure=self.secure, base=CSRF_COOKIE)
         return None

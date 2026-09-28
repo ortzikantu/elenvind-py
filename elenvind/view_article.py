@@ -10,9 +10,17 @@ from .view_layout_base import render as layout
 from .i18n import t
 from .utils import escape_html, format_date
 from .articles import get_article_by_slug, load_article_content
+from .evmd_parser import EvmdError
 from .view_partials_comment import render_comments
 
 logger = logging.getLogger(__name__)
+
+
+def render_error(message: str, user=None, theme=None, path=None, lang="en"):
+    """用站点布局渲染一条错误说明（供评论发布失败等场景使用）。"""
+    title = config.get("title", "WHERE IS YOUR TITLE?")
+    content = f"<p>{escape_html(message)}</p>"
+    return layout(title, content, user=user, theme=theme, path=path, lang=lang)
 
 
 def render(slug: str = None, user=None, reply_to: int = None, csrf_token: str = None,
@@ -43,9 +51,13 @@ def render(slug: str = None, user=None, reply_to: int = None, csrf_token: str = 
         article_title = escape_html(metadata.get("title", article_meta["title"]))
         date_pub = format_date(metadata.get("date"))
         date_mod = format_date(metadata.get("lastmod"))
-        authors = ", ".join(escape_html(a) for a in metadata.get("authors", []))
-    except Exception as e:
-        logger.error(f"Article rendering failed for {slug}: {e}")
+        raw_authors = metadata.get("authors") or []
+        if isinstance(raw_authors, str):
+            raw_authors = [raw_authors]
+        authors = ", ".join(escape_html(a) for a in raw_authors)
+    except (EvmdError, OSError, UnicodeDecodeError, ValueError) as e:
+        # 只吞"文章内容/文件本身有问题"这类预期错误；程序缺陷照常冒泡成 500 堆栈
+        logger.error("Article rendering failed for %s: %s", slug, e)
         content = f"<p>{escape_html(t(lang, 'article_failed'))}</p>"
         return layout("500 Internal Server Error", content, user=user, theme=theme, path=path, lang=lang)
 

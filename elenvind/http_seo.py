@@ -1,12 +1,15 @@
 """SEO 元文件响应：/robots.txt 与 /sitemap.xml（纯文本/XML，零依赖）。
 
-站点基址用“请求自身的 Host 头 + 是否 HTTPS”推导，跟随实际部署域名自动变化，
-无需在配置里重复维护站点 URL；Host 缺失时 robots 不输出 Sitemap 行。
+站点基址只来自 `config.toml` 顶层的 `site_url`：
+绝不使用请求的 Host 头拼绝对 URL——Host 由客户端完全控制，
+用它生成 canonical / sitemap 会把任意域名写进给搜索引擎的元文件（Host 头投毒）。
+`site_url` 留空时 robots 不输出 Sitemap 行、sitemap 输出空 urlset（不产生错误 URL）。
 robots 缓存 1 小时、sitemap 缓存 10 分钟（文章增删后最迟 10 分钟被搜索引擎看到）。
 """
 from urllib.parse import quote
 
 from .articles import get_articles
+from .config import config
 from .http_base import plain_response
 from .utils import escape_html, format_date
 
@@ -15,17 +18,9 @@ _ROBOTS_CACHE = (b"cache-control", b"public, max-age=3600")
 _SITEMAP_CACHE = (b"cache-control", b"public, max-age=600")
 
 
-def _site_base(ctx) -> str:
-    """根据请求头推导站点绝对基址（如 https://example.com），无 Host 返回空串。"""
-    host = ""
-    for name, value in ctx.scope.get("headers", []):
-        if name == b"host":
-            host = value.decode("latin-1").strip()
-            break
-    if not host:
-        return ""
-    scheme = "https" if ctx.secure else "http"
-    return f"{scheme}://{host}"
+def site_base() -> str:
+    """站点绝对基址（如 https://example.com），未配置时返回空串。"""
+    return str(config.get("site_url", "") or "").strip().rstrip("/")
 
 
 def _loc_url(base: str, path: str) -> str:
@@ -34,9 +29,9 @@ def _loc_url(base: str, path: str) -> str:
 
 
 def seo_robots_get(ctx):
-    """GET /robots.txt：全站放行 + 指向 sitemap。"""
+    """GET /robots.txt：全站放行 + 指向 sitemap（有 site_url 时才给 Sitemap 行）。"""
     lines = ["User-agent: *", "Allow: /"]
-    base = _site_base(ctx)
+    base = site_base()
     if base:
         lines.append(f"Sitemap: {base}/sitemap.xml")
     return plain_response("\n".join(lines) + "\n",
@@ -46,7 +41,7 @@ def seo_robots_get(ctx):
 
 def seo_sitemap_get(ctx):
     """GET /sitemap.xml：首页 + 全部文章页（含 lastmod，若文章元数据里有）。"""
-    base = _site_base(ctx)
+    base = site_base()
     entries = []
     if base:
         entries.append(f"        <url><loc>{escape_html(_loc_url(base, '/'))}</loc></url>")

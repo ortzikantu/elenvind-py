@@ -3,11 +3,17 @@
 职责说明：
 - 本模块只做“密码学原语 + Cookie 构造”，不做数据库操作；
   会话 token 的持久化见 db_session.py。
-- 密码：PBKDF2-HMAC-SHA256 + 每用户 16 字节随机盐，防彩虹表；校验用
-  compare_digest 常量时间比较，防计时侧信道。
-- CSRF：无状态 Double-Submit Cookie（随机令牌同时写入 Cookie 与表单，只比对两者），
-  不依赖服务端会话状态，因此登出/换账号/改密清会话都不会使令牌失效。
-- Cookie 均带 HttpOnly + SameSite=Lax；请求为 HTTPS（可信代理标记 scheme）时自动加 Secure。
+- 本模块导入时不读写文件、不读取环境变量（便于测试与审计），
+  部署前置条件（如 SECRET_KEY）由 config.validate_config() 在启动时统一检查。
+
+密码哈希格式（自描述，支持长期升级迁移）：
+
+    scrypt$ln=15,r=8,p=1$<salt hex>$<digest hex>          <- 当前写入格式
+    pbkdf2_sha256$600000$<salt hex>$<digest hex>          <- 可写入/可校验
+    <salt hex>$<digest hex>                               <- 历史格式（仅校验，等价 PBKDF2-SHA256 10 万次）
+
+旧格式使用者在下次登录成功后会被透明地重新哈希为新格式（渐进式 rehash，
+见 password_needs_rehash），无需强制全员改密。
 """
 import hashlib
 import hmac
@@ -16,13 +22,11 @@ import re
 import secrets
 from http.cookies import SimpleCookie
 
-# 历史约定：早期版本用 SECRET_KEY 做会话 token 签名；现架构改为服务端随机会话
-# （见 db_session.py），SECRET_KEY 已无密码学用途，仅保留为“启动环境一致性门禁”：
-# 统一要求部署方显式注入环境变量，避免隐式默认值带来的配置漂移。
-if not os.environ.get("SECRET_KEY"):
-    raise RuntimeError("SECRET_KEY environment variable is not set")
-
 # ----- Cookie 名称与生命周期 -----
+# 名称可在启动时切换为 __Host- 前缀（config.toml [server].cookie_prefix = true）。
+# __Host- 前缀由浏览器强制要求 Secure + Path=/ + 无 Domain，能挡子域名写 Cookie 的攻击；
+# 但它依赖全程 HTTPS，因此默认关闭，仅 HTTPS 部署才应开启。
+# 读取时始终同时接受带前缀与不带前缀两种名字，切换配置不会把所有人踢下线。
 SESSION_COOKIE = "session"
 CSRF_COOKIE = "csrf"
 THEME_COOKIE = "theme"              # 手动白/夜主题偏好（light/dark），无该 Cookie 时跟随系统
@@ -30,37 +34,166 @@ SESSION_MAX_AGE = 7 * 86400      # 会话 Cookie 7 天，与 db_session.SESSION_
 CSRF_MAX_AGE = 30 * 86400        # CSRF Cookie 30 天（仅做同源比对，无状态）
 THEME_MAX_AGE = 365 * 86400      # 主题 Cookie 1 年
 
+_COOKIE_PREFIX = ""
+
+
+def configure_cookie_prefix(enabled: bool) -> None:
+    """启用/停用 __Host- 前缀（由 config 校验阶段调用一次）。"""
+    global _COOKIE_PREFIX
+    _COOKIE_PREFIX = "__Host-" if enabled else ""
+
+
+def cookie_name(base: str) -> str:
+    """返回带当前前缀的 Cookie 名（写入时使用）。"""
+    return _COOKIE_PREFIX + base
+
+
+def cookie_names(base: str) -> tuple:
+    """返回该 Cookie 的全部可接受名称（写入名在前，兼容名在后）。"""
+    canonical = _COOKIE_PREFIX + base
+    if _COOKIE_PREFIX and canonical != base:
+        return (canonical, base)
+    return (canonical,)
+
+
+def pick_cookie(cookies: dict, base: str):
+    """从请求 Cookie 中取出该逻辑 Cookie 的值，不存在返回 None。"""
+    for name in cookie_names(base):
+        if name in cookies:
+            return cookies[name]
+    return None
+
+
 # ----- 输入长度策略（注册 / 登录 / 改密 / 资料修改统一引用） -----
 PASSWORD_MIN = 8
 PASSWORD_MAX = 128
 NICKNAME_MAX = 50
 EMAIL_MAX = 254
 
-# ----- 密码哈希 -----
-def hash_password(password: str, salt: bytes = None) -> str:
-    """PBKDF2 哈希，输出格式：<salt hex>$<digest hex>"""
-    if salt is None:
-        salt = os.urandom(16)
-    dk = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
-    return salt.hex() + "$" + dk.hex()
+# ----- 密码哈希参数（本机 benchmark 结果：scrypt N=2^15, r=8, p=1 ≈ 240 ms/次） -----
+SCRYPT_N = 2 ** 15           # CPU/内存代价主参数
+SCRYPT_R = 8                 # 块大小
+SCRYPT_P = 1                 # 并行度
+SCRYPT_DKLEN = 32            # 派生密钥长度
+SCRYPT_MAXMEM = 64 * 1024 * 1024   # 允许的最大内存（N=2^15,r=8 实际约 33 MB）
+PBKDF2_ITERATIONS = 600_000  # 本机 ≈ 134 ms/次（历史格式为 10 万次）
+SALT_BYTES = 16
+
+_SCRYPT_ALGO = "scrypt"
+_PBKDF2_ALGO = "pbkdf2_sha256"
+_LEGACY_PBKDF2_ITERATIONS = 100_000   # 历史格式固定参数，仅用于校验旧哈希
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 
-def verify_password(password: str, stored_hash: str) -> bool:
-    """校验密码；任何格式异常都返回 False 而不是抛异常（避免信息泄露）。"""
+def _scrypt(password: bytes, salt: bytes, n: int, r: int, p: int) -> bytes:
+    """scrypt 派生；maxmem 随参数放大，避免 OpenSSL 默认 32 MB 上限误伤。"""
+    maxmem = 132 * n * r + 1024 * 1024
+    return hashlib.scrypt(password, salt=salt, n=n, r=r, p=p,
+                          maxmem=maxmem, dklen=SCRYPT_DKLEN)
+
+
+def _encode_scrypt_params(n: int, r: int, p: int) -> str:
+    return f"ln={n.bit_length() - 1},r={r},p={p}"
+
+
+def _parse_scrypt_params(raw: str):
+    """解析 "ln=15,r=8,p=1"；非法参数返回 None（视为无法识别的哈希）。"""
+    values = {}
+    for part in raw.split(","):
+        key, _, value = part.partition("=")
+        if not value or not value.isdigit():
+            return None
+        values[key.strip()] = int(value)
+    if set(values) != {"ln", "r", "p"}:
+        return None
     try:
-        salt_hex, hash_hex = stored_hash.split('$')
+        n = 1 << values["ln"]
+    except (ValueError, OverflowError):
+        return None
+    r, p = values["r"], values["p"]
+    # 参数边界：防止恶意/损坏的数据库值触发天量内存或极长计算
+    if not (1 <= values["ln"] <= 20) or not (1 <= r <= 32) or not (1 <= p <= 16):
+        return None
+    return n, r, p
+
+
+def _parse_hash(stored_hash):
+    """把存储的哈希串解析为 (算法, 参数, 盐, 摘要)。
+
+    无法识别的格式返回 None；调用方据此判定"校验失败"，而不是抛异常。
+    - 4 段：algorithm$params$salt$digest
+    - 2 段：历史格式 salt$digest（等价 pbkdf2_sha256 + 10 万次）
+    """
+    if not isinstance(stored_hash, str) or not stored_hash:
+        return None
+    parts = stored_hash.split("$")
+    try:
+        if len(parts) == 4:
+            algo, params, salt_hex, digest_hex = parts
+        elif len(parts) == 2:
+            algo, params = _PBKDF2_ALGO, str(_LEGACY_PBKDF2_ITERATIONS)
+            salt_hex, digest_hex = parts
+        else:
+            return None
+        if not _HEX_RE.match(salt_hex) or not _HEX_RE.match(digest_hex):
+            return None
         salt = bytes.fromhex(salt_hex)
-        expected = bytes.fromhex(hash_hex)
-        dk = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
-        return hmac.compare_digest(dk, expected)
-    except Exception:
+        digest = bytes.fromhex(digest_hex)
+    except (ValueError, TypeError):
+        return None
+    if not salt or not digest:
+        return None
+    return algo, params, salt, digest
+
+
+def hash_password(password: str) -> str:
+    """生成自描述密码哈希串：scrypt$ln=..,r=..,p=..$盐$摘要。"""
+    salt = os.urandom(SALT_BYTES)
+    digest = _scrypt(password.encode("utf-8"), salt, SCRYPT_N, SCRYPT_R, SCRYPT_P)
+    return f"{_SCRYPT_ALGO}${_encode_scrypt_params(SCRYPT_N, SCRYPT_R, SCRYPT_P)}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash) -> bool:
+    """校验密码。只吞掉"格式/参数不可识别"这类预期错误，程序缺陷照常抛出。"""
+    parsed = _parse_hash(stored_hash)
+    if parsed is None:
         return False
+    algo, params, salt, expected = parsed
+    try:
+        raw = password.encode("utf-8")
+        if algo == _SCRYPT_ALGO:
+            scrypt_params = _parse_scrypt_params(params)
+            if scrypt_params is None:
+                return False
+            candidate = _scrypt(raw, salt, *scrypt_params)
+        elif algo == _PBKDF2_ALGO:
+            if not params.isdigit():
+                return False
+            candidate = hashlib.pbkdf2_hmac("sha256", raw, salt, int(params))
+        else:
+            return False   # 未知算法（未来版本写入的哈希）：不通过，交由升级路径处理
+    except (ValueError, TypeError):
+        # 参数非法（如 ln 超界导致 scrypt 抛 ValueError）；不是程序缺陷
+        return False
+    return hmac.compare_digest(candidate, expected)
+
+
+def password_needs_rehash(stored_hash) -> bool:
+    """判断存储的哈希是否应升级为新格式（未知格式/旧参数一律视为需要）。"""
+    parsed = _parse_hash(stored_hash)
+    if parsed is None:
+        return True
+    algo, params, _salt, _digest = parsed
+    if algo != _SCRYPT_ALGO:
+        return True
+    return _parse_scrypt_params(params) != (SCRYPT_N, SCRYPT_R, SCRYPT_P)
+
 
 # ----- CSRF 保护（Double-Submit Cookie，无服务端状态） -----
 # 随机令牌同时写入 Cookie 与表单隐藏域，校验时只做两者比对。
 # 攻击者无法在跨站请求中同时伪造两个值：Cookie 为 HttpOnly 且 SameSite=Lax，
 # 跨站 POST 请求根本不会携带该 Cookie。
-_CSRF_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_CSRF_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
 def generate_csrf_token() -> str:
@@ -69,8 +202,12 @@ def generate_csrf_token() -> str:
 
 
 def is_valid_csrf_token(token) -> bool:
-    """校验令牌格式，防止把任意超长/异常字符串带入比较逻辑。"""
-    return isinstance(token, str) and bool(_CSRF_PATTERN.match(token))
+    """校验令牌格式，防止把任意超长/异常字符串带入比较逻辑。
+
+    用 fullmatch 而非 match：`$` 在 match 语义下允许结尾多一个换行，
+    会让 "43 个合法字符 + \\n" 通过校验（表单值里带换行并非不可能）。
+    """
+    return isinstance(token, str) and _CSRF_PATTERN.fullmatch(token) is not None
 
 
 def verify_csrf_token(submitted, expected) -> bool:
@@ -79,13 +216,53 @@ def verify_csrf_token(submitted, expected) -> bool:
         return False
     return hmac.compare_digest(submitted.encode("ascii"), expected.encode("ascii"))
 
+
+# ----- 管理员判定 -----
+# 管理员身份只有一个来源：config.toml 顶层 admin_user_id（默认 1，即最早注册的账号）。
+# 业务代码一律调用 is_admin()，不得再散落 "id == 1" 这类魔法数字。
+# admin_user_id 缺失或非法时视为"无管理员"，而不是静默回退到 id=1——
+# 静默回退会把权限悄悄授予一个意料之外的账号。
+def admin_id():
+    """返回当前配置的管理员用户 id；未配置/非法时返回 None。"""
+    from .config import config   # 延迟导入：本模块导入期不依赖 config 加载状态
+    value = config.get("admin_user_id")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def is_admin(user) -> bool:
+    """判断用户是否为管理员（user 可为 sqlite3.Row、dict 或 None）。"""
+    if not user:
+        return False
+    owner = admin_id()
+    if owner is None:
+        return False
+    try:
+        return int(user["id"]) == owner
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def is_admin_id(user_id) -> bool:
+    """按 user_id 判断管理员身份（评论行只带 user_id 时使用）。"""
+    owner = admin_id()
+    if owner is None:
+        return False
+    try:
+        return int(user_id) == owner
+    except (TypeError, ValueError):
+        return False
+
+
 # ----- Cookie 构造 -----
-def _make_cookie(name: str, value: str, secure: bool, max_age: int) -> tuple:
+def _make_cookie(name: str, value: str, secure: bool, max_age: int, http_only: bool = True) -> tuple:
     """构造 Set-Cookie 响应头（bytes 键值对，供 ASGI headers 使用）。"""
     cookie = SimpleCookie()
     cookie[name] = value
     cookie[name]["path"] = "/"
-    cookie[name]["httponly"] = True
+    if http_only:
+        cookie[name]["httponly"] = True
     cookie[name]["samesite"] = "Lax"
     cookie[name]["max-age"] = max_age
     if secure:
@@ -93,19 +270,30 @@ def _make_cookie(name: str, value: str, secure: bool, max_age: int) -> tuple:
     return (b"set-cookie", cookie[name].OutputString().encode("utf-8"))
 
 
-def set_cookie_header(token: str, secure: bool = False, max_age: int = SESSION_MAX_AGE) -> tuple:
+def set_cookie_header(token: str, secure: bool = False, max_age: int = SESSION_MAX_AGE,
+                      base: str = SESSION_COOKIE) -> tuple:
     """下发会话 Cookie（登录成功时使用）。"""
-    return _make_cookie(SESSION_COOKIE, token, secure, max_age)
+    return _make_cookie(cookie_name(base), token, secure, max_age)
 
 
-def clear_session_cookie(secure: bool = False) -> tuple:
-    """让客户端会话 Cookie 立即过期（登出/删号/改密后使用）。"""
-    return _make_cookie(SESSION_COOKIE, "", secure, 0)
+def clear_cookie_headers(secure: bool = False, base: str = SESSION_COOKIE,
+                         http_only: bool = True) -> list:
+    """返回让该 Cookie 立即过期的全部 Set-Cookie 头。
+
+    启用 __Host- 前缀后会同时清理旧的无前缀 Cookie，避免切换配置时残留旧值。
+    """
+    return [_make_cookie(name, "", secure, 0, http_only=http_only) for name in cookie_names(base)]
 
 
-def csrf_cookie_header(token: str, secure: bool = False, max_age: int = CSRF_MAX_AGE) -> tuple:
+
+def clear_session_cookie(secure: bool = False, base: str = SESSION_COOKIE) -> tuple:
+    """让客户端会话 Cookie 立即过期（登出/删号/改密后使用，单个头）。"""
+    return _make_cookie(cookie_name(base), "", secure, 0)
+
+def csrf_cookie_header(token: str, secure: bool = False, max_age: int = CSRF_MAX_AGE,
+                       base: str = CSRF_COOKIE) -> tuple:
     """下发或续期 CSRF Cookie。"""
-    return _make_cookie(CSRF_COOKIE, token, secure, max_age)
+    return _make_cookie(cookie_name(base), token, secure, max_age)
 
 
 def theme_cookie_header(value: str, secure: bool = False, max_age: int = THEME_MAX_AGE) -> tuple:
@@ -114,12 +302,24 @@ def theme_cookie_header(value: str, secure: bool = False, max_age: int = THEME_M
 
 
 def parse_cookies(scope) -> dict:
-    """从 ASGI scope 的 Cookie 请求头解析为 {name: value}。"""
-    cookie_header = ""
+    """从 ASGI scope 的 Cookie 请求头解析为 {name: value}（同名取最后一个）。
+
+    自己按 RFC 6265 的语法切分而不是交给 http.cookies.SimpleCookie：
+    后者遇到一个畸形片段（如 "=broken"）会把**整个头部**的 Cookie 全部丢弃，
+    导致一个损坏的无关 Cookie 让所有人掉线。这里只跳过畸形的那个片段。
+    """
+    cookies = {}
     for header in scope.get("headers", []):
-        if header[0] == b"cookie":
-            cookie_header = header[1].decode("utf-8", errors="ignore")
-            break
-    cookies = SimpleCookie()
-    cookies.load(cookie_header)
-    return {key: morsel.value for key, morsel in cookies.items()}
+        if header[0] != b"cookie":
+            continue
+        raw = header[1].decode("latin-1")
+        for part in raw.split(";"):
+            name, sep, value = part.partition("=")
+            if not sep:
+                continue
+            name = name.strip()
+            if not name or value.strip().startswith('"') or "=" in name:
+                # 空名 / 带引号的值（浏览器不会这样发）/ 名字里再出现 "=" 都跳过
+                continue
+            cookies[name] = value.strip()
+    return cookies

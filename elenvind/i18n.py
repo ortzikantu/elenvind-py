@@ -5,6 +5,9 @@
 - 语言代码固定为 en / zh / ja（可扩展：往 i18n/ 加文件并在 SUPPORTED_LANGS 登记）；
 - 文案文件位于项目根目录 i18n/ 下，键名即代码里的引用标识；
 - 取词回退链：目标语言 -> en -> 键名本身（不会抛 KeyError）。
+- 本模块**导入时不读磁盘**：文案在 lifespan 启动阶段由 load() 统一加载。
+  加载失败（文件缺失、TOML 语法错误、值不是字符串）会直接抛异常，
+  让服务启动失败而不是运行到某个页面才发现文案坏了。
 """
 import logging
 import tomllib
@@ -18,21 +21,49 @@ _TABLES = {}          # {lang: {key: text}}
 _I18N_DIR = Path(__file__).resolve().parent.parent / "i18n"
 
 
+class I18nError(ValueError):
+    """文案表加载失败（缺失/语法错误/类型错误）。"""
+
+
+def _validate_table(lang: str, table) -> dict:
+    if not isinstance(table, dict):
+        raise I18nError(f"i18n/{lang}.toml must contain a TOML table")
+    cleaned = {}
+    for key, value in table.items():
+        if not isinstance(value, str):
+            raise I18nError(f"i18n/{lang}.toml: value of {key!r} must be a string")
+        cleaned[key] = value
+    return cleaned
+
+
 def load() -> None:
-    """重新加载全部语言文案表（启动时调用；文件缺失/损坏时回退空表）。"""
+    """重新加载全部语言文案表（启动时调用）。
+
+    文件缺失只记 warning（此时界面会退回 en 或键名，不至于整站不可用），
+    但文件存在却解析失败 / 值类型不对会抛 I18nError，让启动阶段暴露问题。
+    """
     global _TABLES
-    _TABLES = {}
+    tables = {}
     for lang in SUPPORTED_LANGS:
         path = _I18N_DIR / f"{lang}.toml"
         try:
             with open(path, "rb") as f:
-                _TABLES[lang] = tomllib.load(f)
+                raw = tomllib.load(f)
         except FileNotFoundError:
             logger.warning("i18n file missing: %s", path)
-            _TABLES[lang] = {}
-        except Exception as e:
-            logger.error("Failed to load i18n file %s: %s", path, e)
-            _TABLES[lang] = {}
+            tables[lang] = {}
+            continue
+        except tomllib.TOMLDecodeError as e:
+            raise I18nError(f"invalid TOML in {path}: {e}") from e
+        tables[lang] = _validate_table(lang, raw)
+
+    if not tables.get("en"):
+        raise I18nError(f"i18n/{'en'}.toml is required but missing or empty")
+    _TABLES = tables
+
+
+def is_loaded() -> bool:
+    return bool(_TABLES)
 
 
 def t(lang: str, key: str, **kwargs) -> str:
@@ -62,7 +93,3 @@ def normalize(lang) -> str:
         return value
     base = value.split("-")[0].split("_")[0]
     return base if base in SUPPORTED_LANGS else "en"
-
-
-# 模块导入即加载（与 config 一致：文件变更需重启生效）
-load()

@@ -7,6 +7,7 @@
 - 删除账号区块整体用 .danger-zone 红虚线框警示；
 - 界面文案走 i18n（lang 由请求层透传）。
 """
+import sqlite3
 from datetime import datetime
 
 from .config import config
@@ -15,7 +16,6 @@ from .utils import escape_html, format_datetime, normalize_email
 from .security import (
     hash_password,
     verify_password,
-    verify_csrf_token,
     PASSWORD_MIN,
     PASSWORD_MAX,
     NICKNAME_MAX,
@@ -50,7 +50,8 @@ def _label(text: str, for_id: str = "", hint: str = "") -> str:
 
 
 def render(request_method="GET", form_data=None, user=None, csrf_token=None,
-           theme=None, path=None, lang="en"):
+           csrf_ok=True, theme=None, path=None, lang="en"):
+    form_data = form_data or {}
     title = config.get("title", "WHERE IS YOUR TITLE?")
     error = ""
     success = ""
@@ -67,8 +68,8 @@ def render(request_method="GET", form_data=None, user=None, csrf_token=None,
         return layout(title, content, user=user, theme=theme, path=path, lang=lang)
 
     if request_method == "POST":
-        submitted_token = form_data.get("csrf_token", "")
-        if not verify_csrf_token(submitted_token, csrf_token):
+        # CSRF 由分发器统一校验；这里只做业务分支
+        if not csrf_ok:
             error = t(lang, "auth_err_csrf")
         else:
             action = form_data.get("action", "")
@@ -100,22 +101,27 @@ def render(request_method="GET", form_data=None, user=None, csrf_token=None,
                                 if last_changed:
                                     try:
                                         last_dt = datetime.fromisoformat(last_changed)
-                                        if (datetime.now() - last_dt).days < NICKNAME_CHANGE_INTERVAL_DAYS:
-                                            error = t(lang, "user_err_nickname_frequency")
-                                    except Exception:
-                                        # 解析失败则视为无限制，允许更改
-                                        pass
+                                    except (TypeError, ValueError):
+                                        # 历史数据格式异常：视为无限制，允许更改
+                                        last_dt = None
+                                    if last_dt is not None and (datetime.now() - last_dt).days < NICKNAME_CHANGE_INTERVAL_DAYS:
+                                        error = t(lang, "user_err_nickname_frequency")
                             if not error:
-                                if nickname_changed:
-                                    update_user_nickname(user["id"], new_nickname)
-                                if new_email != user["email"]:
-                                    update_user_email(user["id"], new_email)
-                                success = t(lang, "user_ok_profile")
-                                user = dict(user)
-                                user["nickname"] = new_nickname
-                                user["email"] = new_email
-                                if nickname_changed:
-                                    user["nickname_changed_at"] = datetime.now().isoformat()
+                                try:
+                                    if nickname_changed:
+                                        update_user_nickname(user["id"], new_nickname)
+                                    if email_changed:
+                                        update_user_email(user["id"], new_email)
+                                except sqlite3.IntegrityError:
+                                    # 并发下邮箱被他人抢先占用：UNIQUE 约束给出最终判定
+                                    error = t(lang, "user_err_email_used")
+                                else:
+                                    success = t(lang, "user_ok_profile")
+                                    user = dict(user)
+                                    user["nickname"] = new_nickname
+                                    user["email"] = new_email
+                                    if nickname_changed:
+                                        user["nickname_changed_at"] = datetime.now().isoformat()
             elif action == "change_password":
                 old_password = form_data.get("old_password", "")
                 new_password = form_data.get("new_password", "")

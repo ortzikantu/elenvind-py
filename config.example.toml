@@ -1,29 +1,43 @@
+# ============================================================
+# Elenvind 配置模板
+# 复制为 config.toml 后按需修改：cp config.example.toml config.toml
+# 所有键的作用见 docs/CONFIGURATION.md；配置在启动时校验一次，
+# 不合法会直接拒绝启动（不会跑到某个页面才报错）。
+# 路径类配置一律相对项目根目录。
+# ============================================================
+
 locale = "zh"
 title = "Elenvind"
-copyright = "Elenvind"
-keywords = ["a", "b"]
-description = "A Personal Website Server"
+copyright = "Your Name"
+keywords = ["blog", "personal"]
+description = "My personal website"
 
-# 站点对外地址：robots.txt / sitemap.xml 里所有绝对 URL 的唯一来源。
-# 绝不从请求的 Host 头推导（Host 由客户端控制，会造成 Host 头投毒）。
-# 留空则这些文件不输出绝对地址；填了必须是不带结尾斜杠的 http(s) 绝对地址。
-site_url = "https://ortzikantu.com"
+# 站点对外地址：canonical / robots.txt / sitemap.xml 里所有绝对 URL 的唯一来源。
+# 留空则这些文件不输出绝对地址（绝不从请求的 Host 头推导，防 Host 头投毒）。
+# 必须是不带结尾斜杠的 http(s) 绝对地址。
+site_url = "https://example.com"
 
-# 管理员账号 id：可删除/恢复任意评论（不再硬编码为 1）。
-# 缺失或非法时视为"无管理员"，不会静默把权限给 id=1。
+# 管理员账号 id：拥有删/恢复任意评论的权限（不再硬编码为 1）。
 admin_user_id = 1
 
-admin_badge = ""   # 管理员徽章文字（admin_user_id 用户昵称旁）；留空彻底不显示，缺失时默认 "BIG BOSS"
-deleted_user_nickname = "已远行"
+admin_badge = "ADMIN"   # 管理员徽章文字（admin_user_id 用户昵称旁）；留空彻底不显示，缺失时默认 "BIG BOSS"
+deleted_user_nickname = "Journeyed On"
 max_length = 1000   # 单条评论最大长度（字符）：textarea 与后端双重限制
 max_comment_depth = 32             # 评论最大层级（顶层 = 1），到顶后不再提供回复入口
-max_comments_per_article = 1000    # 单篇文章评论总数上限
+max_comments_per_article = 1000    # 单篇文章评论总数上限（防无限膨胀）
 
-registration_enabled = true        # 是否开放公开注册
-max_body_size = 1048576            # POST 表单体积上限（1 MB），超出返回 413
-database = "sqlite.db"             # 相对项目根；也可用环境变量 ELENVIND_DB 覆盖
-articles_dir = "articles"          # 文章目录（相对项目根）
-usrpages_dir = "usrpages"          # 自定义页面目录（相对项目根）
+# 是否开放公开注册；false 时 /register 明确提示"已关闭注册"
+registration_enabled = true
+
+# 请求体上限（字节）：POST 表单最大体积，超出返回 413
+max_body_size = 1048576            # 1 MB
+
+# 数据库文件（相对项目根目录；也可用环境变量 ELENVIND_DB 覆盖，用于多环境隔离）
+database = "sqlite.db"
+
+# 内容目录（相对项目根目录）
+articles_dir = "articles"
+usrpages_dir = "usrpages"
 
 [server]
     host = "0.0.0.0"
@@ -32,8 +46,8 @@ usrpages_dir = "usrpages"          # 自定义页面目录（相对项目根）
     # 列表中时才信任转发头，防伪造绕过登录限流。nginx 反代场景保持回环默认即可；
     # 若代理与本站不在同一台机器，请改为代理的实际地址。
     trusted_proxies = ["127.0.0.1", "::1"]
-    # 给会话/CSRF Cookie 加 __Host- 前缀（要求全程 HTTPS + Path=/ + 无 Domain）。
-    # 仅在站点确定只能通过 HTTPS 访问时开启。
+    # 是否给会话/CSRF Cookie 加 __Host- 前缀（要求全程 HTTPS + Path=/ + 无 Domain）。
+    # 仅在站点确定只能通过 HTTPS 访问时开启，否则浏览器会拒收这些 Cookie。
     cookie_prefix = false
 
 [pagination]
@@ -45,11 +59,11 @@ usrpages_dir = "usrpages"          # 自定义页面目录（相对项目根）
     window_seconds = 60
 
 [login_limits]
-    max_email_failures = 5      # 单邮箱失败上限（主防线）
+    max_email_failures = 5      # 单邮箱失败上限（主防线，防定向爆破）
     email_window_seconds = 86400
     max_ip_failures = 20        # 单 IP 失败上限（辅助防线）
     ip_window_seconds = 900
-    max_global_failures = 200   # 全站失败上限（分布式爆破闸门）
+    max_global_failures = 200   # 全站失败上限（分布式爆破最后闸门）
     global_window_seconds = 900
 
 [register_limits]
@@ -58,17 +72,17 @@ usrpages_dir = "usrpages"          # 自定义页面目录（相对项目根）
 
 [static]
     # 全站样式表；留空回退 /style.css
-    css = "https://raw.githack.com/ortzikantu/elenvind-py/refs/heads/trunk/static/style.css"
+    css = "/static/style.css"
 
     # 站点图标；留空回退 /favicon.ico
-    favicon = "http://192.168.1.182/static/favicon.ico"
+    favicon = "/static/favicon.ico"
 
     # 首页Hero大图
-    hero = "https://ortzikantu.com/assets/imgs/hero_hu_a43a6d82c671954c.webp"
+    hero = "/static/hero.webp"
 
 [params]
-  author = "Genius"
-  intro = "Hey there! 👋 很高兴在这里与你相遇。🌟お幸せに~"
+  author = "Your Name"
+  intro = "Hi, welcome to my site."
 
 ###################################################################################################
 
@@ -84,17 +98,17 @@ usrpages_dir = "usrpages"          # 自定义页面目录（相对项目根）
   [[params.social]]
     name = "Codeberg"
     url = "https://codeberg.org/"
-    icon = "http://192.168.1.182/static/codeberg.svg"
+    icon = "/static/codeberg.svg"
   [[params.social]]
     name = "Github"
     url = "https://github.com/"
-    icon = "http://192.168.1.182/static/github.svg"
+    icon = "/static/github.svg"
   
 ###################################################################################################
 
   [[params.projects]]
     name = "Elenvind"
-    url = "https://github.com/ortzikantu/elenvind"
+    url = "https://codeberg.org/yourname/elenvind"
     description = "本站运行的基石，仅用 Python 标准库、SQLite 与 uvicorn 构建的博客。"
 
 ###################################################################################################

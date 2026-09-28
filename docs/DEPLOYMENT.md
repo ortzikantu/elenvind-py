@@ -51,15 +51,18 @@ python run.py
 
 ### 1. 修改配置文件
 
-编辑 `config.toml`：
+编辑 `config.toml`（模板见 `config.example.toml`）：
 
 ```toml
+site_url = "https://example.com"   # robots.txt / sitemap.xml 的绝对地址来源（必改）
+
 [server]
     host = "127.0.0.1"     # 只允许本机回源，配合 trusted_proxies 安全边界
     port = 6789
 ```
 
 同步按需填写 `[static]` 与 `params.social.icon` 等 URL（指向 Nginx 静态目录）。
+配置在启动时校验，取值非法会直接拒绝启动并在控制台/日志给出具体原因。
 
 ### 2. 准备静态资源目录
 
@@ -146,12 +149,14 @@ curl -I https://example.com/login                     # 无 Server 版本泄露
 cd /opt/elenvind-py
 git pull
 .venv/bin/pip install -r requirements.txt      # 依赖有变化时
+python -m unittest discover -s tests -t .      # 可选：先跑一遍自带测试
 sudo systemctl restart elenvind
 ```
 
-数据库向后兼容：启动时 `CREATE TABLE/INDEX IF NOT EXISTS` 幂等补表，
-旧库无需手工迁移。`articles/*.evmd` 与 `usrpages/*.evmd` 为纯内容文件，
-升级不会触碰；**升级前仍建议先做一次数据库备份**（见运维文档）。
+数据库迁移：schema 版本记录在 `PRAGMA user_version`，启动时会自动检测并执行迁移
+（`db_base.migrate`，幂等、可重复执行），**旧库可以直接启动**，无需手工改表。
+`articles/*.evmd` 与 `usrpages/*.evmd` 为纯内容文件，升级不会触碰；
+**升级前仍建议先做一次数据库备份**（见运维文档）。
 
 ## 六、备份（重要）
 
