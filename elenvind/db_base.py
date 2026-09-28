@@ -32,15 +32,23 @@ DB_PATH = Path(os.environ.get("ELENVIND_DB", str(DEFAULT_DB_PATH)))
 def apply_db_path():
     """把 config.toml 的 database 键（相对项目根）应用到 DB_PATH。
 
-    ELENVIND_DB 环境变量的优先级更高（部署隔离 / 测试用），因此显式设置过就沿用。
+    优先级（与 docs/CONFIGURATION.md 一致）：
+        ELENVIND_DB 环境变量  >  config.toml 的 database  >  默认 <项目根>/sqlite.db
+
+    配置为空时**显式回落到默认路径**，而不是保留当前值——否则空配置会让
+    "数据库在哪"取决于进程之前碰过什么，属于隐式状态。
     """
     global DB_PATH
-    if os.environ.get("ELENVIND_DB"):
-        return DB_PATH
     from .config import config, resolve_path
+
+    if os.environ.get("ELENVIND_DB"):
+        DB_PATH = Path(os.environ["ELENVIND_DB"])
+        return DB_PATH
     configured = config.get("database")
     if isinstance(configured, str) and configured.strip():
         DB_PATH = resolve_path(configured, DEFAULT_DB_PATH)
+    else:
+        DB_PATH = DEFAULT_DB_PATH
     return DB_PATH
 
 

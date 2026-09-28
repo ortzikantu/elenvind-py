@@ -87,10 +87,13 @@ class Response:
 class AppHarness:
     """把 elenvind.app.app 当作真实 ASGI 应用来调用。"""
 
-    def __init__(self, host="example.com", scheme="https", client=("203.0.113.7", 44321)):
+    #: 默认直连对端：模拟"应用前面有一台受信代理"（127.0.0.1 在默认白名单内）
+    DEFAULT_PEER = ("127.0.0.1", 44321)
+
+    def __init__(self, host="example.com", scheme="https", client=None):
         self.host = host
         self.scheme = scheme
-        self.client = client
+        self.client = client or self.DEFAULT_PEER
         self.started = False
 
     # ---------- lifespan ----------
@@ -302,6 +305,7 @@ class ElenvindTestCase(unittest.TestCase):
                 "cookie_prefix": False,
             },
             "pagination": {"per_page": 6},
+            "params": {"intro": "", "nav": [], "social": [], "projects": []},
             "comment_limits": {"max_per_user": 5, "max_per_ip": 10, "window_seconds": 60},
             "login_limits": {
                 "max_email_failures": 5, "email_window_seconds": 86400,
@@ -349,7 +353,7 @@ class ElenvindTestCase(unittest.TestCase):
         return self.app.request("POST", "/login",
                                 form={"email": email, "password": password,
                                       "csrf_token": token},
-                                cookies={self.csrf_cookie_name(): token})
+                                cookies=self.csrf_cookies(token))
 
     def login_ok(self, email, password):
         """登录并返回 (session_token, csrf_token)；失败时断言失败。"""
@@ -362,7 +366,7 @@ class ElenvindTestCase(unittest.TestCase):
     def new_session(self):
         """为一个全新客户端取出 (csrf_token, cookies 字典)。"""
         token = self.fetch_csrf()
-        return token, {self.csrf_cookie_name(): token}
+        return token, self.csrf_cookies(token)
 
     def app_cookies(self, session=None, csrf=None, theme=None):
         jar = {}
@@ -375,17 +379,32 @@ class ElenvindTestCase(unittest.TestCase):
         return jar
 
     def fetch_csrf(self):
-        """GET /login 拿一个 CSRF 令牌（含 Cookie 下发）。"""
+        """GET /login 拿一个 CSRF 令牌（含 Cookie 下发）。
+
+        必须按**当前**的 Cookie 命名取（cookie_prefix 开启时是 `__Host-csrf`），
+        否则开启前缀后所有依赖本方法的测试都会因令牌不匹配而失败。
+        """
+        from elenvind.security import CSRF_COOKIE, cookie_name
+
         response = self.app.request("GET", "/login")
-        return self.app.set_cookie_value(response, "csrf")
+        token = self.app.set_cookie_value(response, cookie_name(CSRF_COOKIE))
+        if not token:
+            token = self.app.set_cookie_value(response, CSRF_COOKIE)
+        self.assertTrue(token, "login page did not issue a CSRF cookie")
+        return token
+
+    def csrf_cookies(self, token):
+        """返回携带当前命名 CSRF Cookie 的 cookies 字典。"""
+        from elenvind.security import CSRF_COOKIE, cookie_name
+        return {cookie_name(CSRF_COOKIE): token}
 
     def csrf_cookie_name(self):
-        from elenvind.security import CSRF_COOKIE
-        return CSRF_COOKIE
+        from elenvind.security import CSRF_COOKIE, cookie_name
+        return cookie_name(CSRF_COOKIE)
 
     def session_cookie_name(self):
-        from elenvind.security import SESSION_COOKIE
-        return SESSION_COOKIE
+        from elenvind.security import SESSION_COOKIE, cookie_name
+        return cookie_name(SESSION_COOKIE)
 
 
 def _cookie_value(set_cookie: str, name: str) -> str:

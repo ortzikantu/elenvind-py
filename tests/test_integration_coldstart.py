@@ -12,7 +12,6 @@ from tests.support import PROJECT_ROOT, AppHarness, run_async  # noqa: F401
 from elenvind import articles as articles_module
 from elenvind import config as config_module
 from elenvind import db_base
-from elenvind import i18n as i18n_module
 from elenvind import lifespan as lifespan_module
 from elenvind import usrpages as usrpages_module
 from elenvind.config import apply_runtime_config, load_config, validate_config

@@ -40,6 +40,23 @@ def _theme_link_html(theme, path, lang: str) -> str:
     )
 
 
+def _brand_html(title: str) -> str:
+    """站标 + 站名组成一个整体链接。
+
+    图标 URL 取 config.toml [static].logo，留空回退 [static].favicon；
+    两级都留空则只显示站名（不输出 <img>，避免裂图）。
+    取值来自管理员配置，但进入 HTML 属性仍统一转义。
+    """
+    static_cfg = config.get("static") or {}
+    logo_url = str(static_cfg.get("logo") or static_cfg.get("favicon") or "").strip()
+    icon_html = f'<img src="{escape_html(logo_url)}" alt="" loading="lazy">' if logo_url else ""
+    return (
+        f'<a class="header-brand" href="/">'
+        f'{icon_html}<span class="header-title">{escape_html(title)}</span>'
+        f"</a>"
+    )
+
+
 def render(user=None, theme=None, path=None, lang="en") -> str:
     title = config.get("title", "WHERE IS YOUR TITLE?")
     admin_badge = str(config.get("admin_badge", "BIG BOSS")).strip()
@@ -51,9 +68,7 @@ def render(user=None, theme=None, path=None, lang="en") -> str:
 
     return f"""
     <header>
-        <a class="header-title" href="/">
-            {escape_html(title)}
-        </a>
+        {_brand_html(title)}
 
         <nav class="header-nav">
             <ul>

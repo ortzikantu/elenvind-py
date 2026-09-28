@@ -11,7 +11,7 @@ import time
 import unittest
 from urllib.parse import parse_qs
 
-from tests.support import PROJECT_ROOT  # noqa: F401
+from tests.support import PROJECT_ROOT, ElenvindTestCase  # 导入即完成 sys.path 设置
 
 from elenvind.evmd_header import EvmdError, split_document
 from elenvind.evmd_inline import MAX_INLINE_LENGTH, parse_inline, safe_url
@@ -169,7 +169,6 @@ class FormParserFuzzTests(unittest.TestCase):
 
     def test_fuzz_over_http_layer(self):
         """端到端：随机垃圾表单不得让应用返回 5xx。"""
-        from tests.support import ElenvindTestCase
 
         class _HttpFuzz(ElenvindTestCase):
             def runTest(self):
@@ -191,6 +190,21 @@ class FormParserFuzzTests(unittest.TestCase):
             case.runTest()
         finally:
             case.tearDown()
+
+    def test_shipped_content_files_never_break_the_parser(self):
+        """仓库内真实内容文件（示例文章 + 自定义页面）必须都能安全解析。"""
+        candidates = list((PROJECT_ROOT / "articles").glob("*.evmd"))
+        candidates += list((PROJECT_ROOT / "usrpages").glob("*.evmd"))
+        self.assertTrue(candidates, "no shipped .evmd content found")
+        for path in candidates:
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                try:
+                    html = evmd_to_html(text)
+                except EvmdError:
+                    html = ""   # 示例内容允许带文档头语法错误，但不得抛别的异常
+                self.assertIsInstance(html, str)
+                self.assertNotIn("<script", html.lower())
 
 
 if __name__ == "__main__":

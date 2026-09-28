@@ -63,11 +63,13 @@ usrpages_dir = "usrpages"          # 自定义页面目录（相对项目根）
     # 站点图标；留空回退 /favicon.ico
     favicon = "http://192.168.1.182/static/favicon.ico"
 
+    # 页头站标图标（与站名并排）；留空回退 favicon，两级都留空则只显示站名
+    logo = "http://192.168.1.182/static/logo.png"
+
     # 首页Hero大图
     hero = "https://ortzikantu.com/assets/imgs/hero_hu_a43a6d82c671954c.webp"
 
 [params]
-  author = "Genius"
   intro = "Hey there! 👋 很高兴在这里与你相遇。🌟お幸せに~"
 
 ###################################################################################################

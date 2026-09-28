@@ -155,6 +155,7 @@ sqlite3 sqlite.db "DELETE FROM login_attempts WHERE ip = '1.2.3.4';"          # 
 | 页面 500 | 先看 `logs/app.log` 尾部堆栈：文章语法错误会在日志点名文件；修复即热更新 |
 | 控制台报 CSP 拦截 inline script | 页面本身零脚本；通常是**浏览器扩展**注入被 `script-src 'none'` 正确拦下，忽略即可 |
 | 评论图标/社交图标裂图 | `params.social.icon` 或 `[static]` URL 与 Nginx 实际路径不一致；先 curl 该 URL |
+| 页头没有站标图标 | `[static].logo` 与 `[static].favicon` 都为空 → 按设计只显示站名文字；填上任一个即可 |
 | 登录后提示 "Too many failed attempts for this account…" | 单邮箱失败 5 次；等 24 小时窗口或按第五节 SQL 清除 |
 | 改了 config.toml 没生效 | 配置非热加载，需重启 |
 | 图片并排错位 | 检查图片行是否用 `@{img,url,NN%}` 方言且各份额和 ≤100（含间隙预算），语法见 EVMD_SPEC |
@@ -163,7 +164,30 @@ sqlite3 sqlite.db "DELETE FROM login_attempts WHERE ip = '1.2.3.4';"          # 
 ## 八、日常安全检查清单
 
 1. 应用端口未被公网直连（`host=127.0.0.1` 或防火墙）；确认 `trusted_proxies` 只含真实代理；
+   **这是本应用最重要的前置条件**：端口一旦公网可达，客户端可直接伪造
+   `X-Forwarded-Proto: https`（uvicorn 会采信），并绕过全部代理假定。
 2. 全站 HTTPS 可达，登录 Cookie 带 `Secure`；
-3. 定期 `git pull` 跟进安全修复，升级前备份数据库；
-4. 偶尔翻阅 `login_attempts` 里的失败流水是否有异常来源 IP；
-5. 软删除评论积累后跑一次 `purge.py` 清理（可选）。
+3. 若代理不在本机：`trusted_proxies` 与 uvicorn 的 `--forwarded-allow-ips`
+   必须同时指向该代理，否则 HTTPS 下 Cookie 不会带 `Secure`（见《配置文件使用指南》代理信任边界）；
+4. 定期 `git pull` 跟进安全修复，升级前备份数据库；
+5. 偶尔翻阅 `login_attempts` 里的失败流水是否有异常来源 IP；
+6. 软删除评论积累后跑一次 `purge.py` 清理（可选）。
+
+## 九、上线部署核对清单（逐条确认）
+
+| # | 项目 | 期望 |
+|---|---|---|
+| 1 | HTTPS | 浏览器访问全站跳转 HTTPS，证书有效 |
+| 2 | `site_url` | 已填成真实对外域名（robots/sitemap 的绝对 URL 只来自它） |
+| 3 | `Secure` Cookie | 开发者工具里 `session`/`csrf` 带 `Secure`（经 HTTPS 访问时） |
+| 4 | `__Host-` Cookie | 若 `cookie_prefix = true`：`Set-Cookie` 名为 `__Host-session`/`__Host-csrf`，且站点**只能**通过 HTTPS 访问 |
+| 5 | `trusted_proxies` | 只包含真实代理地址（默认回环）；不含任何公网地址 |
+| 6 | 代理与 uvicorn | 代理不在本机时，`run.py` 的 `forwarded_allow_ips` 需改为该代理地址 |
+| 7 | 应用端口 | 防火墙/安全组封闭，公网无法直连 `host:port` |
+| 8 | 数据库备份 | 已配置 `sqlite3 … ".backup …"` 定时任务（WAL 下勿直接拷贝文件） |
+| 9 | 数据库权限 | `sqlite.db` 仅服务账号可读写，目录不可被他人写入 |
+| 10 | 日志权限 | `logs/` 仅服务账号可读写；确认日志内不含密码/token（应用已保证） |
+| 11 | 注册策略 | 需要私有站点时设 `registration_enabled = false`，或保持注册并依赖 IP 限流 |
+| 12 | 管理员账号 | 第一个注册的账号 id 记为 `admin_user_id`，或显式设定；确认导航出现管理员徽章 |
+| 13 | 静态资源 | `[static]` 与 `params.social.icon` 的 URL 在浏览器可 200 打开（无裂图） |
+| 14 | 自检命令 | `python -m unittest discover -s tests -t .` 全绿；`SECRET_KEY=… python smoke_driver.py` 全绿 |

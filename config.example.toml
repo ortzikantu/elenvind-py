@@ -77,11 +77,13 @@ usrpages_dir = "usrpages"
     # 站点图标；留空回退 /favicon.ico
     favicon = "/static/favicon.ico"
 
-    # 首页Hero大图
+    # 页头站标图标（与站名并排）；留空回退 favicon，两级都留空则只显示站名
+    logo = "/static/logo.png"
+
+    # 首页Hero大图；留空则不显示 hero 区
     hero = "/static/hero.webp"
 
 [params]
-  author = "Your Name"
   intro = "Hi, welcome to my site."
 
 ###################################################################################################

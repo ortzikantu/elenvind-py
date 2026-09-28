@@ -5,7 +5,6 @@ import unittest
 from tests.support import ElenvindTestCase
 
 from elenvind import articles as articles_module
-from elenvind import usrpages as usrpages_module
 from elenvind.articles import (
     MAX_ARTICLE_SIZE,
     get_article_by_slug,

@@ -1,7 +1,5 @@
 """安全原语测试：密码哈希、自描述格式、渐进式 rehash、CSRF 令牌、Cookie 构造。"""
 import hashlib
-import os
-import re
 import unittest
 
 from tests.support import PROJECT_ROOT  # noqa: F401  (确保 sys.path 就绪)

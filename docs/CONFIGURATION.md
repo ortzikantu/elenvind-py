@@ -25,7 +25,7 @@
 | `max_comments_per_article` | `1000` | 单篇文章评论总数上限，超出返回 429。 |
 | `registration_enabled` | `true` | 是否开放公开注册；`false` 时 `/register` 只显示"已关闭注册"。 |
 | `max_body_size` | `1048576` | POST 请求体上限（字节，1 MB）。超出返回 413，缺 `Content-Length` 返回 411，非表单类型返回 415。 |
-| `database` | `"sqlite.db"` | SQLite 文件路径（相对项目根）。环境变量 `ELENVIND_DB` 优先级更高。 |
+| `database` | `"sqlite.db"` | SQLite 文件路径（相对项目根）。**优先级：`ELENVIND_DB` 环境变量 > 本键 > 默认 `<项目根>/sqlite.db`**；本键留空时显式回落到默认路径（不会沿用进程里上一次的取值）。 |
 | `articles_dir` | `"articles"` | 文章目录（相对项目根）。 |
 | `usrpages_dir` | `"usrpages"` | 自定义页面目录（相对项目根）。 |
 
@@ -39,8 +39,29 @@
 |---|---|---|
 | `host` | `"0.0.0.0"` | 监听地址。**生产请改 `"127.0.0.1"`**，只让 Nginx 本机回源。 |
 | `port` | `6789` | 监听端口（1–65535，越界启动失败）。 |
-| `trusted_proxies` | `["127.0.0.1","::1"]` | **安全相关**：只有直连对端属于该列表时，`X-Forwarded-For` 才会被采信为客户端 IP（登录/评论限流按此计数）。切勿加入公网地址。 |
+| `trusted_proxies` | `["127.0.0.1","::1"]` | **安全相关**：只有直连对端属于该列表时，`X-Forwarded-For` 才会被采信为客户端 IP（登录/评论限流按此计数）。`X-Real-IP` 一律不采信。切勿加入公网地址。 |
 | `cookie_prefix` | `false` | 是否给会话/CSRF Cookie 加 `__Host-` 前缀。要求全程 HTTPS + `Path=/` + 无 Domain；仅在站点确定只能通过 HTTPS 访问时开启。开启后读取侧仍兼容旧的无前缀 Cookie，切换不会把所有人踢下线。 |
+
+### 代理信任边界（务必理解，涉及两个层次）
+
+应用对"代理"的信任分两处，默认值一致、可分别调整：
+
+1. **HTTP scheme（`https` 判定）**由 uvicorn 负责。`run.py` 以
+   `proxy_headers=True` + `forwarded_allow_ips="127.0.0.1"` 启动，
+   即**只有回环地址**的 `X-Forwarded-Proto` 会被采信，据此决定
+   `Secure` Cookie 与 HSTS 是否下发。
+2. **客户端 IP** 由应用负责，规则见 `trusted_proxies`（本表上一行）。
+
+两者必须都能对得上，安全边界才完整：
+
+- 代理在**本机回环**（默认拓扑）：两级都默认生效，无需额外配置。
+- 代理在**其它地址**：除了把该地址写进 `trusted_proxies`，
+  还必须用 `uvicorn --forwarded-allow-ips="<代理地址>"` 直接启动
+  （不要再用 `run.py` 的内置默认值），否则 `X-Forwarded-Proto` 不被采信，
+  HTTPS 下 `Secure` Cookie 不会下发。
+- **防火墙必须封闭应用端口**：若应用端口可被公网直连，攻击者可以直接伪造
+  `X-Forwarded-Proto: https`（uvicorn 会当成真实 scheme）以及绕过全部代理假定。
+  这是本应用最重要的部署前置条件。
 
 ## `[pagination]` 分页
 
@@ -85,8 +106,8 @@
 |---|---|---|
 | `css` | `/style.css` | 全站样式表 URL。可指向 Nginx/CDN 的绝对地址，或留空用站点相对路径。 |
 | `favicon` | `/favicon.ico` | 浏览器标签页图标 URL。 |
-| `hero` | 空（不显示） | 首页 hero 背景图 URL。 |
-| `logo` | 回退 `favicon` | 页头站标图标 URL；两级都留空则不显示图标。 |
+| `logo` | 回退 `favicon` | **页头站标图标** URL，与站名并排显示（`<a class="header-brand">`）；留空回退 `favicon`，两级都留空则只显示站名文字（不输出 `<img>`，不会裂图）。 |
+| `hero` | 空（不显示） | 首页 hero 背景图 URL；留空则整块 hero 区不渲染。 |
 
 取值只允许：留空、站内绝对路径（`/x`）或 http(s) 绝对 URL；
 协议相对形式（`//host/x`）会被启动校验拒绝。
@@ -99,8 +120,10 @@
 
 | 键 | 说明 |
 |---|---|
-| `author` | 作者名（预留键，当前首页文案以 `intro` 为准）。 |
 | `intro` | 首页 about 区介绍段落，原样转义输出；整行删除则该段落消失。 |
+
+> 没有 `params.author`：文章作者来自每篇 `.evmd` 文档头的 `authors = [...]`
+> （见 `docs/EVMD_SPEC.md`），不设全局作者配置，避免出现"配置里写着作者但页面不读"的死配置。
 
 ### `[[params.nav]]` 顶栏/页脚导航（可多条）
 

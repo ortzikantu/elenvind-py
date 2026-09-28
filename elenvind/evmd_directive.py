@@ -40,14 +40,11 @@ MAX_DIRECTIVE_LINE = 2048
 
 
 def _esc_url(url: str):
-    """URL 协议白名单校验 + 属性转义；不合法返回 None。"""
-    if not safe_url(url):
-        return None
-    return escape_html(url)
+    """URL 协议白名单校验 + 属性转义；不合法返回 None。
 
-
-def _esc_url(url: str):
-    """URL 协议白名单校验 + 属性转义；不合法返回 None。"""
+    全项目唯一的指令 URL 转义实现：`@{img}` / `@{video}` 都走这里，
+    scheme 白名单与属性转义只在一处维护。
+    """
     if not safe_url(url):
         return None
     return escape_html(url)

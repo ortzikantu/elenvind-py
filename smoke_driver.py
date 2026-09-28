@@ -85,6 +85,8 @@ def prepare_config():
     config["usrpages_dir"] = str(TMP / "usrpages")
     config["logging"] = {"level": "critical", "file": str(TMP / "app.log")}
     config["site_url"] = "https://smoke.example.com"
+    config["static"] = {"css": "/static/style.css", "favicon": "/static/favicon.ico",
+                        "logo": "/static/logo.png", "hero": "/static/hero.webp"}
     (TMP / "articles").mkdir()
     (TMP / "usrpages").mkdir()
     (TMP / "articles" / "smoke.evmd").write_text(
@@ -146,6 +148,8 @@ def run_checks():
     check("首页列出文章", "Smoke Post" in body)
     check("安全响应头", headers.get("x-content-type-options") == "nosniff")
     check("CSP 禁用脚本", "script-src 'none'" in (headers.get("content-security-policy") or ""))
+    check("页头站标结构", '<a class="header-brand" href="/">' in body)
+    check("站标图标来自配置", "/logo.png" in body)
 
     status, body, _ = fetch(opener, "GET", "/article/smoke")
     check("文章页 200", status == 200, status)

@@ -1,7 +1,7 @@
 """EVMD 行内语法测试：转义、code、粗斜体、删除线、链接、脚注引用、注入防护。"""
 import unittest
 
-from tests.support import PROJECT_ROOT  # noqa: F401
+from tests.support import PROJECT_ROOT  # 导入即完成 sys.path 设置，同时用于示例文件断言
 
 from elenvind.evmd_inline import (
     MAX_INLINE_LENGTH,
@@ -216,6 +216,18 @@ class InlineRobustnessTests(unittest.TestCase):
         twice = parse_inline(once)
         self.assertNotIn("<strong>", twice)
         self.assertNotIn("<code>", twice)
+
+    def test_shipped_sample_article_has_no_raw_html_in_output(self):
+        """仓库内示例文章整篇渲染后不得出现任何原生脚本/事件属性。"""
+        from elenvind.evmd_parser import parse_document
+
+        sample = PROJECT_ROOT / "articles" / "2026-09-07-evmd-syntax-showcase.evmd"
+        if not sample.exists():
+            self.skipTest("sample article not present")
+        _meta, html = parse_document(sample.read_text(encoding="utf-8"), require_header=True)
+        lowered = html.lower()
+        for marker in ("<script", "javascript:", "onerror=", "onload=", "<iframe"):
+            self.assertNotIn(marker, lowered)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """EVMD 行级指令测试：@{img} / @{video} 的属性转义、协议白名单、并排换算、畸形输入。"""
 import unittest
 
-from tests.support import PROJECT_ROOT  # noqa: F401
+from tests.support import PROJECT_ROOT  # 导入即完成 sys.path 设置，同时用于示例文件断言
 
 from elenvind.evmd_directive import (
     MAX_DIRECTIVE_LINE,
@@ -142,6 +142,22 @@ class DirectiveInDocumentTests(unittest.TestCase):
         lines = [f'@{{img, https://e.com/{i}.png, 100%}}' for i in range(total)]
         html = evmd_to_html("\n".join(lines))
         self.assertEqual(html.count("<img"), total)
+
+    def test_shipped_sample_article_directives_render_safely(self):
+        """仓库内示例文章的图片/视频指令必须渲染成安全 HTML（内容兼容性回归）。"""
+        sample = PROJECT_ROOT / "articles" / "2026-09-07-evmd-syntax-showcase.evmd"
+        if not sample.exists():
+            self.skipTest("sample article not present")
+        html = evmd_to_html(sample.read_text(encoding="utf-8"))
+        self.assertTrue("<img" in html or "<video" in html,
+                        "sample article no longer exercises image/video directives")
+        self.assertNotIn("javascript:", html.lower())
+        self.assertNotIn("<script", html.lower())
+        # 所有渲染出的 src 都必须是白名单协议
+        for chunk in html.split('src="')[1:]:
+            url = chunk.split('"', 1)[0]
+            self.assertTrue(url.startswith(("http://", "https://")),
+                            f"non-whitelisted src rendered: {url!r}")
 
 
 if __name__ == "__main__":

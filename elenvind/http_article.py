@@ -74,11 +74,12 @@ def article_get(ctx, slug: str):
 
 def comment_create_post(ctx, slug: str):
     """发布评论：POST /article/{slug}/comment"""
+    if not slug or get_article_by_slug(slug) is None:
+        # 空 slug 与不存在的文章一律 404：拒绝为不存在的文章写入孤儿评论，
+        # 且不让"路径形态错误"退化成 403（权限语义）造成误读
+        return plain_response("Article not found", 404)
     if not ctx.user:
         return plain_response("Forbidden", 403)
-    if get_article_by_slug(slug) is None:
-        # 拒绝为不存在的文章写入孤儿评论
-        return plain_response("Article not found", 404)
 
     content_text = ctx.form.get("content", "").strip()
     max_len = config.get("max_length", 1000)

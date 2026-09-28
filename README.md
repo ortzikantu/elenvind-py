@@ -23,7 +23,9 @@ Everything in Chinese, because we're classy like that:
 
 ## Getting started
 
-This is an SSR Python Web App that's both painful and joyful. No external deps except Uvicorn. Just for fun.
+A standard-library-based SSR web app, with **Uvicorn as the ASGI server** — that is the
+only runtime dependency (`requirements.txt` also pins Uvicorn's own `click`/`h11`).
+No ORM, no template engine, no framework, no build step. Just for fun.
 
 ```bash
 git clone https://codeberg.org/ortzikantu/elenvind.git elenvind-py
@@ -46,6 +48,19 @@ cp config.example.toml config.toml
 For CSS, images, and whatnot, you're on your own. Set up Nginx (or equivalent) or a CDN. I can't be bothered.
 Static URLs live in `config.toml` (`[static]` + `params.social.icon`). See the Configuration Guide.
 `config.toml` is validated once at startup: a typo means a refused start with a reason, not a 500 later.
+
+### What it is made of
+
+| Concern | Choice |
+|---|---|
+| Runtime | Python standard library + Uvicorn (ASGI) |
+| Rendering | Server-side HTML strings, Zero-JS |
+| Database | SQLite (WAL, `PRAGMA foreign_keys=ON`, `user_version` migrations) |
+| Markup | EVMD — this project's own format (see `docs/EVMD_SPEC.md`) |
+| Sessions | Server-side random tokens in SQLite (not JWT) |
+| Passwords | `hashlib.scrypt`, self-describing hashes, transparent rehash on login |
+| CSRF | Double-submit cookie, enforced in one dispatcher gate |
+| Cache | In-process file-snapshot caches for articles and custom pages |
 
 ## Any Tips
 

@@ -5,7 +5,7 @@ import unittest
 from tests.support import ElenvindTestCase
 
 from elenvind.db_base import get_connection
-from elenvind.db_login import count_email_failures, count_ip_failures
+from elenvind.db_login import count_email_failures
 from elenvind.db_session import get_session_user
 from elenvind.db_user import get_user_by_email, get_user_by_id
 from elenvind.security import hash_password, password_needs_rehash, verify_password

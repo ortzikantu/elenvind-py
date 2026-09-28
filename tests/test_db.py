@@ -1,6 +1,8 @@
 """数据库层测试：外键、schema 迁移、连接生命周期、约束、限流流水与数据完整性。"""
+import os
 import sqlite3
 import unittest
+from pathlib import Path
 
 from tests.support import ElenvindTestCase
 
@@ -131,10 +133,15 @@ class SchemaTests(ElenvindTestCase):
         conn.commit()
         conn.close()
 
-        original = db_base.DB_PATH
+        # 优先级是 ELENVIND_DB > config.database > 默认路径，
+        # 因此要让 init_db() 作用于这个旧库，必须连环境变量一起指向它。
+        original_path = db_base.DB_PATH
+        original_env = os.environ.get("ELENVIND_DB")
         db_base.DB_PATH = legacy_path
+        os.environ["ELENVIND_DB"] = str(legacy_path)
         try:
             init_db()
+            self.assertEqual(Path(db_base.DB_PATH), legacy_path)   # 确认打在旧库上
             with get_connection() as check:
                 self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
                 rows = {row["content"]: row["parent_id"] for row in check.execute(
@@ -142,7 +149,11 @@ class SchemaTests(ElenvindTestCase):
                 sql = check.execute(
                     "SELECT sql FROM sqlite_master WHERE name = 'comment'").fetchone()[0]
         finally:
-            db_base.DB_PATH = original
+            db_base.DB_PATH = original_path
+            if original_env is None:
+                os.environ.pop("ELENVIND_DB", None)
+            else:
+                os.environ["ELENVIND_DB"] = original_env
 
         self.assertEqual(rows["root"], None)
         self.assertEqual(rows["child"], 1)
