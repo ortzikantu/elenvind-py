@@ -1,0 +1,49 @@
+{# 评论区：数据（含权限判断与展示文本）由 Feature 准备成 comment_rows，
+   模板只负责排版。author / reply_to 是纯文本（Jinja 自动转义），
+   content 是 Feature 产出的 Markup（已转义并保留换行）。 #}
+<section class="comments" id="comments">
+  <h2>{{ t('comment_comments', total=comment_total) }}</h2>
+
+  {% if comment_rows %}
+    {% for row in comment_rows %}
+      <div class="{{ 'comment' if row.depth <= 1 else 'comment comment-reply' }}">
+        <div class="meta">
+          <span>{{ row.author }}{% if row.badge %} <span class="badge-admin">{{ row.badge }}</span>{% endif %} · {{ row.created }}</span>
+          <div class="comment-actions">
+            {% for action in row.actions %}
+              <form method="post" action="{{ action.url }}" class="comment-form">
+                {{ csrf_input() }}
+                <button type="submit" class="{{ action.css }}">
+                  {%- if action.action == 'delete' %}{{ t('comment_delete') }}{% else %}{{ t('comment_restore') }}{% endif -%}
+                </button>
+              </form>
+            {% endfor %}
+            {% if row.reply_url %}
+              <a class="reply-link" href="{{ row.reply_url }}">{{ t('comment_reply') }}</a>
+            {% endif %}
+          </div>
+        </div>
+        <p class="comment-body">
+          {%- if row.reply_to %}<span class="reply-to">{{ row.reply_to }} </span>{% endif -%}
+          {{ row.content }}
+        </p>
+      </div>
+    {% endfor %}
+  {% else %}
+    <p>{{ t('comment_none') }}</p>
+  {% endif %}
+</section>
+
+{% if user %}
+  <h3>{{ t('comment_post_title') }}</h3>
+  <form method="post" action="/article/{{ article.slug }}/comment">
+    {{ csrf_input() }}
+    <input type="hidden" name="reply_to" value="{{ reply_to_value }}">
+    {% if reply_to_message %}<p>{{ reply_to_message }}</p>{% endif %}
+    <textarea name="content" rows="4" required maxlength="{{ max_comment_length }}"
+              placeholder="{{ t('comment_placeholder') }}"></textarea>
+    <button type="submit">{{ t('comment_submit') }}</button>
+  </form>
+{% else %}
+  <p>{{ t('comment_login_hint') }}</p>
+{% endif %}

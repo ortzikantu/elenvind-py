@@ -4,8 +4,8 @@ import unittest
 
 from tests.support import PROJECT_ROOT  # noqa: F401  (确保 sys.path 就绪)
 
-from elenvind import security
-from elenvind.security import (
+from elenvind.core import security
+from elenvind.core.security import (
     CSRF_MAX_AGE,
     SESSION_MAX_AGE,
     clear_session_cookie,
@@ -207,7 +207,7 @@ class CookieHeaderTests(unittest.TestCase):
         self.assertEqual(attrs.get("samesite"), "Lax")
 
     def test_host_prefix_can_be_enabled_and_disabled(self):
-        from elenvind.security import configure_cookie_prefix, cookie_names, pick_cookie
+        from elenvind.core.security import configure_cookie_prefix, cookie_names, pick_cookie
         try:
             configure_cookie_prefix(True)
             name, _, _ = self._parse(set_cookie_header("tok"))
@@ -217,7 +217,7 @@ class CookieHeaderTests(unittest.TestCase):
             self.assertEqual(pick_cookie({"session": "b"}, "session"), "b")
             self.assertIn("session", cookie_names("session"))
             # 清理时两个名字都要下发，避免旧 Cookie 残留
-            from elenvind.security import clear_cookie_headers
+            from elenvind.core.security import clear_cookie_headers
             cleared = [self._parse(header)[0] for header in clear_cookie_headers()]
             self.assertEqual(cleared, ["__Host-session", "session"])
         finally:
@@ -226,21 +226,24 @@ class CookieHeaderTests(unittest.TestCase):
         self.assertEqual(name, "session")
 
 
-class ConfigSecretGateTests(unittest.TestCase):
+class ImportSideEffectTests(unittest.TestCase):
     def test_security_module_has_no_import_side_effects(self):
-        """security.py 导入时不得读取环境变量或文件（部署门禁在 config 校验里）。"""
-        source = (PROJECT_ROOT / "elenvind" / "security.py").read_text(encoding="utf-8")
-        # 去掉模块 docstring 后再检查代码体（文档里提到 SECRET_KEY 是说明用途）
+        """security.py 导入时不得读取环境变量或文件。
+
+        安全原语必须能在任何环境下被导入与审计；配置校验是 config 的职责。
+        """
+        source = (PROJECT_ROOT / "elenvind" / "core" / "security.py").read_text(encoding="utf-8")
+        # 去掉模块 docstring 后再检查代码体
         body = source.split('"""', 2)[-1]
         code_lines = [line for line in body.splitlines()
                       if not line.strip().startswith("#")]
         code = "\n".join(code_lines)
         self.assertNotIn("os.environ", code)
-        self.assertNotIn("SECRET_KEY", code)
+        self.assertNotIn("getenv", code)
 
     def test_admin_helpers_respect_config(self):
-        from elenvind import config as config_module
-        from elenvind.security import admin_id, is_admin, is_admin_id
+        from elenvind.core import config as config_module
+        from elenvind.core.security import admin_id, is_admin, is_admin_id
 
         original = dict(config_module.config)
         try:

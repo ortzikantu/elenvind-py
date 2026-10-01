@@ -1,0 +1,28 @@
+{# 全站基础布局：所有页面模板都 extends 本文件。
+   Python 只准备数据，HTML 全部在这里。 #}
+<!DOCTYPE html>
+<html lang="{{ lang }}"{% if request and request.cookies.get('theme') in ('light', 'dark') %} data-theme="{{ request.cookies.get('theme') }}"{% endif %}>
+  <head>
+    <meta charset="utf-8">
+    <title>{% block title %}{{ site_title }}{% endblock %}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="generator" content="Elenvind {{ elenvind_version }}">
+    {% if description %}<meta name="description" content="{{ description }}">{% endif %}
+    {% if keywords %}<meta name="keywords" content="{{ keywords }}">{% endif %}
+    {# 样式表：配置里的 [static].css 优先；为空时回落到缺省样式表。
+       css_url() 已处理这条规则（含 use_builtin_css = false 时返回空串）。 #}
+    {% set stylesheet = css_url() %}
+    {% if stylesheet %}<link rel="stylesheet" href="{{ stylesheet }}">{% endif %}
+    {# 图标：同样"配置优先、缺省兜底"；两级都没有时**不输出**该标签，
+       避免浏览器去请求一个不存在的 /favicon.ico（404 + 控制台告警）。 #}
+    {% set icon = icon_url() %}
+    {% if icon %}<link rel="icon" href="{{ icon }}">{% endif %}
+  </head>
+  <body>
+    {% include "partials/navbar.html" %}
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+    {% include "partials/footer.html" %}
+  </body>
+</html>

@@ -27,10 +27,12 @@
 | `max_body_size` | `1048576` | POST 请求体上限（字节，1 MB）。超出返回 413，缺 `Content-Length` 返回 411，非表单类型返回 415。 |
 | `database` | `"sqlite.db"` | SQLite 文件路径（相对项目根）。**优先级：`ELENVIND_DB` 环境变量 > 本键 > 默认 `<项目根>/sqlite.db`**；本键留空时显式回落到默认路径（不会沿用进程里上一次的取值）。 |
 | `articles_dir` | `"articles"` | 文章目录（相对项目根）。 |
-| `usrpages_dir` | `"usrpages"` | 自定义页面目录（相对项目根）。 |
+| `custom_pages_dir` | `"custom_pages"` | 自定义页面目录（相对项目根）。 |
+| `templates_dir` | `"elenvind/templates"` | Jinja2 模板目录（相对项目根）。整站换模板时才需要改。 |
+| `use_builtin_css` | `true` | `[static].css` 为空时是否回落到应用缺省样式表。详见 [`[static]`](#static-静态资源地址)。 |
 
 > 密码哈希参数（scrypt 的 N/r/p）**不**通过配置暴露：它属于安全默认值，
-> 改了会让新老哈希不一致；升级算法请改 `elenvind/security.py` 并保留
+> 改了会让新老哈希不一致；升级算法请改 `elenvind/core/security.py` 并保留
 > `password_needs_rehash` 的渐进式升级路径。
 
 ## `[server]` 服务监听
@@ -104,17 +106,66 @@
 
 | 键 | 默认回退 | 说明 |
 |---|---|---|
-| `css` | `/style.css` | 全站样式表 URL。可指向 Nginx/CDN 的绝对地址，或留空用站点相对路径。 |
-| `favicon` | `/favicon.ico` | 浏览器标签页图标 URL。 |
-| `logo` | 回退 `favicon` | **页头站标图标** URL，与站名并排显示（`<a class="header-brand">`）；留空回退 `favicon`，两级都留空则只显示站名文字（不输出 `<img>`，不会裂图）。 |
+| `css` | 见下方"样式表解析顺序" | 全站样式表 URL。填站内路径或 CDN 绝对地址；**留空则回落到缺省样式表**。 |
+| `favicon` | 缺省图标 | 浏览器标签页图标 URL。留空则回落到 `elenvind/static/imgs/favicon.ico`（或 `.png`）；两者都不存在时**不输出** `<link rel="icon">`。 |
+| `logo` | 回退 `favicon` → 缺省图标 | **页头站标图标** URL，与站名并排显示（`<a class="header-brand">`）。留空依次回退：配置的 `favicon` → 缺省图标 → 只显示站名文字。 |
 | `hero` | 空（不显示） | 首页 hero 背景图 URL；留空则整块 hero 区不渲染。 |
 
 取值只允许：留空、站内绝对路径（`/x`）或 http(s) 绝对 URL；
 协议相对形式（`//host/x`）会被启动校验拒绝。
+URL 里**不允许**出现引号、圆括号、尖括号、反斜杠、空白与控制字符——
+这些值会进入 HTML 属性甚至内联 CSS 的 `url()`，字符集必须先收窄
+（否则 `&#39;` 经浏览器解码后会闭合 `url('…')`）。
 
-> 静态资源**不是由应用托管的**——请把 `style.css`、`favicon.ico`、`logo.png`、
-> 社交图标等放到 Nginx（或 CDN）可达的目录，再在 `[static]`/`params.social.icon`
-> 里填对应 URL。
+### 样式表解析顺序
+
+| `[static].css` | `use_builtin_css` | 结果 |
+|---|---|---|
+| 有值 | 任意 | 用配置的地址（站内路径或绝对 URL） |
+| 空 / 缺失 | `true`（默认） | 用应用缺省样式表 `/css/style.css` |
+| 空 / 缺失 | `false` | **不输出** `<link>`，页面无样式 |
+
+`use_builtin_css` 只影响"配置为空时是否回落"，不会让显式配置失效。
+
+### 通用静态服务（`elenvind/static/`）
+
+应用把 `elenvind/static/` 整个目录作为自带的静态根发出，**URL 与磁盘一一对应**：
+
+```
+/css/style.css   ->  elenvind/static/css/style.css
+/imgs/logo.svg   ->  elenvind/static/imgs/logo.svg
+/fonts/x.woff2   ->  elenvind/static/fonts/x.woff2
+```
+
+也就是说：**往这个目录里丢文件就能被站点用上**，不需要改代码或登记白名单。
+
+| 目录 | 约定用途 | 对应配置 | 缺省 URL |
+|---|---|---|---|
+| `elenvind/static/css/` | 样式表 | `[static].css` 留空时用 | `/css/style.css` |
+| `elenvind/static/imgs/` | 图像 | `[static].favicon` 留空时用 | `/imgs/favicon.ico`（或 `.png`） |
+| `elenvind/static/` 其它子目录 | 字体、图标等随意 | —— | 按相对路径直接取 |
+
+响应带 `ETag` 与 `Cache-Control: public, max-age=86400`，**改动文件无需重启**
+（按请求读盘，浏览器按 ETag 自动刷新）。Content-Type 按后缀给，
+CSS/JS/SVG/字体等常见类型有显式映射（避免被回成 `text/plain` 而失效）。
+
+替换缺省资产有两种方式，任选其一：
+
+1. **直接改文件**（`elenvind/static/css/style.css`、`imgs/favicon.png`）——
+   不用动配置，改完刷新即生效；
+2. **改配置指到别处**——`[static].css` / `[static].favicon` 填 URL 后，
+   配置优先，缺省文件不再被引用。
+
+**安全边界**：规范化后必须仍在 `elenvind/static/` 之下；隐藏文件/目录
+（任一段以 `.` 开头）一律 404；越界形态（`../`、`%2e%2e`、反斜杠、符号链接
+指向外部）全部拒绝。这些资源是**公开**的（浏览器要取），
+**站点私有内容不要放这个目录**。
+
+> 其余资源（`logo`、`hero`、社交图标、以及你自己指定的 `css`）留给
+> Nginx（或 CDN）托管也行——把 URL 填进 `[static]` / `params.social.icon`
+> 即可；留空时对应元素**不渲染**，所以开箱即用不会裂图。
+>
+> 仓库根的 `style.example.css` 是缺省样式表的副本，可作为自定义样式的起点。
 
 ## `[params]` 首页与站点内容
 
@@ -122,8 +173,9 @@
 |---|---|
 | `intro` | 首页 about 区介绍段落，原样转义输出；整行删除则该段落消失。 |
 
-> 没有 `params.author`：文章作者来自每篇 `.evmd` 文档头的 `authors = [...]`
-> （见 `docs/EVMD_SPEC.md`），不设全局作者配置，避免出现"配置里写着作者但页面不读"的死配置。
+> 没有 `params.author`：文章作者来自每篇 `.md` 文件 front matter 里的
+> `authors = [...]`（见 `docs/development/features.md` 第 6 节），
+> 不设全局作者配置，避免出现"配置里写着作者但页面不读"的死配置。
 
 ### `[[params.nav]]` 顶栏/页脚导航（可多条）
 
@@ -171,7 +223,7 @@
 `registration_enabled` / `max_length` / `max_comment_depth` /
 `max_comments_per_article` / `max_body_size` / `database` / 内容目录 /
 `[server]`（host、port、trusted_proxies、cookie_prefix）/ `[static]` URL /
-`[pagination]` / 三个限流段落 / `[logging]`，以及 `SECRET_KEY` 环境变量。
+`[pagination]` / 三个限流段落 / `[logging]`。
 任一项非法都会打印原因并以非零码退出（lifespan 阶段则为
 `lifespan.startup.failed`，uvicorn 不会启动一个半初始化的应用）。
 

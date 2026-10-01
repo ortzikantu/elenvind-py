@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}{{ t('user_title') }} - {{ site_title }}{% endblock %}
+{% block content %}
+{% if not user %}
+  {# 未登录：友好提示 + 登录入口，并带回跳地址（登录后回到本页） #}
+  <h1>{{ t('user_title') }}</h1>
+  <p>{{ t('user_anon_desc') }}</p>
+  <p>
+    <a href="/login?next=/user">{{ t('nav_sign_in') }}</a>
+    {% if registration_enabled %}
+      · <a href="/register">{{ t('auth_register_link') }}</a>
+    {% endif %}
+  </p>
+{% else %}
+  <h1>{{ t('user_title') }}</h1>
+  {% include "partials/form_message.html" %}
+
+  <section>
+    <h2>{{ t('user_section_profile') }}</h2>
+    <div class="field-grid">
+      <div class="field-row">
+        <div class="field-label"><span>{{ t('user_id') }}</span></div>
+        <div class="field-value">{{ user['id'] }}</div>
+      </div>
+      <div class="field-row">
+        <div class="field-label"><span>{{ t('user_nickname') }}</span></div>
+        <div class="field-value">{{ user['nickname'] }}</div>
+      </div>
+      <div class="field-row">
+        <div class="field-label"><span>{{ t('user_email') }}</span></div>
+        <div class="field-value">{{ user['email'] }}</div>
+      </div>
+      <div class="field-row">
+        <div class="field-label"><span>{{ t('user_registered_at') }}</span></div>
+        <div class="field-value">{{ profile.registered_at }}</div>
+      </div>
+    </div>
+    <form method="post" action="/logout" class="field-action">
+      {{ csrf_input() }}
+      <button type="submit" class="text-link-button">{{ t('user_logout') }}</button>
+    </form>
+  </section>
+
+  <details class="panel">
+    <summary><h2>{{ t('user_section_edit') }}</h2></summary>
+    <form method="post" action="/user" class="field-grid">
+      {{ csrf_input() }}
+      <input type="hidden" name="action" value="update_profile">
+      <div class="field-row">
+        <div class="field-label"><label for="profile-nickname">{{ t('user_nickname') }}</label></div>
+        <input type="text" id="profile-nickname" name="nickname" value="{{ user['nickname'] }}"
+               maxlength="{{ limits.nickname }}" autocomplete="nickname" required>
+      </div>
+      <div class="field-row">
+        <div class="field-label"><label for="profile-email">{{ t('user_email') }}</label></div>
+        <input type="email" id="profile-email" name="email" value="{{ user['email'] }}"
+               maxlength="{{ limits.email }}" autocomplete="email" required>
+      </div>
+      <div class="field-row">
+        <div class="field-label"><label for="profile-password">{{ t('auth_password') }}</label>
+          <span class="field-hint">{{ t('user_password_hint_email') }}</span></div>
+        <input type="password" id="profile-password" name="current_password"
+               maxlength="{{ limits.password }}" autocomplete="current-password">
+      </div>
+      <div class="field-action"><button type="submit">{{ t('user_update_btn') }}</button></div>
+    </form>
+  </details>
+
+  <details class="panel">
+    <summary><h2>{{ t('user_section_password') }}</h2></summary>
+    <form method="post" action="/user" class="field-grid">
+      {{ csrf_input() }}
+      <input type="hidden" name="action" value="change_password">
+      <div class="field-row">
+        <div class="field-label"><label for="old-password">{{ t('user_current_password') }}</label></div>
+        <input type="password" id="old-password" name="old_password"
+               maxlength="{{ limits.password }}" autocomplete="current-password" required>
+      </div>
+      <div class="field-row">
+        <div class="field-label"><label for="new-password">{{ t('user_new_password') }}</label>
+          <span class="field-hint">{{ t('user_password_hint_len') }}</span></div>
+        <input type="password" id="new-password" name="new_password"
+               minlength="{{ limits.password_min }}" maxlength="{{ limits.password }}"
+               autocomplete="new-password" required>
+      </div>
+      <div class="field-row">
+        <div class="field-label"><label for="confirm-password">{{ t('user_confirm_new_password') }}</label></div>
+        <input type="password" id="confirm-password" name="confirm_password"
+               minlength="{{ limits.password_min }}" maxlength="{{ limits.password }}"
+               autocomplete="new-password" required>
+      </div>
+      <div class="field-action"><button type="submit">{{ t('user_change_btn') }}</button></div>
+    </form>
+  </details>
+
+  <details class="panel danger-zone">
+    <summary><h2>{{ t('user_section_delete') }}</h2></summary>
+    <p class="danger-note">{{ t('user_delete_note') }}</p>
+    <form method="post" action="/user" class="field-grid">
+      {{ csrf_input() }}
+      <input type="hidden" name="action" value="delete_account">
+      <div class="field-row">
+        <div class="field-label"><label for="delete-confirm-password">{{ t('user_delete_password') }}</label></div>
+        <input type="password" id="delete-confirm-password" name="password_confirm"
+               autocomplete="current-password" required>
+      </div>
+      <div class="field-action"><button type="submit" class="btn-danger">{{ t('user_delete_btn') }}</button></div>
+    </form>
+  </details>
+{% endif %}
+{% endblock %}

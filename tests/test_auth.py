@@ -4,11 +4,11 @@ import unittest
 
 from tests.support import ElenvindTestCase
 
-from elenvind.db_base import get_connection
-from elenvind.db_login import count_email_failures
-from elenvind.db_session import get_session_user
-from elenvind.db_user import get_user_by_email, get_user_by_id
-from elenvind.security import hash_password, password_needs_rehash, verify_password
+from elenvind.core.db_base import connect
+from elenvind.core.db_login import count_email_failures
+from elenvind.core.db_session import get_session_user
+from elenvind.core.db_user import get_user_by_email, get_user_by_id
+from elenvind.core.security import hash_password, password_needs_rehash, verify_password
 
 
 class LoginTests(ElenvindTestCase):
@@ -44,22 +44,28 @@ class LoginTests(ElenvindTestCase):
         self.assertEqual(strip(unknown.text), strip(wrong.text))
 
     def test_unknown_email_still_runs_a_password_verification(self):
-        """存在与不存在的账号都必须执行一次密码校验（等量计算，弱化计时枚举）。"""
-        from elenvind import view_login
+        """存在与不存在的账号都必须执行一次密码校验（等量计算，弱化计时枚举）。
+
+        未知账号走 `core.security.dummy_verify`（对哑哈希做一次真实 scrypt），
+        因此这里统计的是哑校验被调用。
+        """
+        from elenvind.core import security as security_module
+
         calls = []
-        original = view_login.verify_password
+        original = security_module.verify_password
 
         def spy(password, stored_hash):
             calls.append(stored_hash)
             return original(password, stored_hash)
 
-        view_login.verify_password = spy
+        security_module.verify_password = spy
         try:
             self.login("ghost@example.com", "whatever123")
         finally:
-            view_login.verify_password = original
+            security_module.verify_password = original
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0], view_login._DUMMY_PASSWORD_HASH)
+        # 哑校验用的哈希与真实用户哈希格式一致（同为 scrypt 自描述格式）
+        self.assertTrue(str(calls[0]).startswith("scrypt$"))
 
     def test_login_rate_limit_by_email(self):
         self.create_user(email="lock@example.com")
@@ -69,18 +75,18 @@ class LoginTests(ElenvindTestCase):
         self.assertIn("Too many failed attempts for this account", response.text)
 
     def test_login_rate_limit_by_ip(self):
-        from elenvind import view_login
-        limits = dict(view_login.DEFAULT_LOGIN_LIMITS)
+        from elenvind.features.auth import routes as auth_routes
+        limits = dict(auth_routes.DEFAULT_LOGIN_LIMITS)
         limits["max_ip_failures"] = 3
         self._config["login_limits"] = limits
-        for _ in range(3):
-            self.login(f"user{_ }@example.com", "wrong")
+        for index in range(3):
+            self.login(f"user{index}@example.com", "wrong")
         response = self.login("another@example.com", "wrong")
         self.assertIn("Too many failed attempts from this address", response.text)
 
     def test_login_rate_limit_global(self):
-        from elenvind import view_login
-        limits = dict(view_login.DEFAULT_LOGIN_LIMITS)
+        from elenvind.features.auth import routes as auth_routes
+        limits = dict(auth_routes.DEFAULT_LOGIN_LIMITS)
         limits["max_global_failures"] = 2
         self._config["login_limits"] = limits
         self.login("g1@example.com", "wrong")
@@ -105,11 +111,11 @@ class LoginTests(ElenvindTestCase):
         self.assertEqual(get_session_user(new_session), user_id)
 
     def test_expired_session_is_rejected_and_removed(self):
-        from elenvind.db_session import create_session
+        from elenvind.core.db_session import create_session
         user_id, _ = self.create_user(email="exp@example.com")
         token = create_session(user_id, days=-1)   # 已过期
         self.assertIsNone(get_session_user(token))
-        with get_connection() as conn:
+        with connect() as conn:
             remaining = conn.execute("SELECT COUNT(*) FROM session WHERE token = ?",
                                      (token,)).fetchone()[0]
         self.assertEqual(remaining, 0)
@@ -122,7 +128,7 @@ class LoginTests(ElenvindTestCase):
     def test_password_is_rehashed_on_login_when_legacy(self):
         """历史格式哈希在登录成功后必须被透明升级为新格式（渐进式 rehash）。"""
         import hashlib
-        from elenvind.db_user import update_user_password
+        from elenvind.core.db_user import update_user_password
 
         user_id, password = self.create_user(email="legacy@example.com")
         salt = b"0123456789abcdef"
@@ -162,12 +168,14 @@ class LogoutTests(ElenvindTestCase):
         self.assertEqual(response.status, 400)
         self.assertEqual(get_session_user(session), user_id)
 
-    def test_logout_without_session_is_harmless(self):
+    def test_logout_without_session_is_rejected_cleanly(self):
+        """未登录调用登出：auth 闸门统一拒绝（403），不报错也不产生副作用。"""
         csrf = self.fetch_csrf()
         response = self.app.request("POST", "/logout",
                                     form={"csrf_token": csrf},
                                     cookies={self.csrf_cookie_name(): csrf})
-        self.assertEqual(response.status, 302)
+        self.assertEqual(response.status, 403)
+        self.assertEqual(self.app.set_cookie_value(response, "session"), "")
 
 
 class PasswordChangeTests(ElenvindTestCase):
@@ -282,34 +290,40 @@ class RegistrationTests(ElenvindTestCase):
         self.assertIn("Registration failed", response.text)
 
     def test_concurrent_duplicate_registration_races_are_handled(self):
-        """绕过视图查重、直接并发插同一邮箱：UNIQUE 约束必须给出可读错误而非 500。"""
-        from elenvind.view_register import _validate
-        from elenvind.db_user import create_user
+        """绕过查重、直接并发插同一邮箱：UNIQUE 约束必须给出可读错误而非 500。"""
+        from elenvind.core.db_user import create_user
 
-        # 模拟"两个请求都通过了查重，然后一起 INSERT"
         create_user("First", "race@example.com", hash_password("password-123"))
-        reason, fields = _validate({"nickname": "Second", "email": "race@example.com",
-                                    "password": "password-123",
-                                    "confirm_password": "password-123"})
-        self.assertIsNone(reason)
+        # 模拟"两个请求都通过了查重，然后一起 INSERT"
         with self.assertRaises(sqlite3.IntegrityError):
             create_user("Second", "race@example.com", hash_password("password-123"))
 
+        # 走真实 HTTP 路径：重复邮箱必须得到友好提示（200 + 文案），而不是 500
+        token = self.fetch_csrf()
+        self._register(nickname="First", email="race@example.com", csrf=token)
+        response = self._register(nickname="Second", email="race@example.com", csrf=token)
+        self.assertEqual(response.status, 200)
+        self.assertIn("Registration failed", response.text)
+        with connect() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM user WHERE email = ?",
+                                 ("race@example.com",)).fetchone()[0]
+        self.assertEqual(count, 1)
+
     def test_duplicate_registration_after_integrity_error_is_friendly(self):
-        import elenvind.view_register as view_register_module
+        import elenvind.features.auth.routes as auth_routes
 
         token = self.fetch_csrf()
         # 让 SELECT 查重"看不到"已存在用户，强制走 INSERT 路径触发 IntegrityError
-        original = view_register_module.get_user_by_email
-        view_register_module.get_user_by_email = lambda email: None
+        original = auth_routes.get_user_by_email
+        auth_routes.get_user_by_email = lambda email: None
         try:
             self._register(email="dupe@example.com", csrf=token)
             response = self._register(nickname="Other", email="dupe@example.com", csrf=token)
         finally:
-            view_register_module.get_user_by_email = original
+            auth_routes.get_user_by_email = original
         self.assertEqual(response.status, 200)
         self.assertIn("Registration failed", response.text)
-        with get_connection() as conn:
+        with connect() as conn:
             count = conn.execute("SELECT COUNT(*) FROM user WHERE email = ?",
                                  ("dupe@example.com",)).fetchone()[0]
         self.assertEqual(count, 1)
@@ -357,16 +371,30 @@ class RegistrationTests(ElenvindTestCase):
 
 
 class AccountPageTests(ElenvindTestCase):
-    def test_anonymous_user_page_renders_sign_in_prompt(self):
+    def test_anonymous_user_page_shows_friendly_sign_in_prompt(self):
+        """未登录访问 /user：渲染友好的"请先登录"页，而不是 403。"""
         response = self.app.request("GET", "/user")
         self.assertEqual(response.status, 200)
         self.assertIn("You are not logged in", response.text)
-        self.assertIsNone(response.header("set-cookie"))
+        # 提供登录入口，并带回跳地址（登录后回到本页）
+        self.assertIn('href="/login?next=/user"', response.text)
+        # 不得泄漏任何账号信息，也不得出现只有登录后才能看到的表单
+        self.assertNotIn('name="password_confirm"', response.text)
+        self.assertNotIn('name="nickname"', response.text)
 
-    def test_anonymous_post_to_user_page_does_not_crash(self):
+    def test_anonymous_post_to_user_page_is_rejected(self):
+        """未登录 + 无 CSRF 的 POST：先被 CSRF 闸门拒绝（400），无状态变更。"""
         response = self.app.request("POST", "/user", form={"action": "update_profile"},
                                     headers={}, cookies=None)
-        self.assertEqual(response.status, 400)   # 统一 CSRF 闸门先拒绝
+        self.assertEqual(response.status, 400)
+
+    def test_anonymous_post_with_valid_csrf_is_forbidden(self):
+        """未登录但令牌有效：auth 闸门拒绝（403）——写操作没有"跳转"可言。"""
+        csrf = self.fetch_csrf()
+        response = self.app.request("POST", "/user",
+                                    form={"csrf_token": csrf, "action": "update_profile"},
+                                    cookies={self.csrf_cookie_name(): csrf})
+        self.assertEqual(response.status, 403)
 
     def test_logged_in_user_page_shows_profile(self):
         user_id, password = self.create_user(nickname="Carol", email="carol@example.com")

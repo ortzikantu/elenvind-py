@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}{{ site_title }}{% endblock %}
+
+{% block content %}
+  {% if hero_url %}
+    <section class="home-hero">
+      <div class="hero" style="background-image:url('{{ hero_url }}')"></div>
+    </section>
+  {% endif %}
+
+  {% if intro or social_items %}
+    <section class="home-about">
+      {% if intro %}<p class="intro">{{ intro }}</p>{% endif %}
+      {% if social_items %}
+        <p class="socials">
+          {{ t('social_prefix') }}
+          {%- for item in social_items -%}
+            {% if not loop.first %}{{ t('social_sep') if not loop.last else t('social_join') }}{% endif %}
+            <a class="social-icon" href="{{ item.url }}"
+               {%- if item.url.startswith(('http://', 'https://', '//')) %} target="_blank" rel="noopener"{% endif %}
+               {%- if item.name %} aria-label="{{ item.name }}" title="{{ item.name }}"{% else %} aria-hidden="true"{% endif %}>
+              {%- if item.icon %}<img src="{{ item.icon }}" alt="{{ item.name or 'link' }}" loading="lazy">
+              {%- else %}{{ item.name or 'link' }}{% endif -%}
+            </a>
+          {%- endfor -%}
+          {{ t('social_end') }}
+        </p>
+      {% endif %}
+    </section>
+  {% endif %}
+
+  <section class="article-list">
+    <h2>{{ t('home_writing') }} ({{ total_articles }})</h2>
+    {% if articles %}
+      <ul>
+        {% for article in articles %}
+          <li>
+            <div class="article-date"><time datetime="{{ article.date_attr }}">{{ article.date_display }}</time></div>
+            <span><a href="/article/{{ article.slug }}">{{ article.title }}</a></span>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>{{ t('home_no_articles') }}</p>
+    {% endif %}
+
+    {% if total_pages > 1 %}
+      <nav class="pagination" aria-label="Pagination">
+        {% if page > 1 %}
+          <a href="?page={{ page - 1 }}"><strong><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="18,4 18,20 4,12"></polygon></svg></strong></a>
+        {% endif %}
+        {{ t('home_page_of', page=page, total=total_pages) }}
+        {% if page < total_pages %}
+          <a href="?page={{ page + 1 }}"><strong><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 6,20 20,12"></polygon></svg></strong></a>
+        {% endif %}
+      </nav>
+    {% endif %}
+  </section>
+
+  {% if project_items %}
+    <section class="project-list">
+      <h2>{{ t('home_projects') }}</h2>
+      <ul>
+        {% for item in project_items %}
+          <li>
+            {% if item.name and item.url %}
+              <a href="{{ item.url }}"{% if item.url.startswith(('http://', 'https://', '//')) %} target="_blank" rel="noopener"{% endif %}>{{ item.name }}</a>
+            {% elif item.name %}
+              <span class="project-name">{{ item.name }}</span>
+            {% else %}
+              <a href="{{ item.url }}">{{ item.url }}</a>
+            {% endif %}
+            {% if item.description %}<span>{{ item.description }}</span>{% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endif %}
+{% endblock %}

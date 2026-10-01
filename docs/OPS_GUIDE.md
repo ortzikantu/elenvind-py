@@ -31,18 +31,19 @@ journalctl -u elenvind -n 100 --no-pager      # 看 systemd 侧输出
 
 ### 文章
 
-- 目录：`articles/`，每篇一个 `.evmd` 文件（文件名即 URL slug），
-  语法与文档头字段见 `docs/EVMD_SPEC.md`；
+- 目录：`articles/`，每篇一个 `.md` 文件（文件名即 URL slug），
+  正文是标准 Markdown，文档头字段见 `docs/development/features.md`；
 - **增、删、改即时生效**：索引按目录文件状态（mtime/size）自动重扫，
   正文按文件状态缓存，改完保存即可，无需重启；
-- 首页按文档头 `date` 倒序排列（缺 date 视为最早）；
+- 首页按 front matter 的 `date` 倒序排列（缺 date 视为最早）；
 - 单文件上限 1 MB，超出会拒绝解析并在日志报错；
-- 图片/视频等媒体请放静态托管处，正文里用 `@{img,url}` 方言引用绝对 URL。
+- 图片/视频等媒体请放静态托管处，正文里用标准 Markdown 图片语法
+  或 `<video src="…" controls></video>` 引用绝对 URL。
 
 ### 自定义页面
 
-- 目录：`usrpages/`，文件名即路由（`about.evmd` → `/about`），同样热更新；
-- 页面为纯正文（无文档头），整页渲染为文章排版。
+- 目录：`custom_pages/`，文件名即路由（`about.md` → `/about`），同样热更新；
+- 页面为纯 Markdown 正文（无 front matter），整页渲染为文章排版。
 
 ### 静态资源
 
@@ -56,9 +57,9 @@ CSS/图标/图片由 Nginx 托管，与应用无关；同步文件后即可，
 - `config.toml` 顶层 `admin_user_id` 指定的用户即站长（默认 `1`，即最早注册的账号）：
   导航带徽章、可删除任意评论、可恢复已删评论；把该项删掉或改成非法值 = **没有管理员**；
 - 恢复/删除是**软删除**：访客看到等长方块打码，站长看到删除线，可随时恢复；
-- 物理清除：`python purge.py`（交互式列出软删除评论并按 ID 永久删除，
-  不可恢复，仅建议在确认违规内容后使用）。物理删除父评论时，其子评论的
-  `parent_id` 由数据库 `ON DELETE SET NULL` 自动置空，子评论升级为顶层评论，不会消失。
+- **没有物理删除入口**：评论只做软删除，永久保留在库里（这是审计与误删恢复的前提）。
+  数据库层 `parent_id` 是 `ON DELETE SET NULL`，因此即便在库外手工清理了父行，
+  子评论也会自动升级为顶层评论，不会跟着消失。
 
 ### 账号注销（用户自行操作）
 
@@ -106,16 +107,19 @@ python -m unittest tests.test_http -v              # 单个模块
 **不会触碰生产数据库与文章目录**。升级代码后建议先跑一遍。
 
 需要一次"真实 uvicorn 冷启动"验证时（例如换机器、换 Python 版本后），
-可以跑仓库根目录的一次性冒烟驱动：
+可以跑冒烟驱动（`scripts/` 下）：
 
 ```bash
-SECRET_KEY=任意随机串 python smoke_driver.py   # 需要环境里已安装 uvicorn
+python scripts/smoke_driver.py   # 需要环境里已安装 uvicorn
 ```
 
-它会在临时目录（`.smoketmp/`）里起一个真实服务，走完首页 / 文章 / EVMD /
-登录 / 注册 / 注销 / 改密 / 评论 / 删除 / 恢复 / SEO / 主题 / 404 / 405
-以及请求体边界（411 / 413 / 415）与 Host 头投毒共 30 余项断言，
-结束后清理临时目录，不影响生产数据。
+它会在临时目录（`.smoketmp/`）里起一个真实服务并走完整流程：首页 / 文章 /
+Markdown / 自定义页面 / 内置样式表 / 登录 / 注册 / 注销 / 改密 / 发表评论 /
+回复评论 / 软删除 / 恢复 / SEO / 主题 / 404 / 405，以及请求体边界
+（411 / 413 / 415）与 Host 头投毒，共 50 余项断言。
+
+从任何工作目录运行都可以（脚本自己切到项目根），结束后清理临时目录，
+不影响仓库里的真实数据。
 
 ## 五、限流策略与误锁处理
 
@@ -150,7 +154,6 @@ sqlite3 sqlite.db "DELETE FROM login_attempts WHERE ip = '1.2.3.4';"          # 
 
 | 现象 | 原因与处理 |
 |---|---|
-| 启动即退出，日志提示 `SECRET_KEY environment variable is not set` | 漏设环境变量；生成随机串后 export（见部署文档） |
 | `Address already in use` | 端口被占：`ss -ltnp | grep 6789`，或改 `[server].port` |
 | 页面 500 | 先看 `logs/app.log` 尾部堆栈：文章语法错误会在日志点名文件；修复即热更新 |
 | 控制台报 CSP 拦截 inline script | 页面本身零脚本；通常是**浏览器扩展**注入被 `script-src 'none'` 正确拦下，忽略即可 |
@@ -158,8 +161,8 @@ sqlite3 sqlite.db "DELETE FROM login_attempts WHERE ip = '1.2.3.4';"          # 
 | 页头没有站标图标 | `[static].logo` 与 `[static].favicon` 都为空 → 按设计只显示站名文字；填上任一个即可 |
 | 登录后提示 "Too many failed attempts for this account…" | 单邮箱失败 5 次；等 24 小时窗口或按第五节 SQL 清除 |
 | 改了 config.toml 没生效 | 配置非热加载，需重启 |
-| 图片并排错位 | 检查图片行是否用 `@{img,url,NN%}` 方言且各份额和 ≤100（含间隙预算），语法见 EVMD_SPEC |
-| 日期显示不对 | 文章文档头 `date` 请写带时区的 ISO 格式（如 `2026-01-05T10:00:00+08:00`），显示统一为本地 YYYY-MM-DD |
+| 图片并排错位 | 用 `![alt](url){: width="50%" }` 属性列表控制宽度，多图之间不要留空行才会并排 |
+| 日期显示不对 | 文章 front matter 的 `date` 请写带时区的 ISO 格式（如 `2026-01-05T10:00:00+08:00`），显示统一为本地 YYYY-MM-DD |
 
 ## 八、日常安全检查清单
 
@@ -171,7 +174,6 @@ sqlite3 sqlite.db "DELETE FROM login_attempts WHERE ip = '1.2.3.4';"          # 
    必须同时指向该代理，否则 HTTPS 下 Cookie 不会带 `Secure`（见《配置文件使用指南》代理信任边界）；
 4. 定期 `git pull` 跟进安全修复，升级前备份数据库；
 5. 偶尔翻阅 `login_attempts` 里的失败流水是否有异常来源 IP；
-6. 软删除评论积累后跑一次 `purge.py` 清理（可选）。
 
 ## 九、上线部署核对清单（逐条确认）
 
@@ -190,4 +192,4 @@ sqlite3 sqlite.db "DELETE FROM login_attempts WHERE ip = '1.2.3.4';"          # 
 | 11 | 注册策略 | 需要私有站点时设 `registration_enabled = false`，或保持注册并依赖 IP 限流 |
 | 12 | 管理员账号 | 第一个注册的账号 id 记为 `admin_user_id`，或显式设定；确认导航出现管理员徽章 |
 | 13 | 静态资源 | `[static]` 与 `params.social.icon` 的 URL 在浏览器可 200 打开（无裂图） |
-| 14 | 自检命令 | `python -m unittest discover -s tests -t .` 全绿；`SECRET_KEY=… python smoke_driver.py` 全绿 |
+| 14 | 自检命令 | `python -m unittest discover -s tests -t .` 全绿；`python scripts/smoke_driver.py` 全绿 |

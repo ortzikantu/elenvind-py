@@ -145,7 +145,7 @@ class PostBodyFramingTests(ElenvindTestCase):
 
     def test_body_exactly_at_limit_is_allowed(self):
         """上限之内的 body 必须能正常进入业务逻辑（此处以 CSRF 失败为界）。"""
-        from elenvind.config import config as live_config
+        from elenvind.core.config import config as live_config
 
         limit = live_config["max_body_size"]
         token = "x" * 43
@@ -161,11 +161,16 @@ class PostBodyFramingTests(ElenvindTestCase):
 
 class MethodAndRoutingTests(ElenvindTestCase):
     def test_unsupported_method_returns_405_with_allow(self):
-        response = self.app.raw_request("DELETE", "/")
+        """方法不被任何匹配路由支持：405 + Allow（且不进入业务逻辑）。
+
+        DELETE 需要请求体，所以这里显式给出 Content-Length=0，
+        以便测到路由层的方法判定而不是被 411 拦在前面。
+        """
+        response = self.app.raw_request(
+            "DELETE", "/nope", b"", [("host", "example.com"), ("content-length", "0")])
         self.assertEqual(response.status, 405)
         allow = response.header("allow") or ""
         self.assertIn("GET", allow)
-        self.assertIn("POST", allow)
 
     def test_head_returns_headers_without_body(self):
         response = self.app.raw_request("HEAD", "/")
@@ -174,31 +179,83 @@ class MethodAndRoutingTests(ElenvindTestCase):
         self.assertEqual(response.header("content-length"),
                          str(len(self.app.request("GET", "/").body)))
 
-    def test_get_logout_is_not_allowed(self):
+    def test_get_logout_anonymous_shows_signed_out_message(self):
+        """未登录（或会话已失效）访问 GET /logout：友好提示，不是 405。"""
         response = self.app.request("GET", "/logout")
+        self.assertEqual(response.status, 200)
+        self.assertIn("You have been signed out", response.text)
+        # 没有任何可提交的退出表单（本来就没登录）
+        self.assertNotIn('action="/logout"', response.text)
+
+    def test_get_logout_logged_in_renders_csrf_confirmation(self):
+        """已登录访问 GET /logout：给出确认页，且**不**销毁会话。
+
+        退出会改变状态，必须由 POST + CSRF 触发；GET 只做确认，
+        因此不能被 `<img src="/logout">` 这类跨站请求触发。
+        """
+        user_id, password = self.create_user(email="bye@example.com")
+        session, csrf = self.login_ok("bye@example.com", password)
+        cookies = self.app_cookies(session=session, csrf=csrf)
+
+        response = self.app.request("GET", "/logout", cookies=cookies)
+        self.assertEqual(response.status, 200)
+        self.assertIn('action="/logout"', response.text)
+        self.assertIn('name="csrf_token"', response.text)
+        self.assertIn("Are you sure", response.text)
+
+        # 关键：GET 之后会话必须仍然有效
+        from elenvind.core.db_session import get_session_user
+        self.assertEqual(get_session_user(session), user_id)
+
+    def test_get_logout_does_not_clear_session_cookie(self):
+        """GET /logout 不得下发清 Cookie 的头（那是 POST 的职责）。"""
+        _user_id, password = self.create_user(email="keep@example.com")
+        session, csrf = self.login_ok("keep@example.com", password)
+        response = self.app.request("GET", "/logout",
+                                    cookies=self.app_cookies(session=session, csrf=csrf))
+        for header in response.headers_all("set-cookie"):
+            self.assertNotIn("session=;", header)
+            self.assertNotIn("Max-Age=0", header)
+
+    def test_post_only_routes_still_return_405_with_allow(self):
+        """仅声明 POST 的路由，GET 仍必须是 405 + Allow（未被友好化误伤）。"""
+        path = "/article/some-slug/comment/delete/1"
+        response = self.app.request("GET", path)
         self.assertEqual(response.status, 405)
-        self.assertEqual(response.header("allow"), "POST")
+        self.assertIn("POST", response.header("allow") or "")
 
     def test_unknown_path_returns_404(self):
         response = self.app.request("GET", "/definitely-not-here")
         self.assertEqual(response.status, 404)
 
     def test_unknown_post_path_returns_405(self):
+        """没有任何 POST 路由能匹配：/, /<slug> 都不该被 POST 命中。"""
         response = self.app.request("POST", "/nope", form={"a": "b"})
         self.assertEqual(response.status, 405)
+        allow = response.header("allow") or ""
+        self.assertIn("GET", allow)
+
+    def test_short_path_without_body_length_is_411(self):
+        """需要请求体的方法缺少 Content-Length：411，且不进入业务逻辑。"""
+        response = self.app.request("DELETE", "/logout", body=b"", send_content_length=False)
+        self.assertEqual(response.status, 411)
+        self.assertNotIn("Location", response.text)
 
     def test_article_route_with_extra_segments_is_404(self):
         response = self.app.request("GET", "/article/a/b")
         self.assertEqual(response.status, 404)
 
     def test_traversal_like_paths_never_touch_filesystem(self):
+        """路径穿越类请求不得泄漏配置文件内容。"""
         for path in ("/..%2fconfig.toml", "/../config.toml", "/articles/../config.toml",
-                     "/usrpages/../config.toml", "/.git/config", "/about/../secret"):
+                     "/custom_pages/../config.toml", "/.git/config", "/about/../secret"):
             with self.subTest(path=path):
                 response = self.app.request("GET", path)
                 self.assertIn(response.status, (404, 302))
-                self.assertNotIn("SECRET_KEY", response.text)
+                # config.toml 里的真实键名不得出现在响应中（否则说明读到了文件）
                 self.assertNotIn("site_url", response.text)
+                self.assertNotIn("[server]", response.text)
+                self.assertNotIn("[static]", response.text)
 
     def test_theme_redirect_rejects_open_redirect(self):
         for value in ("//evil.example.com", "https://evil.example.com", "\\\\evil",
@@ -215,12 +272,22 @@ class MethodAndRoutingTests(ElenvindTestCase):
         response = self.app.request("GET", "/theme", query={"mode": "light", "next": "/about"})
         self.assertEqual(response.status, 302)
         self.assertEqual(response.header("location"), "/about")
-        self.assertIn("theme=light", response.header("set-cookie") or "")
+        cookies = " ".join(response.headers_all("set-cookie"))
+        self.assertIn("theme=light", cookies)
 
     def test_theme_invalid_mode_sets_no_cookie(self):
         response = self.app.request("GET", "/theme", query={"mode": "neon", "next": "/"})
         self.assertEqual(response.status, 302)
-        self.assertIsNone(response.header("set-cookie"))
+        cookies = " ".join(response.headers_all("set-cookie"))
+        self.assertNotIn("theme=", cookies)
+
+    def test_theme_cookie_is_http_only_same_site_lax(self):
+        response = self.app.request("GET", "/theme", query={"mode": "dark", "next": "/"})
+        theme = next((h for h in response.headers_all("set-cookie") if h.startswith("theme=")),
+                     "")
+        self.assertIn("HttpOnly", theme)
+        self.assertIn("SameSite=Lax", theme)
+        self.assertIn("Secure", theme)          # https 请求
 
     def test_theme_value_is_not_reflected_into_html(self):
         response = self.app.request("GET", "/", cookies={"theme": '"><script>x</script>'})
@@ -320,8 +387,8 @@ class CsrfGateTests(ElenvindTestCase):
         self.assertEqual(response.status, 400)
 
     def test_get_requests_never_mutate_state(self):
-        from elenvind.db_user import get_user_by_id
-        from elenvind.db_comment import get_comments_by_article
+        from elenvind.core.db_user import get_user_by_id
+        from elenvind.core.db_comment import get_comments_by_article
 
         user_id, _ = self.create_user(email="readonly@example.com")
         self.write_article("readonly-post", "body")

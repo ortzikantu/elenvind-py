@@ -83,9 +83,10 @@ class SitemapTests(ElenvindTestCase):
 
 class CanonicalHostPolicyTests(ElenvindTestCase):
     def test_seo_module_does_not_read_host_header(self):
-        """静态检查：SEO 模块不得从 Host 头推导站点地址。"""
+        """静态检查：SEO 模块不得从 Host 头推导站点地址（Host 头投毒）。"""
         from tests.support import PROJECT_ROOT
-        source = (PROJECT_ROOT / "elenvind" / "http_seo.py").read_text(encoding="utf-8")
+        source = (PROJECT_ROOT / "elenvind" / "features" / "seo"
+                  / "routes.py").read_text(encoding="utf-8")
         body = source.split('"""', 2)[-1]
         self.assertNotIn("host", body.lower())
         self.assertIn("site_url", body)

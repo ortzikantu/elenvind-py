@@ -16,9 +16,9 @@ from pathlib import Path
 
 from tests.support import PROJECT_ROOT, ElenvindTestCase
 
-from elenvind import db_base
-from elenvind.config import ROOT
-from elenvind.db_comment import get_comments_by_article
+from elenvind.core import db_base
+from elenvind.core.config import ROOT
+from elenvind.core.db_comment import get_comments_by_article
 
 
 class ConfigBehaviorTests(ElenvindTestCase):
@@ -168,7 +168,7 @@ class ConfigBehaviorTests(ElenvindTestCase):
                                           "confirm_password": "password-123"},
                                     cookies={"csrf": csrf})
         self.assertIn("closed", response.text.lower())
-        from elenvind.db_user import get_user_by_email
+        from elenvind.core.db_user import get_user_by_email
         self.assertIsNone(get_user_by_email("off@example.com"))
 
         self._config["registration_enabled"] = True
@@ -236,7 +236,7 @@ class ConfigBehaviorTests(ElenvindTestCase):
     def test_admin_user_id_controls_privileges(self):
         other_id, _ = self.create_user(nickname="Other", email="other@example.com")
         self.write_article("post", "body")
-        from elenvind.db_comment import create_comment
+        from elenvind.core.db_comment import create_comment
         comment_id = create_comment("post", other_id, "content")
 
         # 默认 admin_user_id = 1：id=1 的账号不是管理员时不能恢复
@@ -244,7 +244,7 @@ class ConfigBehaviorTests(ElenvindTestCase):
         self.create_user(nickname="First", email="first@example.com")
         session, csrf = self.login_ok("other@example.com", "correct horse battery")
         cookies = self.app_cookies(session=session, csrf=csrf)
-        from elenvind.db_comment import soft_delete_comment, get_comment_by_id
+        from elenvind.core.db_comment import soft_delete_comment, get_comment_by_id
         soft_delete_comment(comment_id)
         response = self.app.request("POST", f"/article/post/comment/restore/{comment_id}",
                                     form={"csrf_token": csrf}, cookies=cookies)
@@ -298,9 +298,9 @@ class ConfigBehaviorTests(ElenvindTestCase):
     def test_deleted_user_nickname_is_used(self):
         user_id, _ = self.create_user(nickname="Leaver", email="leaver@example.com")
         self.write_article("post", "body")
-        from elenvind.db_comment import create_comment
+        from elenvind.core.db_comment import create_comment
         create_comment("post", user_id, "old comment")
-        from elenvind.db_user import delete_user
+        from elenvind.core.db_user import delete_user
         delete_user(user_id)
 
         self._config["deleted_user_nickname"] = "GONE-AWAY"
@@ -343,6 +343,44 @@ class ConfigBehaviorTests(ElenvindTestCase):
         self.assertNotIn("header-brand\"><img", page)
         self.assertIn(f"<span class=\"header-title\">{self._config['title']}</span>", page)
 
+    def test_templates_dir_change_switches_template_source(self):
+        """templates_dir 必须真的生效：换目录就换模板（不是死配置）。
+
+        注意它是一个**完整替换**：目录必须自带被请求的模板，
+        所以这里同时提供 base.html 与 home.html。
+        """
+        from elenvind.core.templating import reset_environment
+
+        custom = self.tmpdir / "custom-templates"
+        (custom / "partials").mkdir(parents=True)
+        (custom / "base.html").write_text(
+            "<!DOCTYPE html><html lang=\"{{ lang }}\"><body>"
+            "CUSTOM-LAYOUT {{ site_title }}"
+            "{% include 'partials/marker.html' %}"
+            "{% block content %}{% endblock %}"
+            "</body></html>",
+            encoding="utf-8")
+        (custom / "partials" / "marker.html").write_text("MARKER-OK", encoding="utf-8")
+        (custom / "home.html").write_text(
+            "{% extends 'base.html' %}{% block content %}HOME-CUSTOM{% endblock %}",
+            encoding="utf-8")
+
+        self._config["templates_dir"] = str(custom)
+        reset_environment()
+        try:
+            page = self.app.request("GET", "/").text
+            self.assertIn("CUSTOM-LAYOUT", page)
+            self.assertIn("MARKER-OK", page)      # include 链也在新目录里解析
+            self.assertIn("HOME-CUSTOM", page)
+        finally:
+            self._config["templates_dir"] = "elenvind/templates"
+            reset_environment()
+
+        # 换回默认目录后仍是原来的模板
+        page = self.app.request("GET", "/").text
+        self.assertNotIn("CUSTOM-LAYOUT", page)
+        self.assertIn("header-brand", page)
+
     def test_intro_is_rendered_and_escaped(self):
         self._config["params"]["intro"] = "Hello <script>alert(1)</script>"
         page = self.app.request("GET", "/").text
@@ -365,26 +403,26 @@ class ConfigBehaviorTests(ElenvindTestCase):
         self.assertIn("A project", page)
 
     def test_static_page_urls_come_from_config(self):
-        self._config["usrpages_dir"] = str(self.usrpages_dir)
+        self._config["custom_pages_dir"] = str(self.custom_pages_dir)
         self.write_page("cfgpage", "content from custom dir")
         page = self.app.request("GET", "/cfgpage").text
         self.assertIn("content from custom dir", page)
 
     def test_articles_dir_change_switches_content_source(self):
-        from elenvind import articles as articles_module
+        from elenvind.features.blog import logic as blog
 
         self.write_article("default-post", "default body",
                            {"title": "Default", "date": "2026-01-01"})
-        self.assertEqual([a["slug"] for a in articles_module.get_articles()], ["default-post"])
+        self.assertEqual([a["slug"] for a in blog.get_articles()], ["default-post"])
 
         alternate = self.tmpdir / "alternate-articles"
         alternate.mkdir()
-        (alternate / "other-post.evmd").write_text(
-            '@@@\ntitle = "Other"\ndate = "2026-02-01"\n@@@\n\nother body\n', encoding="utf-8")
+        (alternate / "other-post.md").write_text(
+            '+++\ntitle = "Other"\ndate = "2026-02-01"\n+++\n\nother body\n', encoding="utf-8")
         self._config["articles_dir"] = str(alternate)
-        articles_module._articles_cache = None
-        articles_module._file_stats = None
-        self.assertEqual([a["slug"] for a in articles_module.get_articles()], ["other-post"])
+        blog._articles_cache = None
+        blog._file_stats = None
+        self.assertEqual([a["slug"] for a in blog.get_articles()], ["other-post"])
         response = self.app.request("GET", "/article/other-post")
         self.assertEqual(response.status, 200)
         self.assertIn("other body", response.text)
@@ -392,8 +430,8 @@ class ConfigBehaviorTests(ElenvindTestCase):
 
     # ---------- Cookie ----------
     def test_cookie_prefix_switch_changes_set_read_delete(self):
-        from elenvind import security
-        from elenvind.config import apply_runtime_config
+        from elenvind.core import security
+        from elenvind.core.config import apply_runtime_config
 
         for enabled, expected_name in ((False, "session"), (True, "__Host-session")):
             with self.subTest(prefix=enabled):
@@ -433,7 +471,7 @@ class ConfigBehaviorTests(ElenvindTestCase):
 
     # ---------- 代理与客户端 IP ----------
     def test_trusted_proxies_control_client_ip(self):
-        from elenvind.utils import get_client_ip
+        from elenvind.core.utils import get_client_ip
 
         def scope(peer, forwarded=None):
             headers = []
@@ -521,7 +559,7 @@ class DatabasePathConfigTests(unittest.TestCase):
 
 class LoggingPathConfigTests(unittest.TestCase):
     def test_logging_file_resolves_against_project_root(self):
-        from elenvind.logging_config import resolve_log_path
+        from elenvind.core.logging_config import resolve_log_path
 
         self.assertEqual(resolve_log_path("logs/app.log"), ROOT / "logs" / "app.log")
         self.assertEqual(resolve_log_path(""), ROOT / "logs" / "app.log")
@@ -547,8 +585,9 @@ class DeadConfigurationGuardTests(unittest.TestCase):
         return keys
 
     def _runtime_source(self):
+        """整个 elenvind 包（含 core/ 与 features/）的源码，用于死配置扫描。"""
         parts = []
-        for path in sorted((PROJECT_ROOT / "elenvind").glob("*.py")):
+        for path in sorted((PROJECT_ROOT / "elenvind").rglob("*.py")):
             parts.append(path.read_text(encoding="utf-8"))
         return "\n".join(parts)
 
@@ -566,9 +605,15 @@ class DeadConfigurationGuardTests(unittest.TestCase):
         self.assertEqual(dead, [], f"dead configuration keys: {dead}")
 
     def test_no_leftover_params_author(self):
-        """params.author 已被移除（曾是死配置）。"""
+        """params.author 已被移除（曾是死配置）。
+
+        只针对 `params` 命名空间断言：评论行里的 `"author"` 字段是无关概念，
+        不应被这条守卫误伤。
+        """
         source = self._runtime_source()
-        self.assertNotIn('"author"', source)
+        for pattern in ('params.get("author")', "params['author']",
+                        'params["author"]'):
+            self.assertNotIn(pattern, source)
         for name in ("config.toml", "config.example.toml"):
             text = (PROJECT_ROOT / name).read_text(encoding="utf-8")
             self.assertNotIn("params.author", text)
@@ -593,7 +638,7 @@ class NoUnclosedConnectionGuardTests(unittest.TestCase):
 
     def test_every_connection_is_closed_on_all_paths(self):
         offenders = []
-        for path in sorted((PROJECT_ROOT / "elenvind").glob("db_*.py")):
+        for path in sorted((PROJECT_ROOT / "elenvind").rglob("db_*.py")):
             source = path.read_text(encoding="utf-8")
             tree = ast.parse(source, str(path))
             for func in [node for node in ast.walk(tree)
@@ -617,7 +662,7 @@ class NoUnclosedConnectionGuardTests(unittest.TestCase):
     def test_no_duplicate_top_level_definitions(self):
         """同一模块内不得有重名顶层定义（同步/合并事故的典型残留）。"""
         duplicates = []
-        for path in sorted((PROJECT_ROOT / "elenvind").glob("*.py")):
+        for path in sorted((PROJECT_ROOT / "elenvind").rglob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
             seen = {}
             for node in tree.body:
@@ -630,7 +675,7 @@ class NoUnclosedConnectionGuardTests(unittest.TestCase):
 
 
 def _config_dict():
-    from elenvind.config import config
+    from elenvind.core.config import config
     return config
 
 

@@ -90,7 +90,7 @@ class StoredXssTests(ElenvindTestCase):
                              f"payload {payload!r} was reflected verbatim")
 
     def test_comment_payloads_are_escaped(self):
-        from elenvind.db_comment import create_comment
+        from elenvind.core.db_comment import create_comment
 
         user_id, _ = self.create_user(nickname="Ann", email="ann@example.com")
         for payload in XSS_PAYLOADS:
@@ -138,15 +138,15 @@ class StoredXssTests(ElenvindTestCase):
         self._assert_no_injection(response.text, payload)
 
     def _make_user(self, nickname):
-        from elenvind.db_user import create_user
-        from elenvind.security import hash_password
+        from elenvind.core.db_user import create_user
+        from elenvind.core.security import hash_password
         existing = len(self._all_emails())
         email = f"user{existing + 1}@example.com"
         return create_user(nickname, email, hash_password("password-123"))
 
     def _all_emails(self):
-        from elenvind.db_base import get_connection
-        with get_connection() as conn:
+        from elenvind.core.db_base import connect
+        with connect() as conn:
             return [row["email"] for row in conn.execute("SELECT email FROM user")]
 
 
@@ -178,16 +178,29 @@ class ReflectedXssTests(ElenvindTestCase):
         self.assertNotIn("<script>alert(1)</script>", response.text)
 
     def test_error_pages_escape_messages(self):
-        from elenvind.http_article import _error_page
-        from elenvind.http_base import RequestContext
+        """评论被拒时渲染的错误提示必须转义（不能把输入当 HTML 输出）。
 
-        ctx = RequestContext(scope={"headers": []}, cookies={}, session_token=None,
-                             user=None, client_ip="1.2.3.4", secure=False, method="POST",
-                             path="/article/post/comment", query={}, form={})
-        response = _error_page(ctx, '<script>alert(1)</script>', 400)
-        body = response.body.decode("utf-8")
-        self.assertNotIn("<script>alert(1)</script>", body)
-        self.assertIn("&lt;script&gt;", body)
+        走真实渲染路径：`build_comment_rows` 会转义评论正文，
+        系统错误页渲染 `error_message` 时由 Jinja 自动转义。
+        """
+        from elenvind.core.db_comment import create_comment
+        from elenvind.core.templating import render_template
+        from elenvind.features.blog import logic as blog
+
+        user_id, _ = self.create_user()
+        self.write_article("post", "body")
+        create_comment("post", user_id, '<script>alert(1)</script>')
+        rows, _total, _max = blog.build_comment_rows("post", None, max_length=1000)
+        self.assertNotIn("<script>alert(1)</script>", str(rows[0]["content"]))
+        self.assertIn("&lt;script&gt;", str(rows[0]["content"]))
+
+        # 错误页文案同样必须被转义
+        page = render_template("errors/error.html", {
+            "error_title": "Bad Request",
+            "error_message": '<script>alert(1)</script>',
+        })
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertIn("&lt;script&gt;", page)
 
 
 class CrlfInjectionTests(ElenvindTestCase):
@@ -195,7 +208,7 @@ class CrlfInjectionTests(ElenvindTestCase):
         """值含控制字符时 http.cookies 直接拒绝，从根上杜绝响应头注入。"""
         from http.cookies import CookieError
 
-        from elenvind.security import csrf_cookie_header, set_cookie_header
+        from elenvind.core.security import csrf_cookie_header, set_cookie_header
 
         for value in ("abc\r\nX-Injected: 1", "abc\ndef", "abc\rdef", "a\x00b"):
             with self.subTest(value=value):
@@ -204,7 +217,7 @@ class CrlfInjectionTests(ElenvindTestCase):
                         builder(value)
 
     def test_suspicious_values_are_quoted_not_split(self):
-        from elenvind.security import set_cookie_header
+        from elenvind.core.security import set_cookie_header
 
         header = set_cookie_header("abc; Path=/evil")
         self.assertNotIn(b"\r", header[1])
@@ -223,7 +236,7 @@ class CrlfInjectionTests(ElenvindTestCase):
                 self.assertNotIn("\n", location)
 
     def test_cookie_header_parsing_ignores_malformed_pairs(self):
-        from elenvind.security import parse_cookies
+        from elenvind.core.security import parse_cookies
 
         scope = {"headers": [(b"cookie", b"session=abc; =broken; csrf=xyz; session=def")]}
         cookies = parse_cookies(scope)
@@ -231,7 +244,7 @@ class CrlfInjectionTests(ElenvindTestCase):
         self.assertEqual(cookies.get("csrf"), "xyz")
 
     def test_multiple_cookie_headers_are_merged(self):
-        from elenvind.security import parse_cookies
+        from elenvind.core.security import parse_cookies
 
         scope = {"headers": [(b"cookie", b"session=abc"), (b"cookie", b"csrf=xyz")]}
         cookies = parse_cookies(scope)
@@ -259,18 +272,19 @@ class CacheLeakTests(ElenvindTestCase):
 
 class ErrorHandlingTests(ElenvindTestCase):
     def test_unexpected_exception_becomes_500_without_leaking_details(self):
-        from elenvind import http as http_module
+        from elenvind.app import app
 
-        original = http_module._route_get
+        target = next(route for route in app.router.routes if route.path == "/")
+        original = target.handler
 
-        def boom(ctx):
+        def boom(request):
             raise RuntimeError("internal detail: /etc/passwd")
 
-        http_module._route_get = boom
+        target.handler = boom
         try:
             response = self.app.request("GET", "/")
         finally:
-            http_module._route_get = original
+            target.handler = original
 
         self.assertEqual(response.status, 500)
         self.assertEqual(response.text, "Internal Server Error")

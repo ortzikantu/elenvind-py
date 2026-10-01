@@ -5,9 +5,9 @@ from pathlib import Path
 
 from tests.support import PROJECT_ROOT, ElenvindTestCase
 
-from elenvind import config as config_module
-from elenvind import i18n as i18n_module
-from elenvind.config import (
+from elenvind.core import config as config_module
+from elenvind.core import i18n as i18n_module
+from elenvind.core.config import (
     ConfigError,
     ROOT,
     apply_runtime_config,
@@ -126,14 +126,28 @@ class ValidateConfigTests(ElenvindTestCase):
         with self.assertRaises(ConfigError):
             validate_config()
 
-    def test_missing_secret_key_fails_startup(self):
-        original = os.environ.pop("SECRET_KEY", None)
+    def test_no_environment_variable_is_required(self):
+        """配置校验不依赖任何环境变量（本应用没有签名密钥）。"""
+        saved_db = os.environ.pop("ELENVIND_DB", None)
         try:
-            with self.assertRaises(ConfigError):
-                validate_config()
+            validate_config()          # 不应抛异常
         finally:
-            if original is not None:
-                os.environ["SECRET_KEY"] = original
+            if saved_db is not None:
+                os.environ["ELENVIND_DB"] = saved_db
+
+    def test_code_does_not_reference_a_signing_secret(self):
+        """回归守卫：不要重新引入"仪式性"的密钥环境变量。
+
+        只看**代码**（去掉注释与 docstring）：文件里有一句注释在解释
+        "为什么不需要密钥"，那句话本身不该被判违规。
+        """
+        source = (PROJECT_ROOT / "elenvind" / "core" / "config.py").read_text(
+            encoding="utf-8")
+        body = source.split('"""', 2)[-1]
+        code = "\n".join(line for line in body.splitlines()
+                         if not line.strip().startswith("#"))
+        self.assertNotIn("SECRET_KEY", code)
+        self.assertNotIn("os.environ", code)
 
     def test_articles_dir_must_be_directory_when_present(self):
         file_path = self.tmpdir / "not-a-dir"
@@ -145,12 +159,12 @@ class ValidateConfigTests(ElenvindTestCase):
 
 class CookiePrefixConfigTests(ElenvindTestCase):
     def test_prefix_disabled_by_default(self):
-        from elenvind.security import cookie_name
+        from elenvind.core.security import cookie_name
         apply_runtime_config()
         self.assertEqual(cookie_name("session"), "session")
 
     def test_prefix_enabled_via_config(self):
-        from elenvind import security
+        from elenvind.core import security
         try:
             self._config["server"]["cookie_prefix"] = True
             apply_runtime_config()
@@ -206,7 +220,7 @@ class RealConfigFileTests(unittest.TestCase):
             data = tomllib.load(handle)
         for key in ("locale", "title", "site_url", "admin_user_id", "max_length",
                     "max_comment_depth", "registration_enabled", "max_body_size",
-                    "database", "articles_dir", "usrpages_dir",
+                    "database", "articles_dir", "custom_pages_dir",
                     "comment_limits", "login_limits", "register_limits",
                     "server", "pagination", "static", "params", "logging"):
             self.assertIn(key, data, f"config.example.toml is missing {key}")
@@ -252,7 +266,7 @@ class I18nTests(unittest.TestCase):
                 self.assertEqual(i18n_module.normalize(value), expected)
 
     def test_import_does_not_read_files(self):
-        source = (PROJECT_ROOT / "elenvind" / "i18n.py").read_text(encoding="utf-8")
+        source = (PROJECT_ROOT / "elenvind" / "core" / "i18n.py").read_text(encoding="utf-8")
         body = source.split('"""', 2)[-1]
         self.assertNotIn("\nload()", body)
 

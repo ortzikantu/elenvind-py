@@ -1,6 +1,6 @@
 <img src="static/logo.png" align="right" alt="Logo designed by Hao Wu" width="120" height="120">
 
-# Elenvind 
+<h2>Elenvind</h2> 
 
 A Personal Website Server
 
@@ -15,7 +15,7 @@ A Personal Website Server
 
 Everything in Chinese, because we're classy like that:
 
-- [EVMD Markup Spec](docs/EVMD_SPEC.md) — the custom markup language for articles & pages
+- [Feature Development Guide](docs/development/features.md) — how to add a Feature (the intended DX)
 - [Configuration Guide](docs/CONFIGURATION.md) — every knob in config.toml
 - [Deployment Guide](docs/DEPLOYMENT.md) — systemd, Nginx, HTTPS, backups
 - [Nginx Config Example](docs/nginx.conf.example) — copy, paste, adjust, ship
@@ -23,9 +23,9 @@ Everything in Chinese, because we're classy like that:
 
 ## Getting started
 
-A standard-library-based SSR web app, with **Uvicorn as the ASGI server** — that is the
-only runtime dependency (`requirements.txt` also pins Uvicorn's own `click`/`h11`).
-No ORM, no template engine, no framework, no build step. Just for fun.
+A standard-library-first SSR web app, with **Uvicorn as the ASGI server**.
+`requirements.txt` pins Uvicorn (plus its `click`/`h11`), Jinja2 and Markdown —
+no ORM, no DI, no plugin system, no framework, no build step.
 
 ```bash
 git clone https://codeberg.org/ortzikantu/elenvind.git elenvind-py
@@ -49,35 +49,115 @@ For CSS, images, and whatnot, you're on your own. Set up Nginx (or equivalent) o
 Static URLs live in `config.toml` (`[static]` + `params.social.icon`). See the Configuration Guide.
 `config.toml` is validated once at startup: a typo means a refused start with a reason, not a 500 later.
 
+### Styling: bring your own, or use the built-in one
+
+| `[static].css` | `use_builtin_css` | What you get |
+|---|---|---|
+| set | any | your URL (site-relative path or CDN) |
+| empty | `true` (default) | the **default** stylesheet, served by the app at `/css/style.css` |
+| empty | `false` | no `<link>` at all — you handle styling yourself |
+
+So `python run.py` alone gives you a fully typeset site, with zero Nginx required.
+The built-in sheet is zero-JS, variable-driven, has both `prefers-color-scheme` and
+`data-theme` dark modes, and is covered by a drift guard
+(`tests/test_styles.py`) that fails if a template uses a class the sheet doesn't define.
+`style.example.css` at the repo root is a copy of it — start from that if you want to
+take over the look entirely.
+
+Default assets live inside the package and are served by the app itself. The whole
+`elenvind/static/` tree is exposed at `/`, with **URL mirroring disk**:
+
+```
+/css/style.css  ->  elenvind/static/css/style.css
+/imgs/logo.svg  ->  elenvind/static/imgs/logo.svg
+```
+
+So dropping a file into that tree is all it takes to make it available — no registry,
+no config edit.
+
+| Directory | Convention | Config key | Default URL |
+|---|---|---|---|
+| `elenvind/static/css/` | stylesheets | `[static].css` when empty | `/css/style.css` |
+| `elenvind/static/imgs/` | images | `[static].favicon` when empty | `/imgs/favicon.ico`/`.png` |
+| anything else under `elenvind/static/` | fonts, icons, … | — | by relative path |
+
+Same rule throughout: **config wins, packaged default fills in.** Order is
+`[static].css`/`favicon` → packaged file → nothing rendered. Responses carry an `ETag`
+and `Cache-Control: public, max-age=86400`, and files are read per request, so edits
+show up on refresh without a restart.
+
+**Security boundary:** the resolved path must stay inside `elenvind/static/`; hidden
+files/directories are 404; `../`, `%2e%2e`, backslashes and symlinks pointing outside
+are all rejected. These assets are **public** by design — never put private content here.
+
+Your own `logo`, `hero` and social icons can stay on Nginx/CDN via plain URLs. When
+they're empty the element simply isn't rendered, so a fresh clone never shows a
+broken image.
+
+### Architecture: Feature 负责业务，Web Core 负责 Web 安全
+
+```
+elenvind/
+  core/        Web Core —— 请求/响应、安全头、Cookie、会话、认证、授权、CSRF、
+               模板（Jinja2 唯一入口）、Markdown（唯一入口）、数据库连接
+  features/    业务 —— blog / pages / auth / users / admin / seo / system
+  templates/   Jinja2 模板（Python 只准备数据，HTML 全在这里）
+  app.py       装配点：Core App + Feature 注册
+```
+
+新增一个页面只需要声明路由，安全由框架默认施加：
+
+```python
+@route("/hello", methods=["GET"])
+def hello(request):
+    return render_template("hello.html", {"greeting": "Hello"})
+
+@route("/settings", methods=["POST"], auth="required")   # 未登录提交 -> 403
+def settings(request): ...
+
+@route("/admin", methods=["GET"], auth="required", permission="admin")
+def admin_home(request): ...
+```
+
+未登录访问受保护页面时，框架会 `302 → /login?next=<原路径>`，登录后自动回到原页面
+（`next` 只接受站内路径，防开放重定向）；已登录但权限不足才是 403。
+`/user` 与 `GET /logout` 这类"关于你自己"的页面在未登录时渲染友好的提示页，
+而状态变更始终只由 POST + CSRF 触发。
+
+Feature 里**不写** CSRF、不拼 Cookie、不加安全头、不检查请求体大小 ——
+这些都是 Core 的职责，且由 `tests/test_core_contract.py` 静态 + 运行时双重守卫。
+详见 [Feature Development Guide](docs/development/features.md)。
+
 ### What it is made of
 
 | Concern | Choice |
 |---|---|
 | Runtime | Python standard library + Uvicorn (ASGI) |
-| Rendering | Server-side HTML strings, Zero-JS |
+| Rendering | Jinja2 templates, server-side, Zero-JS |
+| Styling | Default stylesheet served by the app (`/css/style.css`); config can override with your own URL |
 | Database | SQLite (WAL, `PRAGMA foreign_keys=ON`, `user_version` migrations) |
-| Markup | EVMD — this project's own format (see `docs/EVMD_SPEC.md`) |
+| Content | Markdown body + TOML front matter (`+++` fence), rendered by `core.markdown` |
+| Markup safety | Whitelist HTML sanitiser in `core.markdown` (stdlib `html.parser`) |
 | Sessions | Server-side random tokens in SQLite (not JWT) |
 | Passwords | `hashlib.scrypt`, self-describing hashes, transparent rehash on login |
 | CSRF | Double-submit cookie, enforced in one dispatcher gate |
+| AuthZ | Declarative `auth="required"` / `permission="admin"` on the route |
 | Cache | In-process file-snapshot caches for articles and custom pages |
 
 ## Any Tips
 
-You'll need a `SECRET_KEY` environment variable before starting.
-Just smash your keyboard. The more random, the better.
+No environment variables. No signing key. No secret to generate and paste into a
+systemd unit at 3am. Just:
+
 ```bash
-export SECRET_KEY="your-strong-random-secret"
 python run.py
 ```
 
-Too lazy to type? Use the tool below. Pick whatever length you want, 64, 128, 256, 512, anything goes.
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(64))"
-```
-*DON'T TELL ANYONE*
-
-*Note: it's an environment gate these days — sessions are server-side random tokens, so the key itself isn't used for signing anymore. Set it anyway. Consider it tradition.*
+Why it works without one: sessions are **server-side random tokens** in SQLite (the
+client only ever holds an unguessable opaque value), CSRF is a **double-submit cookie**
+(the token itself is the random value), and passwords are **self-describing scrypt
+hashes**. Nothing here derives anything from a shared secret, so requiring one would
+have been pure ceremony.
 
 HTTPS? Cookies get `Secure` automatically — as long as your reverse proxy speaks `X-Forwarded-Proto`. Behind Nginx, just follow the example config and you're done. No code edits required.
 ```bash
@@ -98,11 +178,12 @@ your real `sqlite.db` and `articles/` are never touched.
 
 ```bash
 python -m unittest discover -s tests -t .        # everything
-python -m unittest tests.test_evmd_block -v      # one module
+python -m unittest tests.test_core_contract -v   # one module
 ```
 
 Covers the HTTP body parser, CSRF, sessions, auth, comments, the article/page caches,
-SEO, config validation, the EVMD parser (plus a seeded fuzz harness) and an
+SEO, config validation, the Markdown renderer + sanitiser (plus a seeded fuzz harness),
+the **Core Contract** (features cannot bypass or duplicate security), and an
 end-to-end cold start walkthrough.
 
 No PRs, please.  

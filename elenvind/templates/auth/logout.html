@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}{{ t('user_logout') }} - {{ site_title }}{% endblock %}
+{% block content %}
+  <h1>{{ t('user_logout') }}</h1>
+
+  {% if user %}
+    {# 退出登录会改变状态，因此必须由 POST + CSRF 触发；
+       这个 GET 页面只做确认，不产生任何副作用。 #}
+    <p>{{ t('user_logout_confirm') }}</p>
+    <form method="post" action="/logout" class="field-action">
+      {{ csrf_input() }}
+      <button type="submit">{{ t('user_logout') }}</button>
+    </form>
+    <p><a href="/">{{ t('user_logout_cancel') }}</a></p>
+  {% else %}
+    <p>{{ t('user_logout_done') }}</p>
+    <p><a href="/">{{ t('user_logout_cancel') }}</a></p>
+  {% endif %}
+{% endblock %}

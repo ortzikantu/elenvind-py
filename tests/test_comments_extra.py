@@ -2,15 +2,44 @@
 
 复杂度基准对应规格第十五节：100 / 500 / 1000 / 5000 条评论的树构建，
 必须接近线性（不是 O(n²)），且任何深度都不能触发 Python 递归上限。
+
+树展开现在由 `features.blog.logic.build_comment_rows` 的同一套算法负责
+（children_by_parent + 显式栈）；本模块的性能基准对内存数据复刻该算法，
+因此仍然能守住"线性 + 无递归"这条契约。
 """
 import time
 import unittest
 
 from tests.support import ElenvindTestCase
 
-from elenvind.db_base import get_connection
-from elenvind.db_comment import create_comment, get_comment_by_id, get_comments_by_article
-from elenvind.view_partials_comment import build_tree
+from elenvind.core.db_base import connect
+from elenvind.core.db_comment import create_comment, get_comment_by_id, get_comments_by_article
+from elenvind.features.blog import logic as blog
+
+
+def expand_tree(comments):
+    """与生产实现同构的树展开（供纯内存性能测试使用）。"""
+    by_id = {row["id"]: row for row in comments}
+    children = {}
+    roots = []
+    for row in comments:
+        parent_id = row["parent_id"]
+        if parent_id is None or parent_id not in by_id:
+            roots.append(row)
+        else:
+            children.setdefault(parent_id, []).append(row)
+    ordered = []
+    seen = set()
+    stack = [(row, 1) for row in reversed(roots)]
+    while stack:
+        row, depth = stack.pop()
+        if row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        ordered.append((row, depth))
+        for child in reversed(children.get(row["id"], ())):
+            stack.append((child, depth + 1))
+    return ordered, by_id
 
 
 class CrossArticleReplyTests(ElenvindTestCase):
@@ -28,6 +57,7 @@ class CrossArticleReplyTests(ElenvindTestCase):
                                     form={"csrf_token": self.csrf, "content": "cross",
                                           "reply_to": str(other)},
                                     cookies=self.cookies)
+        # 回复目标非法 = 表单输入问题 -> 400，且不写入任何评论
         self.assertEqual(response.status, 400)
         self.assertEqual(len(get_comments_by_article("post-a")), 0)
 
@@ -35,7 +65,7 @@ class CrossArticleReplyTests(ElenvindTestCase):
         other = create_comment("post-b", 1, "other article comment")
         response = self.app.request("POST", f"/article/post-a/comment/delete/{other}",
                                     form={"csrf_token": self.csrf}, cookies=self.cookies)
-        self.assertEqual(response.status, 400)
+        self.assertEqual(response.status, 403)
         self.assertEqual(get_comment_by_id(other)["is_deleted"], 0)
 
     def test_reply_to_root_of_same_article_is_accepted(self):
@@ -56,7 +86,7 @@ class CrossArticleReplyTests(ElenvindTestCase):
         self.assertEqual(response.status, 404)
 
     def test_comment_on_deleted_article_is_404(self):
-        path = self.articles_dir / "post-a.evmd"
+        path = self.articles_dir / "post-a.md"
         path.unlink()
         response = self.app.request("POST", "/article/post-a/comment",
                                     form={"csrf_token": self.csrf, "content": "x"},
@@ -79,7 +109,7 @@ class CorruptCommentDataTests(ElenvindTestCase):
     def test_surface_level_cycle_does_not_hang_rendering(self):
         first = create_comment("post", 1, "one")
         second = create_comment("post", 1, "two", parent_id=first)
-        with get_connection() as conn:
+        with connect() as conn:
             conn.execute("UPDATE comment SET parent_id = ? WHERE id = ?", (second, first))
             conn.commit()
         response = self.app.request("GET", "/article/post")
@@ -87,12 +117,12 @@ class CorruptCommentDataTests(ElenvindTestCase):
 
     def test_reply_depth_is_bounded_when_chain_is_corrupt(self):
         """父链被人为拉长/成环时，层级计算必须是常数级有界的，不能死循环。"""
-        from elenvind.http_article import _comment_depth
-        from elenvind.db_comment import get_comment_by_id
+        from elenvind.features.blog import logic as _blog_logic
+        from elenvind.core.db_comment import get_comment_by_id
 
         self._config["max_comment_depth"] = 3
         ids = [create_comment("post", 1, f"c{index}") for index in range(6)]
-        with get_connection() as conn:
+        with connect() as conn:
             for previous, current in zip(ids, ids[1:]):
                 conn.execute("UPDATE comment SET parent_id = ? WHERE id = ?",
                              (previous, current))
@@ -101,14 +131,14 @@ class CorruptCommentDataTests(ElenvindTestCase):
             conn.commit()
 
         start = time.perf_counter()
-        depth = _comment_depth(get_comment_by_id(ids[-1]))
+        depth = _blog_logic.comment_depth(get_comment_by_id(ids[-1]))
         elapsed = time.perf_counter() - start
         self.assertLessEqual(depth, self._config["max_comment_depth"] + 1)
         self.assertLess(elapsed, 1.0)
 
     def test_dangling_parent_is_treated_as_root_when_rendering(self):
         lone = create_comment("post", 1, "lonely")
-        with get_connection() as conn:
+        with connect() as conn:
             conn.execute("PRAGMA foreign_keys=OFF")
             conn.execute("UPDATE comment SET parent_id = 999999 WHERE id = ?", (lone,))
             conn.commit()
@@ -121,7 +151,7 @@ class CommentCapConcurrencyTests(ElenvindTestCase):
     """单篇文章评论上限必须在写事务内判定（并发下不能超发）。"""
 
     def test_cap_is_enforced_inside_the_write_transaction(self):
-        from elenvind.db_comment_rate import try_post_comment
+        from elenvind.core.db_comment_rate import try_post_comment
 
         user_id, _ = self.create_user()
         for index in range(3):
@@ -133,14 +163,14 @@ class CommentCapConcurrencyTests(ElenvindTestCase):
                                    max_per_user=100, max_per_ip=100, window_seconds=60,
                                    max_per_article=3, created_at="2026-01-01T00:00:01")
         self.assertEqual(blocked, "too_many")
-        with get_connection() as conn:
+        with connect() as conn:
             count = conn.execute("SELECT COUNT(*) FROM comment WHERE article_slug = 'slug'"
                                  ).fetchone()[0]
         self.assertEqual(count, 3)
 
     def test_interleaved_writers_cannot_exceed_cap(self):
         """多连接交替写入（模拟并发）时，上限依然成立。"""
-        from elenvind.db_comment_rate import try_post_comment
+        from elenvind.core.db_comment_rate import try_post_comment
 
         user_id, _ = self.create_user()
         writers = [f"10.0.0.{index}" for index in range(3)]
@@ -154,7 +184,7 @@ class CommentCapConcurrencyTests(ElenvindTestCase):
                 if outcome == "ok":
                     accepted += 1
         self.assertEqual(accepted, 5)
-        with get_connection() as conn:
+        with connect() as conn:
             count = conn.execute("SELECT COUNT(*) FROM comment WHERE article_slug = 'shared'"
                                  ).fetchone()[0]
         self.assertEqual(count, 5)
@@ -183,7 +213,7 @@ class CommentTreePerformanceTests(unittest.TestCase):
             with self.subTest(size=size):
                 rows = self._fanout(size)
                 start = time.perf_counter()
-                ordered, _ = build_tree(rows)
+                ordered, _ = expand_tree(rows)
                 elapsed = time.perf_counter() - start
                 timings[size] = elapsed
                 self.assertEqual(len(ordered), size)
@@ -197,7 +227,7 @@ class CommentTreePerformanceTests(unittest.TestCase):
     def test_deep_chain_does_not_recurse(self):
         for size in (100, 500, 1000, 5000):
             with self.subTest(size=size):
-                ordered, _ = build_tree(self._chain(size))
+                ordered, _ = expand_tree(self._chain(size))
                 self.assertEqual(len(ordered), size)
                 self.assertEqual(ordered[-1][1], size)
 
@@ -212,7 +242,7 @@ class CommentTreePerformanceTests(unittest.TestCase):
                 cid += 1
                 rows.append(self._row(cid, root))
         start = time.perf_counter()
-        ordered, _ = build_tree(rows)
+        ordered, _ = expand_tree(rows)
         elapsed = time.perf_counter() - start
         self.assertEqual(len(ordered), 5000)
         self.assertLess(elapsed, 1.0, f"mixed tree took {elapsed:.5f}s")

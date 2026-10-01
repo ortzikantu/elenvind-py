@@ -31,16 +31,12 @@ TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 # 绝不能因为某个测试没走 ElenvindTestCase.setUp 就写到项目根的真实 sqlite.db。
 os.environ.setdefault("ELENVIND_DB", str(TEST_TMP_ROOT / "fallback.db"))
 
-# security.py 不再在导入期检查环境变量，但 validate_config() 会检查；
-# 测试夹具统一注入一个测试用值。
-os.environ.setdefault("SECRET_KEY", "test-secret-key-for-unit-tests")
-
-from elenvind import config as config_module          # noqa: E402
-from elenvind import db_base                          # noqa: E402
-from elenvind import articles as articles_module      # noqa: E402
-from elenvind import usrpages as usrpages_module      # noqa: E402
-from elenvind import lifespan as lifespan_module      # noqa: E402
-from elenvind import console as console_module        # noqa: E402
+from elenvind.core import config as config_module          # noqa: E402
+from elenvind.core import db_base                          # noqa: E402
+from elenvind.core import lifespan as lifespan_module      # noqa: E402
+from elenvind.core import console as console_module        # noqa: E402
+from elenvind.features.blog import logic as blog_logic     # noqa: E402
+from elenvind.features.pages import logic as pages_logic   # noqa: E402
 
 # 静音启动横幅/彩色日志：测试输出只保留 unittest 的结果
 _NOOP = lambda *args, **kwargs: None
@@ -95,6 +91,7 @@ class AppHarness:
         self.scheme = scheme
         self.client = client or self.DEFAULT_PEER
         self.started = False
+        self.jar = {}          # use_jar=True 时的浏览器式 Cookie 罐
 
     # ---------- lifespan ----------
     def startup(self):
@@ -193,8 +190,18 @@ class AppHarness:
 
     def request(self, method, path, *, query=None, form=None, cookies=None,
                 headers=None, content_type="application/x-www-form-urlencoded",
-                body=None, send_content_length=True, extra_headers=()):
-        """构造一个"正常浏览器"风格的请求。"""
+                body=None, send_content_length=True, extra_headers=(),
+                use_jar=False):
+        """构造一个"正常浏览器"风格的请求。
+
+        `use_jar=True` 时使用浏览器式 Cookie 罐：响应 Set-Cookie 会被记住并
+        自动带入后续请求。这更接近真实浏览器行为（也是 CSRF Double-Submit
+        能正常工作的前提——令牌 Cookie 是随表单页一起下发的）。
+        """
+        if use_jar:
+            merged = dict(self.jar)
+            merged.update(cookies or {})
+            cookies = merged
         header_list = [("host", self.host)]
         if cookies:
             header_list.append(("cookie", "; ".join(f"{k}={v}" for k, v in cookies.items())))
@@ -214,8 +221,11 @@ class AppHarness:
             if send_content_length:
                 header_list.append(("content-length", str(len(body))))
 
-        return self.raw_request(method, path, raw_query.encode("latin-1"),
-                                header_list, body)
+        response = self.raw_request(method, path, raw_query.encode("latin-1"),
+                                    header_list, body)
+        if use_jar:
+            self.jar.update(self.set_cookies(response))
+        return response
 
 
 class ElenvindTestCase(unittest.TestCase):
@@ -230,7 +240,7 @@ class ElenvindTestCase(unittest.TestCase):
         TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
         self.tmpdir = TEST_TMP_ROOT / f"case-{uuid.uuid4().hex[:12]}"
         (self.tmpdir / "articles").mkdir(parents=True)
-        (self.tmpdir / "usrpages").mkdir(parents=True)
+        (self.tmpdir / "custom_pages").mkdir(parents=True)
         self.db_path = self.tmpdir / "test.db"
 
         # 每个测试独立的数据库文件：所有模块都通过 db_base.DB_PATH 取路径
@@ -239,9 +249,9 @@ class ElenvindTestCase(unittest.TestCase):
         db_base.DB_PATH = self.db_path
         os.environ["ELENVIND_DB"] = str(self.db_path)
 
-        # 内容目录也隔离，避免读到真实 articles/usrpages（setUp 已建好）
+        # 内容目录也隔离，避免读到真实 articles/custom_pages（setUp 已建好）
         self.articles_dir = self.tmpdir / "articles"
-        self.usrpages_dir = self.tmpdir / "usrpages"
+        self.custom_pages_dir = self.tmpdir / "custom_pages"
 
         self._original_config = dict(config_module.config)
         config_module.config.clear()
@@ -268,14 +278,17 @@ class ElenvindTestCase(unittest.TestCase):
             os.environ["ELENVIND_DB"] = self._original_db_env
         config_module.config.clear()
         config_module.config.update(self._original_config)
-        # 清掉模块级缓存，避免测试之间串数据
-        articles_module._articles_cache = None
-        articles_module._file_stats = None
-        articles_module._body_cache.clear()
-        articles_module._failed_stats = {}
-        usrpages_module._pages_cache = None
-        usrpages_module._file_stats = None
-        from elenvind.db_user import _invalidate_user_count
+        # 清掉模块级缓存与启动钩子，避免测试之间串数据
+        blog_logic._articles_cache = None
+        blog_logic._file_stats = None
+        blog_logic._body_cache.clear()
+        blog_logic._failed_stats = {}
+        pages_logic._pages_cache = None
+        pages_logic._file_stats = None
+        lifespan_module.clear_startup_hooks()
+        from elenvind.core.templating import reset_environment
+        reset_environment()
+        from elenvind.core.db_user import _invalidate_user_count
         _invalidate_user_count()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
@@ -297,7 +310,7 @@ class ElenvindTestCase(unittest.TestCase):
             "max_body_size": 1024 * 1024,
             "database": "sqlite.db",
             "articles_dir": str(self.articles_dir),
-            "usrpages_dir": str(self.usrpages_dir),
+            "custom_pages_dir": str(self.custom_pages_dir),
             "server": {
                 "host": "127.0.0.1",
                 "port": 6789,
@@ -317,32 +330,54 @@ class ElenvindTestCase(unittest.TestCase):
         }
 
     # ---------- 便捷操作 ----------
-    def write_article(self, slug, body, meta=None):
-        """写一篇带文档头的测试文章。"""
-        header_lines = ["@@@"]
-        for key, value in (meta or {"title": slug.title(), "date": "2026-01-01"}).items():
+    def write_article(self, slug, body, meta=None, *, touch=True):
+        """写一篇测试文章：TOML front matter（+++ 包裹）+ Markdown 正文。
+
+        默认推进 mtime：缓存失效基于 (mtime, size)，同一文件系统 tick 内
+        连续写入会得到相同 mtime，让"内容变了"看起来像"没变"。
+        这是文件系统精度问题而非产品行为，测试需要确定性。
+        """
+        fields = dict(meta or {"title": slug.title(), "date": "2026-01-01"})
+        header_lines = ["+++"]
+        for key, value in fields.items():
             if isinstance(value, str):
                 header_lines.append(f'{key} = "{value}"')
+            elif isinstance(value, bool):
+                header_lines.append(f"{key} = {'true' if value else 'false'}")
+            elif isinstance(value, (int, float)):
+                header_lines.append(f"{key} = {value}")
             elif isinstance(value, list):
                 items = ", ".join(f'"{v}"' for v in value)
                 header_lines.append(f"{key} = [{items}]")
             else:
-                header_lines.append(f"{key} = {value}")
-        header_lines.append("@@@")
-        path = self.articles_dir / f"{slug}.evmd"
+                raise TypeError(f"unsupported metadata value for {key}: {value!r}")
+        header_lines.append("+++")
+        path = self.articles_dir / f"{slug}.md"
         path.write_text("\n".join(header_lines) + "\n\n" + body + "\n", encoding="utf-8")
-        return path
+        return self.touch(path) if touch else path
 
-    def write_page(self, slug, body):
-        path = self.usrpages_dir / f"{slug}.evmd"
+    def write_page(self, slug, body, *, touch=True):
+        """自定义页面：纯 Markdown 正文（无 front matter）。"""
+        path = self.custom_pages_dir / f"{slug}.md"
         path.write_text(body, encoding="utf-8")
+        return self.touch(path) if touch else path
+
+    @staticmethod
+    def touch(path, seconds=120):
+        """显式推进文件 mtime（见 write_article 的说明）。
+
+        偏移取 120 秒而不是几秒：小偏移在某些文件系统/时钟精度下会被
+        近似成原值，导致缓存失效判定不触发。
+        """
+        stat = Path(path).stat()
+        os.utime(path, (stat.st_atime + seconds, stat.st_mtime + seconds))
         return path
 
     def create_user(self, nickname="Alice", email="alice@example.com",
                     password="correct horse battery", is_admin=False):
         """直接建用户，返回 (user_id, password)。"""
-        from elenvind.db_user import create_user
-        from elenvind.security import hash_password
+        from elenvind.core.db_user import create_user
+        from elenvind.core.security import hash_password
 
         user_id = create_user(nickname, email, hash_password(password))
         return user_id, password
@@ -384,7 +419,7 @@ class ElenvindTestCase(unittest.TestCase):
         必须按**当前**的 Cookie 命名取（cookie_prefix 开启时是 `__Host-csrf`），
         否则开启前缀后所有依赖本方法的测试都会因令牌不匹配而失败。
         """
-        from elenvind.security import CSRF_COOKIE, cookie_name
+        from elenvind.core.security import CSRF_COOKIE, cookie_name
 
         response = self.app.request("GET", "/login")
         token = self.app.set_cookie_value(response, cookie_name(CSRF_COOKIE))
@@ -395,15 +430,15 @@ class ElenvindTestCase(unittest.TestCase):
 
     def csrf_cookies(self, token):
         """返回携带当前命名 CSRF Cookie 的 cookies 字典。"""
-        from elenvind.security import CSRF_COOKIE, cookie_name
+        from elenvind.core.security import CSRF_COOKIE, cookie_name
         return {cookie_name(CSRF_COOKIE): token}
 
     def csrf_cookie_name(self):
-        from elenvind.security import CSRF_COOKIE, cookie_name
+        from elenvind.core.security import CSRF_COOKIE, cookie_name
         return cookie_name(CSRF_COOKIE)
 
     def session_cookie_name(self):
-        from elenvind.security import SESSION_COOKIE, cookie_name
+        from elenvind.core.security import SESSION_COOKIE, cookie_name
         return cookie_name(SESSION_COOKIE)
 
 

@@ -1,0 +1,31 @@
+{# 顶栏：站标 + 主题切换 + 用户入口。
+   admin_badge 为空串时不渲染徽章（配置可关闭）。 #}
+<header>
+  <a class="header-brand" href="/">
+    {#- 站标图标优先级：配置的 logo -> 配置的 favicon -> 缺省图标 -> 只显示站名 -#}
+    {%- set brand_icon = static_url('logo') or icon_url() -%}
+    {% if brand_icon %}<img src="{{ brand_icon }}" alt="" loading="lazy">{% endif %}
+    <span class="header-title">{{ site_title }}</span>
+  </a>
+
+  <nav class="header-nav">
+    <ul>
+      <li class="nav-user">
+        {% if user %}
+          <a href="/user">{{ user['nickname'] }} (#{{ user['id'] }})</a>
+          {% if admin_badge and is_admin_user(user) %}<span class="badge-admin">{{ admin_badge }}</span>{% endif %}
+        {% else %}
+          <a href="/login">{{ t('nav_sign_in') }}</a>
+        {% endif %}
+      </li>
+      <li class="nav-theme">
+        {% set next_path = request.path if request else '/' %}
+        {% if theme == 'dark' %}
+          <a href="/theme?mode=light&next={{ next_path | urlencode }}" title="{{ t('nav_theme_title') }}">{{ theme_icons.light | safe }}</a>
+        {% else %}
+          <a href="/theme?mode=dark&next={{ next_path | urlencode }}" title="{{ t('nav_theme_title') }}">{{ theme_icons.dark | safe }}</a>
+        {% endif %}
+      </li>
+    </ul>
+  </nav>
+</header>

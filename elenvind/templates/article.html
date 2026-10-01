@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}{{ article.title }} - {{ site_title }}{% endblock %}
+
+{% block content %}
+  <article>
+    <h2>{{ article.title }}</h2>
+    <p class="article-meta">{{ t('article_published') }}:
+      <span>{{ article.date_display or t('article_unknown') }}</span></p>
+    {% if article.lastmod_display %}
+      <p class="article-meta">{{ t('article_updated') }}:
+        <span>{{ article.lastmod_display }}</span></p>
+    {% endif %}
+    <p><strong>{{ t('article_author') }}:</strong> {{ article.authors_text }}</p>
+    <hr>
+    {# article.body 是 core.markdown.render_markdown 产出的 Markup：
+       已完成白名单净化，因此这里直接输出是安全的。 #}
+    {{ article.body }}
+  </article>
+
+  <p><a href="/">{{ t('article_back_home') }}</a></p>
+
+  {% include "partials/comments.html" %}
+{% endblock %}

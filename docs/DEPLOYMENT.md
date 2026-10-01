@@ -34,11 +34,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 启动前置：SECRET_KEY（历史门禁约定，缺少将拒绝启动）
-# 任意强随机串即可：python -c "import secrets; print(secrets.token_urlsafe(64))"
-export SECRET_KEY="在此粘贴生成的随机串"
-
-# 直接前台试跑（开发验证）
+# 直接前台试跑（开发验证）——不需要任何环境变量
 python run.py
 ```
 
@@ -66,9 +62,19 @@ site_url = "https://example.com"   # robots.txt / sitemap.xml 的绝对地址来
 
 ### 2. 准备静态资源目录
 
-把项目中的 `style.css`、`favicon.ico`、`logo.png` 及 `assets/` 内容同步到 Nginx
-站点根目录（目录结构见 `docs/nginx.conf.example` 头部注释）。**改 CSS/图标后只需
-同步文件，应用无需重启。**
+**样式表是可选的**：`[static].css` 留空时，应用自己会发出内置样式表
+（`/css/style.css`），因此"只跑 `python run.py`"也有完整排版。
+
+**仓库不附带图片资产**（favicon / logo / 社交图标 / hero 图）。这些 URL 留空时
+对应元素**不渲染**，所以开箱不会有裂图或 404；要显示它们就把自己的文件放到
+Nginx 站点根目录，再在 `[static]` 与 `params.social.icon` 里填 URL
+（目录结构见 `docs/nginx.conf.example` 头部注释）。
+
+想把 CSS 也交给 Nginx 托管（更省应用进程、便于 CDN 缓存），就把仓库根的
+`style.example.css`（内置样式表的副本）作为起点改好，同步到 Nginx 站点根目录，
+再把 `[static].css` 指过去。
+**改 CSS/图标后只需同步文件，应用无需重启**——应用侧的内置样式表同样是
+按请求读盘 + `ETag`，改完刷新即生效。
 
 ### 3. systemd 常驻
 
@@ -83,7 +89,6 @@ After=network.target
 Type=simple
 User=www-data
 WorkingDirectory=/opt/elenvind-py
-Environment=SECRET_KEY=在此粘贴生成的随机串
 ExecStart=/opt/elenvind-py/.venv/bin/python run.py
 Restart=on-failure
 RestartSec=3
@@ -155,7 +160,7 @@ sudo systemctl restart elenvind
 
 数据库迁移：schema 版本记录在 `PRAGMA user_version`，启动时会自动检测并执行迁移
 （`db_base.migrate`，幂等、可重复执行），**旧库可以直接启动**，无需手工改表。
-`articles/*.evmd` 与 `usrpages/*.evmd` 为纯内容文件，升级不会触碰；
+`articles/*.md` 与 `custom_pages/*.md` 为纯内容文件，升级不会触碰；
 **升级前仍建议先做一次数据库备份**（见运维文档）。
 
 ## 六、备份（重要）
@@ -166,4 +171,4 @@ SQLite 处于 WAL 模式时**不要直接拷贝 `sqlite.db`**，用：
 sqlite3 sqlite.db ".backup '/backup/elenvind-$(date +%F).db'"
 ```
 
-建议 cron 每日执行；同时备份 `articles/` 与 `usrpages/`（内容即文件，直接打包即可）。
+建议 cron 每日执行；同时备份 `articles/` 与 `custom_pages/`（内容即文件，直接打包即可）。

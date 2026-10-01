@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Admin - {{ site_title }}{% endblock %}
+{% block content %}
+  <h1>Admin</h1>
+  <p>Signed in as user #{{ admin.user_id }} (administrator).</p>
+  <div class="field-grid">
+    <div class="field-row">
+      <div class="field-label"><span>Total users</span></div>
+      <div class="field-value">{{ admin.user_count }}</div>
+    </div>
+    <div class="field-row">
+      <div class="field-label"><span>Site URL</span></div>
+      <div class="field-value">{{ admin.site_url or '(not configured)' }}</div>
+    </div>
+    <div class="field-row">
+      <div class="field-label"><span>Registration</span></div>
+      <div class="field-value">{{ 'open' if admin.registration_enabled else 'closed' }}</div>
+    </div>
+    <div class="field-row">
+      <div class="field-label"><span>Max comment depth</span></div>
+      <div class="field-value">{{ admin.max_comment_depth }}</div>
+    </div>
+    <div class="field-row">
+      <div class="field-label"><span>Max comments / article</span></div>
+      <div class="field-value">{{ admin.max_comments_per_article }}</div>
+    </div>
+  </div>
+{% endblock %}

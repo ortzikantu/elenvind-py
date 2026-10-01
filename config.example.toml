@@ -37,7 +37,21 @@ database = "sqlite.db"
 
 # 内容目录（相对项目根目录）
 articles_dir = "articles"
-usrpages_dir = "usrpages"
+custom_pages_dir = "custom_pages"
+
+# Jinja2 模板目录（相对项目根目录）；默认即包内 elenvind/templates。
+# 仅当你要把自己的一套模板整体替换掉时才有必要改这里。
+templates_dir = "elenvind/templates"
+
+# 内置样式表回落开关。
+#
+#   [static].css 有值        -> 用你指定的地址（站内路径或 CDN/Hack 绝对 URL）
+#   [static].css 为空 + true -> 用应用缺省样式表 /css/style.css
+#   [static].css 为空 + false-> 不输出 <link>，完全无样式（你自有方案时用）
+#
+# 内置样式表由应用进程直接发出（不依赖 Nginx），因此"只跑 python run.py"
+# 也能得到一个排版完整的站点。
+use_builtin_css = true
 
 [server]
     host = "0.0.0.0"
@@ -71,17 +85,26 @@ usrpages_dir = "usrpages"
     window_seconds = 3600
 
 [static]
-    # 全站样式表；留空回退 /style.css
-    css = "/static/style.css"
+    # 全站样式表。
+    #   填值 -> 用它（站内路径，或 CDN 绝对 URL）；该地址由你的 Web 服务器提供，
+    #           因为应用只发内置样式表，不托管任意静态文件
+    #   留空 -> 由 use_builtin_css 决定：true 用应用缺省样式表
+    #           （/css/style.css），false 则完全不加载样式
+    #
+    # 默认留空 = 用内置样式，开箱即有完整排版。
+    # 想完全自定义外观：把仓库根的 style.example.css 改好放到你的 Web 服务器，
+    # 再把地址填到下面（例如 "/static/site.css"）。
+    css = ""
 
-    # 站点图标；留空回退 /favicon.ico
-    favicon = "/static/favicon.ico"
+    # 站点图标；留空则回落到包内缺省图标（elenvind/static/imgs/favicon.ico|png）。
+    # 填 URL 时优先用你的。
+    favicon = ""
 
-    # 页头站标图标（与站名并排）；留空回退 favicon，两级都留空则只显示站名
-    logo = "/static/logo.png"
+    # 页头站标图标（与站名并排）；留空依次回退：配置的 favicon -> 缺省图标
+    logo = ""
 
-    # 首页Hero大图；留空则不显示 hero 区
-    hero = "/static/hero.webp"
+    # 首页 Hero 大图；留空则不显示 hero 区
+    hero = ""
 
 [params]
   intro = "Hi, welcome to my site."
@@ -97,14 +120,16 @@ usrpages_dir = "usrpages"
 
 ###################################################################################################
 
+  # 社交链接：icon 留空则退化为显示名称文字（应用不托管这些图标）。
+  # 放好自己的 SVG/PNG 后填 URL，例如 icon = "/static/codeberg.svg"
   [[params.social]]
     name = "Codeberg"
     url = "https://codeberg.org/"
-    icon = "/static/codeberg.svg"
+    icon = ""
   [[params.social]]
     name = "Github"
     url = "https://github.com/"
-    icon = "/static/github.svg"
+    icon = ""
   
 ###################################################################################################
 

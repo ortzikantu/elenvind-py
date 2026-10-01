@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}{{ t('auth_register_title') }} - {{ site_title }}{% endblock %}
+
+{% block content %}
+  <h1>{{ t('auth_register_title') }}</h1>
+  {% include "partials/form_message.html" %}
+
+  <form method="post" action="/register" class="field-grid">
+    {{ csrf_input() }}
+    {# 回跳地址：注册成功后跳登录时继续带着，最终回到原页面 #}
+    <input type="hidden" name="next" value="{{ next_path }}">
+    <div class="field-row">
+      <label class="field-label" for="reg-nickname">{{ t('auth_nickname') }}</label>
+      <input type="text" id="reg-nickname" name="nickname" maxlength="{{ limits.nickname }}"
+             autocomplete="nickname" required>
+    </div>
+    <div class="field-row">
+      <label class="field-label" for="reg-email">{{ t('auth_email') }}</label>
+      <input type="email" id="reg-email" name="email" maxlength="{{ limits.email }}"
+             autocomplete="email" required>
+    </div>
+    <div class="field-row">
+      <label class="field-label" for="reg-password">{{ t('auth_password') }}</label>
+      <input type="password" id="reg-password" name="password" minlength="{{ limits.password_min }}"
+             maxlength="{{ limits.password }}" autocomplete="new-password" required>
+    </div>
+    <div class="field-row">
+      <label class="field-label" for="reg-confirm">{{ t('auth_confirm_password') }}</label>
+      <input type="password" id="reg-confirm" name="confirm_password"
+             minlength="{{ limits.password_min }}" maxlength="{{ limits.password }}"
+             autocomplete="new-password" required>
+    </div>
+    <div class="field-action"><button type="submit">{{ t('auth_signup_btn') }}</button></div>
+  </form>
+
+  <p>{{ t('auth_login_prompt') }}
+    <a href="/login{% if next_path %}?next={{ next_path | urlencode }}{% endif %}">{{ t('auth_login_link') }}</a>
+  </p>
+{% endblock %}

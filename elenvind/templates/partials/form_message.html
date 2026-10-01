@@ -1,0 +1,10 @@
+{# 表单提示条：Feature 传 message / message_kind（error|success）即可。
+
+   注意：Jinja 里 `or` 是**逻辑或**，不是"默认值"运算。
+   写 `{{ message_kind or 'error' }}` 会在 message_kind='error' 时输出
+   `message_kind` 这个字面量本身（真值），导致 class 变成
+   `form-msg message_kind` —— 配色规则 .error/.success 永远不生效。
+   这里显式二选一，只允许这两个类名进入 HTML。 #}
+{% if message %}
+  <p class="form-msg {{ 'success' if message_kind == 'success' else 'error' }}">{{ message }}</p>
+{% endif %}

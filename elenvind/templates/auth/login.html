@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}{{ t('auth_login_title') }} - {{ site_title }}{% endblock %}
+
+{% block content %}
+  <h1>{{ t('auth_login_title') }}</h1>
+  {% include "partials/form_message.html" %}
+
+  <form method="post" action="/login" class="field-grid">
+    {{ csrf_input() }}
+    {# 回跳地址：由认证闸门带上，登录后回到原来想去的页面 #}
+    <input type="hidden" name="next" value="{{ next_path }}">
+    <div class="field-row">
+      <label class="field-label" for="login-email">{{ t('auth_email') }}</label>
+      <input type="email" id="login-email" name="email" maxlength="{{ limits.email }}"
+             autocomplete="email" required>
+    </div>
+    <div class="field-row">
+      <label class="field-label" for="login-password">{{ t('auth_password') }}</label>
+      <input type="password" id="login-password" name="password" maxlength="{{ limits.password }}"
+             autocomplete="current-password" required>
+    </div>
+    <div class="field-action"><button type="submit">{{ t('auth_signin_btn') }}</button></div>
+  </form>
+
+  <p>{{ t('auth_register_prompt') }}
+    <a href="/register{% if next_path %}?next={{ next_path | urlencode }}{% endif %}">{{ t('auth_register_link') }}</a>
+  </p>
+{% endblock %}

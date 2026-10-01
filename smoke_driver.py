@@ -1,10 +1,11 @@
-"""一次性冒烟驱动：用真实 uvicorn + 真实 config.toml 起一次服务并走完整流程。
+"""冒烟驱动：用真实 uvicorn + 真实 config.toml 起一次服务并走完整流程。
 
 不是测试套件的一部分（测试套件不依赖 uvicorn），只在需要"真实冷启动"验证时手工运行：
 
-    python smoke_driver.py            # 需要当前环境已安装 uvicorn
+    python smoke_driver.py        # 需要当前环境已安装 uvicorn
 
-数据库、日志、文章与自定义页面都重定向到系统临时目录，不触碰仓库里的真实数据。
+在仓库根目录运行。副作用隔离：数据库与它生成的临时内容落在
+`.smoketmp/<随机名>/` 下，结束（含异常）时删除，不触碰仓库里的真实数据。
 """
 import os
 import shutil
@@ -17,8 +18,8 @@ import uuid
 from http.cookiejar import CookieJar
 from pathlib import Path
 
-from elenvind import db_base
-from elenvind.config import ROOT, config, load_config, validate_config, apply_runtime_config
+from elenvind.core import db_base
+from elenvind.core.config import ROOT, config, load_config, validate_config, apply_runtime_config
 
 # 不使用 tempfile.mkdtemp：Windows 上它给出的目录权限仅创建者可写，
 # 在受限沙箱里连自己的子目录都建不了。项目根下的 .smoketmp/ 继承正常权限。
@@ -77,23 +78,28 @@ def csrf_from(html):
 
 
 def prepare_config():
-    from elenvind import lifespan as lifespan_module
+    from elenvind.core import lifespan as lifespan_module
 
     load_config()
     config["database"] = str(TMP / "smoke.db")
     config["articles_dir"] = str(TMP / "articles")
-    config["usrpages_dir"] = str(TMP / "usrpages")
+    config["custom_pages_dir"] = str(TMP / "custom_pages")
     config["logging"] = {"level": "critical", "file": str(TMP / "app.log")}
     config["site_url"] = "https://smoke.example.com"
+    # 固定为英文：避免依赖开发机上 config.toml 的 locale 设置，
+    # 让下面基于文案的断言在任何环境下都稳定。
+    config["locale"] = "en"
     config["static"] = {"css": "/static/style.css", "favicon": "/static/favicon.ico",
                         "logo": "/static/logo.png", "hero": "/static/hero.webp"}
+    # 内置样式表默认开启（本 smoke 用外部 CSS；另有专门检查覆盖内置回落）
+    config["use_builtin_css"] = True
     (TMP / "articles").mkdir()
-    (TMP / "usrpages").mkdir()
-    (TMP / "articles" / "smoke.evmd").write_text(
-        '@@@\ntitle = "Smoke Post"\ndate = "2026-01-01"\nauthors = ["Tester"]\n@@@\n\n'
-        "# Heading\n\nBody **bold** and `code` and @{link,https://example.com,link}.\n",
+    (TMP / "custom_pages").mkdir()
+    (TMP / "articles" / "smoke.md").write_text(
+        '+++\ntitle = "Smoke Post"\ndate = "2026-01-01"\nauthors = ["Tester"]\n+++\n\n'
+        "# Heading\n\nBody **bold** and `code` and [link](https://example.com).\n",
         encoding="utf-8")
-    (TMP / "usrpages" / "about.evmd").write_text("About **page**.", encoding="utf-8")
+    (TMP / "custom_pages" / "about.md").write_text("About **page**.", encoding="utf-8")
     os.environ["ELENVIND_DB"] = str(TMP / "smoke.db")
     db_base.DB_PATH = TMP / "smoke.db"
     validate_config()
@@ -137,11 +143,11 @@ def run_checks():
     opener = build_opener()
 
     # 前置断言：测试文章/页面目录确实生效（否则后面所有页面断言都会误导）
-    from elenvind.articles import get_articles
-    from elenvind.usrpages import get_page
-    check("文章索引已装载", [a["slug"] for a in get_articles()] == ["smoke"],
-          str([a["slug"] for a in get_articles()]))
-    check("自定义页面已装载", get_page("about") is not None)
+    from elenvind.features.blog import logic as blog_logic
+    from elenvind.features.pages import logic as pages_logic
+    check("文章索引已装载", [a["slug"] for a in blog_logic.get_articles()] == ["smoke"],
+          str([a["slug"] for a in blog_logic.get_articles()]))
+    check("自定义页面已装载", pages_logic.get_page("about") is not None)
 
     status, body, headers = fetch(opener, "GET", "/")
     check("GET / 200", status == 200, status)
@@ -153,7 +159,7 @@ def run_checks():
 
     status, body, _ = fetch(opener, "GET", "/article/smoke")
     check("文章页 200", status == 200, status)
-    check("EVMD 渲染", "<strong>bold</strong>" in body and "<code>code</code>" in body)
+    check("Markdown 渲染", "<strong>bold</strong>" in body and "<code>code</code>" in body)
 
     status, body, _ = fetch(opener, "GET", "/about")
     check("自定义页面", status == 200 and "<strong>page</strong>" in body)
@@ -164,14 +170,101 @@ def run_checks():
     status, body, _ = fetch(opener, "GET", "/sitemap.xml")
     check("sitemap.xml", status == 200 and "/article/smoke" in body)
 
+    # 样式表：配置有值就用配置的；缺省静态资源也必须可用
+    check("配置的样式表被引用", 'href="/static/style.css"' in fetch(opener, "GET", "/")[1])
+    status, css_body, css_headers = fetch(opener, "GET", "/css/style.css")
+    check("缺省样式表可访问",
+          status == 200 and "--primary" in css_body
+          and (css_headers.get("content-type") or "").startswith("text/css"),
+          f"{status} {css_headers.get('content-type')!r}")
+    check("缺省样式表可缓存",
+          "public" in (css_headers.get("cache-control") or "")
+          and bool(css_headers.get("etag")),
+          css_headers.get("cache-control"))
+
+    # 缺省图标（elenvind/static/imgs/）必须能取到且是图像类型
+    status, _icon_body, icon_headers = fetch(opener, "GET", "/imgs/favicon.png")
+    check("缺省图标可访问",
+          status == 200 and (icon_headers.get("content-type") or "").startswith("image/"),
+          f"{status} {icon_headers.get('content-type')!r}")
+
+    # 通用静态服务：往 static/ 里放文件即可按相对路径取到；越界一律 404
+    probe = ROOT / "elenvind" / "static" / "imgs" / "smoke-probe.svg"
+    probe.write_text('<svg xmlns="http://www.w3.org/2000/svg"/>', encoding="utf-8")
+    try:
+        status, probe_body, probe_headers = fetch(
+            opener, "GET", "/imgs/smoke-probe.svg")
+        check("静态目录新增文件即可取到",
+              status == 200 and "svg" in probe_body
+              and (probe_headers.get("content-type") or "") == "image/svg+xml",
+              f"{status} {probe_headers.get('content-type')!r}")
+    finally:
+        probe.unlink(missing_ok=True)
+
+    traversal_blocked = True
+    for hostile in ("/../config.toml", "/%2e%2e/config.toml",
+                    "/imgs/../../config.toml", "/.gitignore",
+                    "/imgs/.hidden"):
+        code, hostile_body, _ = fetch(opener, "GET", hostile)
+        if code != 404 or "site_url" in hostile_body:
+            traversal_blocked = False
+            break
+    check("静态服务阻断路径穿越", traversal_blocked)
+
+    # 把配置清空，确认真的回落到缺省资产（且链接是同源相对路径，
+    # 因为 CSP 的 style-src 'self' 只允许同源样式）
+    saved_css = config["static"].get("css")
+    saved_favicon = config["static"].get("favicon")
+    saved_logo = config["static"].get("logo")
+    config["static"]["css"] = ""
+    config["static"]["favicon"] = ""
+    config["static"]["logo"] = ""
+    try:
+        _status, home, _ = fetch(opener, "GET", "/")
+        check("配置为空时回落到缺省样式",
+              'href="/css/style.css"' in home,
+              [line for line in home.splitlines() if "stylesheet" in line][:2])
+        check("配置为空时回落到缺省图标",
+              'rel="icon" href="/imgs/favicon' in home,
+              [line for line in home.splitlines() if 'rel="icon"' in line][:2])
+        check("配置为空时站标用缺省图标",
+              '<img src="/imgs/favicon' in home,
+              [line for line in home.splitlines() if "header-brand" in line][:2])
+    finally:
+        config["static"]["css"] = saved_css
+        config["static"]["favicon"] = saved_favicon
+        config["static"]["logo"] = saved_logo
+
     status, body, headers = fetch(opener, "GET", "/theme?mode=dark&next=/about")
     check("主题切换 302", status == 302 and headers.get("location") == "/about", status)
 
     status, _, _ = fetch(opener, "GET", "/definitely-missing")
     check("404", status == 404, status)
 
-    status, _, _ = fetch(opener, "DELETE", "/")
-    check("405", status == 405, status)
+    # 方法不允许：仅声明 POST 的路径 GET 必须 405 且带 Allow。
+    # 注意不要用 DELETE 探这个：需要请求体的方法缺 Content-Length 时先被 411 拦下，
+    # 那样测到的是请求框架而不是路由方法判定。
+    status, _, headers = fetch(opener, "GET", "/article/smoke/comment/delete/1")
+    check("405 + Allow", status == 405 and "POST" in (headers.get("allow") or ""),
+          f"{status} allow={headers.get('allow')!r}")
+
+    status, _, _ = fetch(opener, "POST", "/definitely-missing", {})
+    check("未知 POST 路径 405", status == 405, status)
+
+    # 友好页：匿名访问 /user 与 GET /logout 都不该是 403/405
+    status, body, _ = fetch(opener, "GET", "/user")
+    check("匿名 /user 友好页", status == 200 and "/login?next=/user" in body, status)
+    status, body, _ = fetch(opener, "GET", "/logout")
+    check("GET /logout 确认页", status == 200 and "signed out" in body.lower(), status)
+
+    # 匿名访问受保护页面 -> 跳登录并带回跳地址（开放重定向防护）
+    status, _, headers = fetch(opener, "GET", "/admin")
+    check("受保护页跳登录",
+          status == 302 and (headers.get("location") or "").startswith("/login?next="),
+          f"{status} {headers.get('location')!r}")
+    status, body, _ = fetch(opener, "GET", "/login?next=%2F%2Fevil.example.com")
+    check("next 不反射站外地址",
+          status == 200 and 'value="//evil.example.com"' not in body, status)
 
     # 注册
     status, body, _ = fetch(opener, "GET", "/register")
@@ -206,6 +299,25 @@ def run_checks():
     status, body, _ = fetch(opener, "GET", "/article/smoke")
     check("评论可见", "hello from smoke test" in body)
 
+    # 回复评论：点"回复"会带 ?reply_to=N 重新打开文章页
+    # （回归：这里曾因取单条评论时缺 user 列而 500）
+    import sqlite3
+    conn = sqlite3.connect(db_base.DB_PATH)
+    root_id = conn.execute("SELECT id FROM comment").fetchone()[0]
+    conn.close()
+    status, body, _ = fetch(opener, "GET", f"/article/smoke?reply_to={root_id}")
+    check("回复页渲染 200", status == 200 and "Replying to" in body, status)
+    check("回复表单带目标 id", f'value="{root_id}"' in body)
+    status, _, _ = fetch(opener, "POST", "/article/smoke/comment",
+                         {"csrf_token": token, "content": "nested reply",
+                          "reply_to": str(root_id)})
+    check("发回复 302", status == 302, status)
+    status, body, _ = fetch(opener, "GET", "/article/smoke")
+    check("回复可见且缩进", "nested reply" in body and "comment-reply" in body)
+    # reply_to 指向不存在的评论：正常渲染，不报错
+    status, body, _ = fetch(opener, "GET", "/article/smoke?reply_to=999999")
+    check("未知 reply_to 不报错", status == 200, status)
+
     # 无 CSRF 的 POST 必须被拒
     status, _, _ = fetch(opener, "POST", "/logout", {"csrf_token": "x" * 43})
     check("坏 CSRF 400", status == 400, status)
@@ -231,13 +343,23 @@ def run_checks():
                                 "confirm_password": "new-password-456"})
     check("改密 302 → /login", status == 302 and headers.get("location") == "/login", status)
 
-    # 注销（新会话）
+    # 注销（新会话）：先看友好确认页，再真正 POST 退出
     status, body, _ = fetch(opener, "GET", "/login")
     token = csrf_from(body)
     fetch(opener, "POST", "/login", {"csrf_token": token, "email": "smoke@example.com",
                                      "password": "new-password-456"})
+    status, body, _ = fetch(opener, "GET", "/logout")
+    check("登录后 GET /logout 确认页",
+          status == 200 and 'action="/logout"' in body and "csrf_token" in body, status)
+    status, body, _ = fetch(opener, "GET", "/user")
+    check("GET /logout 未销毁会话",
+          status == 200 and "smoke@example.com" in body, status)
     status, _, headers = fetch(opener, "POST", "/logout", {"csrf_token": token})
     check("注销 302 → /", status == 302 and headers.get("location") == "/", status)
+    status, body, _ = fetch(opener, "GET", "/user")
+    check("注销后 /user 回到友好页",
+          status == 200 and "smoke@example.com" not in body and "/login?next=/user" in body,
+          status)
 
     # 大数据体：Content-Length 超限 → 413（直接发原始请求绕过 urllib 限制）
     import socket

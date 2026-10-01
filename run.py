@@ -1,17 +1,19 @@
 """开发/生产启动入口。
 
-启动前先做一次与 lifespan 相同的配置加载与校验：配置不合法（缺 SECRET_KEY、
-site_url 非法、端口越界等）时立刻以非零码退出并打印原因，而不是先起一个
+启动前先做一次与 lifespan 相同的配置加载与校验：配置不合法（site_url 非法、
+端口越界等）时立刻以非零码退出并打印原因，而不是先起一个
 "看起来在跑但每次请求都出错"的进程。
+
+不需要任何环境变量：本应用没有签名密钥（会话是服务端随机 token）。
 """
 import sys
 
 import uvicorn
 
 from elenvind.app import app
-from elenvind.config import ConfigError, apply_runtime_config, config, load_config, validate_config
-from elenvind.console import banner, error, info
-from elenvind.version import get_version
+from elenvind.core.config import ConfigError, apply_runtime_config, config, load_config, validate_config
+from elenvind.core.console import banner, error, info
+from elenvind.core.version import get_version
 
 
 def main() -> int:

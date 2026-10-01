@@ -6,18 +6,18 @@ from pathlib import Path
 
 from tests.support import ElenvindTestCase
 
-from elenvind import db_base
-from elenvind.db_base import SCHEMA_VERSION, get_connection, init_db, migrate
-from elenvind.db_comment import create_comment, get_comment_by_id, get_comments_by_article
-from elenvind.db_login import (
+from elenvind.core import db_base
+from elenvind.core.db_base import SCHEMA_VERSION, connect, init_db, migrate
+from elenvind.core.db_comment import create_comment, get_comment_by_id, get_comments_by_article
+from elenvind.core.db_login import (
     cleanup_old_login_attempts,
     count_email_failures,
     count_ip_failures,
     record_login_attempt,
 )
-from elenvind.db_register import count_recent, try_register_attempt
-from elenvind.db_session import create_session, delete_user_sessions, get_session_user
-from elenvind.db_user import (
+from elenvind.core.db_register import count_recent, try_register_attempt
+from elenvind.core.db_session import create_session, delete_user_sessions, get_session_user
+from elenvind.core.db_user import (
     create_user,
     delete_user,
     get_user_by_email,
@@ -27,26 +27,26 @@ from elenvind.db_user import (
     update_user_nickname,
     update_user_password,
 )
-from elenvind.security import hash_password
+from elenvind.core.security import hash_password
 
 
 class ConnectionTests(ElenvindTestCase):
     def test_foreign_keys_enabled_on_every_connection(self):
         for _ in range(3):
-            with get_connection() as conn:
+            with connect() as conn:
                 self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
 
     def test_wal_mode_and_busy_timeout(self):
-        with get_connection() as conn:
+        with connect() as conn:
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
             self.assertGreaterEqual(conn.execute("PRAGMA busy_timeout").fetchone()[0], 1000)
 
     def test_row_factory_is_row(self):
-        with get_connection() as conn:
+        with connect() as conn:
             self.assertIs(conn.row_factory, sqlite3.Row)
 
     def test_foreign_key_violation_is_rejected(self):
-        with get_connection() as conn:
+        with connect() as conn:
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(
                     "INSERT INTO comment (article_slug, user_id, content, created_at, is_deleted) "
@@ -64,7 +64,7 @@ class ConnectionTests(ElenvindTestCase):
         self.assertFalse(self.db_path.exists())
 
     def test_no_connection_leak_after_repeated_calls(self):
-        from elenvind.db_session import cleanup_expired_sessions
+        from elenvind.core.db_session import cleanup_expired_sessions
         self.create_user()
         for _ in range(50):
             get_user_number()
@@ -75,19 +75,19 @@ class ConnectionTests(ElenvindTestCase):
 
 class SchemaTests(ElenvindTestCase):
     def test_schema_version_is_recorded(self):
-        with get_connection() as conn:
+        with connect() as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
 
     def test_migrate_is_idempotent(self):
         for _ in range(3):
             migrate()
-        with get_connection() as conn:
+        with connect() as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
 
     def test_init_db_is_idempotent(self):
         init_db()
         init_db()
-        with get_connection() as conn:
+        with connect() as conn:
             tables = {row["name"] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'")}
         self.assertIn("user", tables)
@@ -98,7 +98,7 @@ class SchemaTests(ElenvindTestCase):
         self.assertIn("register_attempts", tables)
 
     def test_comment_parent_foreign_key_uses_set_null(self):
-        with get_connection() as conn:
+        with connect() as conn:
             sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'comment'").fetchone()[0]
         normalized = " ".join(sql.upper().split())
         self.assertIn("ON DELETE SET NULL", normalized)
@@ -142,7 +142,7 @@ class SchemaTests(ElenvindTestCase):
         try:
             init_db()
             self.assertEqual(Path(db_base.DB_PATH), legacy_path)   # 确认打在旧库上
-            with get_connection() as check:
+            with connect() as check:
                 self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
                 rows = {row["content"]: row["parent_id"] for row in check.execute(
                     "SELECT content, parent_id FROM comment")}
@@ -164,7 +164,7 @@ class SchemaTests(ElenvindTestCase):
         user_id, _ = self.create_user()
         parent = create_comment("post", user_id, "root")
         child = create_comment("post", user_id, "child", parent_id=parent)
-        with get_connection() as conn:
+        with connect() as conn:
             conn.execute("DELETE FROM comment WHERE id = ?", (parent,))
             conn.commit()
         self.assertIsNone(get_comment_by_id(child)["parent_id"])
@@ -172,7 +172,7 @@ class SchemaTests(ElenvindTestCase):
     def test_user_deletion_cascades_to_sessions(self):
         user_id, _ = self.create_user()
         token = create_session(user_id)
-        with get_connection() as conn:
+        with connect() as conn:
             conn.execute("DELETE FROM user WHERE id = ?", (user_id,))
             conn.commit()
         self.assertIsNone(get_session_user(token))
@@ -267,7 +267,7 @@ class RateLimitTableTests(ElenvindTestCase):
         import time
 
         record_login_attempt("a@example.com", "1.2.3.4", success=False)
-        with get_connection() as conn:
+        with connect() as conn:
             conn.execute("UPDATE login_attempts SET attempted_at = 0")
             conn.commit()
         huge_window = int(time.time()) + 10 ** 6        # 覆盖 1970 年以来的全部记录

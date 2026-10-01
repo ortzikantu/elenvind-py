@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 
 from tests.support import PROJECT_ROOT, ElenvindTestCase
 
-from elenvind.utils import get_client_ip
+from elenvind.core.utils import get_client_ip
 
 #: 一旦出现在日志里就说明发生了敏感信息泄漏
 SENSITIVE_MARKERS = (
@@ -92,20 +92,21 @@ class LogRedactionTests(ElenvindTestCase):
                 self.assertNotIn(secret, text)
 
     def test_unhandled_exception_log_does_not_leak_body_or_cookies(self):
-        from elenvind import http as http_module
+        from elenvind.app import app
 
-        # 先拿令牌（此时路由还是正常的），再打补丁制造 500
+        # 先拿令牌（此时路由还是正常的），再替换首页 handler 制造未捕获异常
         csrf = self.fetch_csrf()
-        original = http_module._route_get
+        target = next(route for route in app.router.routes if route.path == "/")
+        original = target.handler
 
-        def boom(ctx):
+        def boom(request):
             raise RuntimeError("boom")
 
-        http_module._route_get = boom
+        target.handler = boom
         try:
             self.app.request("GET", "/", cookies={"session": "A" * 43, "csrf": csrf})
         finally:
-            http_module._route_get = original
+            target.handler = original
 
         text = self.handler.text()
         self.assertIn("Unhandled exception", text)

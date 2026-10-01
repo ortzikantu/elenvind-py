@@ -1,0 +1,15 @@
+{# 页脚：导航条目 + 用户总数 + 版权/版本。 #}
+<footer>
+  <div class="footer-top">
+    <ul>
+      {% for item in nav_items %}
+        <li><a href="{{ item.url }}">{{ item.name }}</a></li>
+      {% endfor %}
+      <li>{{ t('footer_users', total=user_count) }}</li>
+    </ul>
+  </div>
+  <div class="footer-bottom">
+    <span>{{ t('footer_rights', year=current_year, name=copyright_name) }}</span>
+    <span>{{ t('footer_powered', version=elenvind_version) }}</span>
+  </div>
+</footer>

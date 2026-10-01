@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}{{ page_title }} - {{ site_title }}{% endblock %}
+{% block content %}
+  <article>
+    {# page.body 是 render_markdown 产出的 Markup（已净化） #}
+    {{ page.body }}
+  </article>
+{% endblock %}

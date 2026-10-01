@@ -9,12 +9,12 @@ import unittest
 
 from tests.support import PROJECT_ROOT, AppHarness, run_async  # noqa: F401
 
-from elenvind import articles as articles_module
-from elenvind import config as config_module
-from elenvind import db_base
-from elenvind import lifespan as lifespan_module
-from elenvind import usrpages as usrpages_module
-from elenvind.config import apply_runtime_config, load_config, validate_config
+from elenvind.core import config as config_module
+from elenvind.core import db_base
+from elenvind.core import lifespan as lifespan_module
+from elenvind.core.config import apply_runtime_config, load_config, validate_config
+from elenvind.features.blog import logic as blog_logic
+from elenvind.features.pages import logic as pages_logic
 
 
 class ColdStartTests(unittest.TestCase):
@@ -28,7 +28,7 @@ class ColdStartTests(unittest.TestCase):
         root.mkdir(parents=True, exist_ok=True)
         self.tmpdir = root / f"cold-{uuid.uuid4().hex[:12]}"
         (self.tmpdir / "articles").mkdir(parents=True)
-        (self.tmpdir / "usrpages").mkdir(parents=True)
+        (self.tmpdir / "custom_pages").mkdir(parents=True)
         self.db_path = self.tmpdir / "cold.db"
 
         # 先加载真实 config.toml，再只覆盖路径类配置（其余保持仓库设定）
@@ -38,17 +38,17 @@ class ColdStartTests(unittest.TestCase):
         load_config()
         config_module.config["database"] = str(self.db_path)
         config_module.config["articles_dir"] = str(self.tmpdir / "articles")
-        config_module.config["usrpages_dir"] = str(self.tmpdir / "usrpages")
+        config_module.config["custom_pages_dir"] = str(self.tmpdir / "custom_pages")
         config_module.config["logging"] = {"level": "critical",
                                            "file": str(self.tmpdir / "app.log")}
         config_module.config["admin_user_id"] = 1
-        # 用仓库里的真实文章做冒烟（只读，不改动）
-        (self.tmpdir / "articles" / "smoke.evmd").write_text(
-            '@@@\ntitle = "Smoke"\ndate = "2026-01-01"\nauthors = ["Tester"]\n@@@\n\n'
-            "# Heading\n\nBody with **bold**, `code`, @{link,https://example.com,link}.\n\n"
+        # 用临时内容做冒烟（真实 config.toml + 临时路径）
+        (self.tmpdir / "articles" / "smoke.md").write_text(
+            '+++\ntitle = "Smoke"\ndate = "2026-01-01"\nauthors = ["Tester"]\n+++\n\n'
+            "# Heading\n\nBody with **bold**, `code`, [link](https://example.com).\n\n"
             "```py\nprint(1)\n```\n",
             encoding="utf-8")
-        (self.tmpdir / "usrpages" / "about.evmd").write_text(
+        (self.tmpdir / "custom_pages" / "about.md").write_text(
             "About page **content**.", encoding="utf-8")
 
         db_base.DB_PATH = self.db_path
@@ -69,11 +69,14 @@ class ColdStartTests(unittest.TestCase):
             os.environ["ELENVIND_DB"] = self._original_db_env
         config_module.config.clear()
         config_module.config.update(self._original_config)
-        articles_module._articles_cache = None
-        articles_module._file_stats = None
-        articles_module._body_cache.clear()
-        usrpages_module._pages_cache = None
-        usrpages_module._file_stats = None
+        blog_logic._articles_cache = None
+        blog_logic._file_stats = None
+        blog_logic._body_cache.clear()
+        blog_logic._failed_stats = {}
+        pages_logic._pages_cache = None
+        pages_logic._file_stats = None
+        from elenvind.core.templating import reset_environment
+        reset_environment()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     # ---------- 辅助 ----------
@@ -106,12 +109,12 @@ class ColdStartTests(unittest.TestCase):
         self.assertEqual(home.status, 200)
         self.assertIn("Smoke", home.text)
 
-        # 文章页 + EVMD 渲染
+        # 文章页 + Markdown 渲染
         article = self.app.request("GET", "/article/smoke")
         self.assertEqual(article.status, 200)
-        for fragment in ("<h1>Heading</h1>", "<strong>bold</strong>", "<code>code</code>",
-                         '<a href="https://example.com">link</a>',
-                         '<code class="language-py">'):
+        for fragment in ("<h1", "Heading</h1>", "<strong>bold</strong>",
+                         "<code>code</code>",
+                         '<a href="https://example.com"', 'class="language-py"'):
             self.assertIn(fragment, article.text)
 
         # 自定义页面
@@ -130,11 +133,14 @@ class ColdStartTests(unittest.TestCase):
         # 主题
         theme = self.app.request("GET", "/theme", query={"mode": "dark", "next": "/about"})
         self.assertEqual(theme.status, 302)
-        self.assertIn("theme=dark", theme.header("set-cookie"))
+        self.assertIn("theme=dark", " ".join(theme.headers_all("set-cookie")))
 
-        # 404 / 405
+        # 404 / 405 / 退出确认页
         self.assertEqual(self.app.request("GET", "/no-such-page").status, 404)
-        self.assertEqual(self.app.request("GET", "/logout").status, 405)
+        self.assertEqual(
+            self.app.request("GET", "/article/a/comment/delete/1").status, 405)
+        # GET /logout 是友好确认页（未登录 -> 提示已退出），不是 405
+        self.assertEqual(self.app.request("GET", "/logout").status, 200)
 
         # 注册 → 登录（admin_user_id = 1，因此这个账号也是管理员）
         session, csrf = self._register_and_login("cold-start@example.com")
@@ -152,10 +158,10 @@ class ColdStartTests(unittest.TestCase):
         self.assertEqual(created.status, 302)
         rendered = self.app.request("GET", "/article/smoke")
         self.assertIn("first!", rendered.text)
-        self.assertIn("id='comments'", rendered.text)
+        self.assertIn('id="comments"', rendered.text)
 
         # 删除评论 → 恢复（本人可删；恢复仅管理员，这里由 id=1 的同一账号执行）
-        from elenvind.db_comment import get_comments_by_article
+        from elenvind.core.db_comment import get_comments_by_article
         comment_id = get_comments_by_article("smoke")[0]["id"]
         deleted = self.app.request("POST", f"/article/smoke/comment/delete/{comment_id}",
                                    form={"csrf_token": csrf}, cookies=cookies)
@@ -179,8 +185,14 @@ class ColdStartTests(unittest.TestCase):
         self.assertEqual(changed.header("location"), "/login")
         # 旧会话已失效：再用它请求个人中心只会渲染未登录页
         stale = self.app.request("GET", "/user", cookies=cookies)
+        # 旧会话失效 -> 视为未登录：渲染友好的"请先登录"页（不再是 403），
+        # 但绝不泄漏该账号的任何信息，也不渲染只有登录后才有的表单
         self.assertEqual(stale.status, 200)
         self.assertNotIn("cold-start@example.com", stale.text)
+        self.assertNotIn('name="password_confirm"', stale.text)
+        self.assertNotIn('name="old_password"', stale.text)
+        # 给出登录入口并带回跳地址（语言无关的断言）
+        self.assertIn('href="/login?next=/user"', stale.text)
 
         csrf2 = self._csrf()
         relogin = self.app.request("POST", "/login",
@@ -229,7 +241,7 @@ class ColdStartTests(unittest.TestCase):
         self.assertIn("port", sent[0]["message"])
 
     def test_startup_creates_missing_directories(self):
-        from elenvind.logging_config import resolve_log_path
+        from elenvind.core.logging_config import resolve_log_path
         log_path = resolve_log_path("logs/cold-test/app.log")
         self.assertTrue(str(log_path).endswith(os.path.join("logs", "cold-test", "app.log")))
 
@@ -245,7 +257,7 @@ class LoggingTests(unittest.TestCase):
 
     def test_setup_logging_is_idempotent(self):
         import logging
-        from elenvind.logging_config import setup_logging, shutdown_logging
+        from elenvind.core.logging_config import setup_logging, shutdown_logging
         from tests.support import PROJECT_ROOT
 
         root = PROJECT_ROOT / ".testtmp"
@@ -271,7 +283,7 @@ class LoggingTests(unittest.TestCase):
 
     def test_uvicorn_loggers_do_not_duplicate(self):
         import logging
-        from elenvind.logging_config import setup_logging, shutdown_logging
+        from elenvind.core.logging_config import setup_logging, shutdown_logging
         from tests.support import PROJECT_ROOT
 
         root = PROJECT_ROOT / ".testtmp"

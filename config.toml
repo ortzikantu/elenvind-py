@@ -23,7 +23,14 @@ registration_enabled = true        # 是否开放公开注册
 max_body_size = 1048576            # POST 表单体积上限（1 MB），超出返回 413
 database = "sqlite.db"             # 相对项目根；也可用环境变量 ELENVIND_DB 覆盖
 articles_dir = "articles"          # 文章目录（相对项目根）
-usrpages_dir = "usrpages"          # 自定义页面目录（相对项目根）
+custom_pages_dir = "custom_pages"      # 自定义页面目录（相对项目根）
+templates_dir = "elenvind/templates"  # Jinja2 模板目录（相对项目根）
+
+# 内置样式表回落：当 [static].css 为空时，是否使用应用自带的样式表
+# （/css/style.css，由应用自己发出，不依赖 Nginx）。
+#   true （默认）：配置为空 -> 用内置样式，站点不会变成裸 HTML
+#   false        ：配置为空 -> 不输出 <link>，完全由你掌控样式
+use_builtin_css = true
 
 [server]
     host = "0.0.0.0"
@@ -57,17 +64,24 @@ usrpages_dir = "usrpages"          # 自定义页面目录（相对项目根）
     window_seconds = 3600
 
 [static]
-    # 全站样式表；留空回退 /style.css
-    css = "https://raw.githack.com/ortzikantu/elenvind-py/refs/heads/trunk/static/style.css"
+    # 全站样式表。
+    # 留空 -> 由上面的 use_builtin_css 决定：true 用应用缺省样式表
+    #        （/css/style.css），false 则完全不加载样式。
+    # 填值 -> 用你指定的地址。注意这个地址由**你的 Web 服务器**负责提供
+    #        （应用只发内置样式表，不托管任意静态文件），例如
+    #        "/static/site.css" 或 "https://cdn.example.com/site.css"。
+    # 想自定义外观：拿仓库根的 style.example.css 改好放到 Nginx，再把地址填这里。
+    css = ""
 
-    # 站点图标；留空回退 /favicon.ico
-    favicon = "http://192.168.1.182/static/favicon.ico"
+    # 站点图标；留空则回落到包内缺省图标（elenvind/static/imgs/）。
+    # 填 URL 时优先用你的（由你的 Web 服务器提供）。
+    favicon = "/imgs/favicon.ico"
 
-    # 页头站标图标（与站名并排）；留空回退 favicon，两级都留空则只显示站名
-    logo = "http://192.168.1.182/static/logo.png"
+    # 页头站标图标（与站名并排）；留空依次回退：配置的 favicon -> 缺省图标
+    logo = "/imgs/logo.png"
 
-    # 首页Hero大图
-    hero = "https://ortzikantu.com/assets/imgs/hero_hu_a43a6d82c671954c.webp"
+    # 首页 Hero 大图；留空则整块 hero 区不渲染
+    hero = "https://raw.githubusercontent.com/ortzikantu/homepage/refs/heads/trunk/assets/assets/imgs/hero.jpg"
 
 [params]
   intro = "Hey there! 👋 很高兴在这里与你相遇。🌟お幸せに~"
@@ -83,14 +97,16 @@ usrpages_dir = "usrpages"          # 自定义页面目录（相对项目根）
 
 ###################################################################################################
 
+  # 社交链接：icon 留空则退化为显示名称文字（仓库不附带图标文件）。
+  # 放好自己的 SVG/PNG 后填 URL，例如 icon = "/static/codeberg.svg"
   [[params.social]]
     name = "Codeberg"
     url = "https://codeberg.org/"
-    icon = "http://192.168.1.182/static/codeberg.svg"
+    icon = "/imgs/codeberg.svg"
   [[params.social]]
     name = "Github"
     url = "https://github.com/"
-    icon = "http://192.168.1.182/static/github.svg"
+    icon = "/imgs/github.svg"
   
 ###################################################################################################
 
