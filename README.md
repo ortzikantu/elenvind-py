@@ -1,4 +1,4 @@
-<img src="static/logo.png" align="right" alt="Logo designed by Hao Wu" width="120" height="120">
+<img src="elenvind/static/imgs/logo.png" align="right" alt="Logo designed by Hao Wu" width="120" height="120">
 
 <h2>Elenvind</h2> 
 
