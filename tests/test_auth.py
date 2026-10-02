@@ -1,5 +1,6 @@
 """认证与会话测试：登录、枚举、限流、会话固定、登出、改密、删号、注册、rehash。"""
 import sqlite3
+import time
 import unittest
 
 from tests.support import ElenvindTestCase
@@ -113,7 +114,12 @@ class LoginTests(ElenvindTestCase):
     def test_expired_session_is_rejected_and_removed(self):
         from elenvind.core.db_session import create_session
         user_id, _ = self.create_user(email="exp@example.com")
-        token = create_session(user_id, days=-1)   # 已过期
+        token = create_session(user_id)
+        # 把创建时间推到绝对过期窗口之外（默认 30 天）
+        with connect() as conn:
+            conn.execute("UPDATE session SET created_at = ? WHERE token = ?",
+                         (time.time() - 31 * 86400, token))
+            conn.commit()
         self.assertIsNone(get_session_user(token))
         with connect() as conn:
             remaining = conn.execute("SELECT COUNT(*) FROM session WHERE token = ?",
@@ -219,6 +225,63 @@ class PasswordChangeTests(ElenvindTestCase):
         self.assertEqual(response.status, 302)
         self.assertIsNone(get_session_user(session_now))
 
+    def test_password_change_kills_a_truly_concurrent_session(self):
+        """改密必须踢掉**同时存活**的另一个会话。
+
+        ⚠️ 为什么需要这条测试：上面两条 `..._invalidates_..._sessions` 里的
+        "其它会话"其实都是**登录轮换**先杀掉、再被断言的 ——
+        它们证明的是"登录会清旧会话"，而不是"改密会清其他会话"。
+        把 `core.session.invalidate_user_sessions()` 从改密分支里整行删掉，
+        上面两条依然全绿（实测）。
+
+        要真正观测到改密的作用，必须造出"同一账号有两个活跃会话"的状态 ——
+        而 `login` 本身会清掉旧的，所以这里直接在库里落一个额外会话
+        （等价于"另一个浏览器还登着"）。
+        """
+        from elenvind.core.db_session import create_session, get_session_user
+
+        user_id, password = self.create_user(email="pw-concurrent@example.com")
+        current, csrf = self.login_ok("pw-concurrent@example.com", password)
+        # 绕过 login 直接落一个会话：模拟"另一个浏览器仍处于登录态"
+        other = create_session(user_id)
+        self.assertEqual(get_session_user(current), user_id)
+        self.assertEqual(get_session_user(other), user_id)
+
+        response = self.app.request(
+            "POST", "/user",
+            form={"csrf_token": csrf, "action": "change_password",
+                  "old_password": password,
+                  "new_password": "brand new password",
+                  "confirm_password": "brand new password"},
+            cookies=self.app_cookies(session=current, csrf=csrf))
+
+        self.assertEqual(response.status, 302)
+        self.assertEqual(response.header("location"), "/login")
+        self.assertIsNone(get_session_user(other),
+                          "改密没有踢掉另一个活跃会话")
+        self.assertIsNone(get_session_user(current),
+                          "改密没有踢掉当前会话")
+        # 浏览器侧的 Cookie 也必须被清除（而不是留着一个失效 token）
+        session_headers = [h for h in response.headers_all("set-cookie")
+                           if h.startswith("session=")]
+        self.assertTrue(session_headers, "改密没有下发清除 session Cookie 的指令")
+        for header in session_headers:
+            self.assertIn("Max-Age=0", header, header)
+
+    def test_password_change_does_not_kill_other_accounts_sessions(self):
+        """改密只影响自己：不得误伤别人的会话。"""
+        from elenvind.core.db_session import create_session, get_session_user
+
+        victim_id, password = self.create_user(email="victim-pw@example.com")
+        bystander_id, _ = self.create_user(email="bystander@example.com")
+        bystander_session = create_session(bystander_id)
+        session, csrf = self.login_ok("victim-pw@example.com", password)
+
+        response = self._change_password(session, csrf, password, "brand new password")
+        self.assertEqual(response.status, 302)
+        self.assertEqual(get_session_user(bystander_session), bystander_id,
+                         "改密误伤了其它账号的会话")
+
     def test_wrong_old_password_is_rejected(self):
         user_id, password = self.create_user(email="pw2@example.com")
         session, csrf = self.login_ok("pw2@example.com", password)
@@ -263,6 +326,62 @@ class DeleteAccountTests(ElenvindTestCase):
                                     cookies=self.app_cookies(session=session, csrf=csrf))
         self.assertIn("Password is incorrect", response.text)
         self.assertIsNotNone(get_user_by_id(user_id))
+
+    def test_squatting_the_placeholder_email_cannot_block_deletion(self):
+        """回归：占位邮箱曾经是 `deleted_<id>@example.com`，可被抢注。
+
+        user_id 是公开的（评论区渲染 `(#id)`）且连续递增，所以任何人都能在
+        受害者删号前注册 `deleted_<id>@example.com`；等到受害者删号时撞
+        UNIQUE 约束 -> 500 -> **账号被永久锁死删不掉**。
+        """
+        from elenvind.core.db_user import delete_user
+        from elenvind.core.db_user import create_user as core_create_user
+
+        victim_id, _ = self.create_user(nickname="Victim", email="victim@example.com")
+        # 攻击者抢注旧实现会用的占位邮箱
+        squatted = f"deleted_{victim_id}@example.com"
+        core_create_user(nickname="Attacker", email=squatted,
+                         password_hash=hash_password("attacker password"))
+
+        delete_user(victim_id)          # 不得抛异常
+
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT email, is_deleted, nickname FROM user WHERE id = ?",
+                (victim_id,)).fetchone()
+        self.assertEqual(row["is_deleted"], 1)
+        self.assertEqual(row["nickname"], "Ghost")
+        self.assertNotEqual(row["email"], squatted, "占位邮箱不得可预测")
+
+    def test_placeholder_email_is_random_and_unregisterable(self):
+        import re
+        from elenvind.core.db_user import delete_user
+
+        ids = []
+        for index in range(3):
+            user_id, _ = self.create_user(email=f"ph{index}@example.com")
+            ids.append(user_id)
+        for user_id in ids:
+            delete_user(user_id)
+
+        with connect() as conn:
+            emails = [row["email"] for row in conn.execute(
+                "SELECT email FROM user WHERE email LIKE 'deleted+%'")]
+        self.assertEqual(len(emails), 3)
+        self.assertEqual(len(set(emails)), 3, "占位邮箱必须互不相同")
+        for email in emails:
+            with self.subTest(email=email):
+                self.assertRegex(email, r"^deleted\+[0-9a-f]{32}@deleted\.invalid$")
+                self.assertTrue(email.endswith(".invalid"),
+                                ".invalid 是 RFC 2606 保留域，永不可注册")
+
+    def test_double_delete_reports_instead_of_silently_succeeding(self):
+        from elenvind.core.db_user import delete_user
+
+        user_id, _ = self.create_user(email="twice@example.com")
+        delete_user(user_id)
+        with self.assertRaises(ValueError):
+            delete_user(user_id)
 
 
 class RegistrationTests(ElenvindTestCase):

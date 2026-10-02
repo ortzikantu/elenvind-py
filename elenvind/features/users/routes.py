@@ -16,9 +16,8 @@ from ...core.context import current_lang
 from ...core.db_user import (
     delete_user,
     get_user_by_email,
-    update_user_email,
-    update_user_nickname,
     update_user_password,
+    update_user_profile,
 )
 from ...core.http import html, redirect
 from ...core.i18n import t
@@ -27,7 +26,6 @@ from ...core.security import (
     NICKNAME_MAX,
     PASSWORD_MAX,
     PASSWORD_MIN,
-    SESSION_COOKIE,
     hash_password,
     verify_password,
 )
@@ -40,7 +38,13 @@ logger = logging.getLogger(__name__)
 NICKNAME_CHANGE_INTERVAL_DAYS = 365
 
 
-def register(router, *, render_forbidden):
+def register(router):
+    """把个人中心路由装到 router 上。
+
+    不收 `render_forbidden=`：权限被拒的 403 由 Core 的
+    `router.dispatch(forbidden=...)` 统一处理，这里的路由只声明 `auth=`。
+    收下一个永不使用的参数只会误导排查方向。
+    """
     @router.route("/user", methods=["GET"])
     def profile_page(request):
         """个人中心页面。
@@ -77,11 +81,11 @@ def register(router, *, render_forbidden):
         elif action == "change_password":
             result = _change_password(request, user, lang)
             if result is None:
-                # Core 语义：改密后该账号全部会话失效，强制重新登录
-                invalidate_user_sessions(user["id"])
-                response = redirect("/login")
-                response.delete_cookie(SESSION_COOKIE)
-                return response
+                # Core 语义：改密后该账号全部会话失效，强制重新登录。
+                # 传入 request 让 Core 同时清除浏览器 Cookie ——
+                # Feature 不 delete_cookie、不 import SESSION_COOKIE。
+                invalidate_user_sessions(user["id"], request=request)
+                return redirect("/login")
             message = result
         elif action == "delete_account":
             password_confirm = request.form.get("password_confirm", "")
@@ -89,10 +93,8 @@ def register(router, *, render_forbidden):
                 message = t(lang, "user_err_password_incorrect")
             else:
                 delete_user(user["id"])
-                invalidate_user_sessions(user["id"])
-                response = redirect("/")
-                response.delete_cookie(SESSION_COOKIE)
-                return response
+                invalidate_user_sessions(user["id"], request=request)
+                return redirect("/")
         else:
             message = t(lang, "user_err_unknown_action")
 
@@ -147,10 +149,13 @@ def _update_profile(request, user, lang):
             return error, user
 
     try:
-        if nickname_changed:
-            update_user_nickname(user["id"], new_nickname)
-        if email_changed:
-            update_user_email(user["id"], new_email)
+        # 一个事务里同时改昵称与邮箱：否则并发抢邮箱时会出现
+        # "邮箱没改成功、昵称却已经改了"的半写状态（见 update_user_profile）。
+        update_user_profile(
+            user["id"],
+            nickname=new_nickname if nickname_changed else None,
+            email=new_email if email_changed else None,
+        )
     except sqlite3.IntegrityError:
         # 并发下邮箱被他人抢先占用：UNIQUE 约束是最终权威
         return t(lang, "user_err_email_used"), user

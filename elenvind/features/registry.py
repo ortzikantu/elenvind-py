@@ -31,13 +31,12 @@ def install(router) -> None:
     from ..core import assets
 
     not_found = system_routes.not_found
-    forbidden = system_routes.forbidden
 
     assets.register(router)              # 静态资源（挂在站点根）
-    auth_routes.register(router, render_forbidden=forbidden)
-    users_routes.register(router, render_forbidden=forbidden)
+    auth_routes.register(router)
+    users_routes.register(router)
     admin_routes.register(router)
-    blog_routes.register(router, render_not_found=not_found, render_forbidden=forbidden)
+    blog_routes.register(router, render_not_found=not_found)
     seo_routes.register(router)
     pages_routes.register(router, render_not_found=not_found)   # 兜底：放最后
 

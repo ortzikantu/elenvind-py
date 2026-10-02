@@ -465,10 +465,3 @@ def render_markdown(source: str) -> Markup:
     return Markup(sanitize_html(rendered))
 
 
-def render_markdown_inline(source: str) -> Markup:
-    """渲染行内 Markdown（标题/摘要），同样经过转义与净化（无块级包裹）。"""
-    if not source:
-        return Markup("")
-    converter = Markdown(extensions=[], output_format="html")
-    rendered = converter.convert(escape_raw_html_outside_code(str(source)))
-    return Markup(sanitize_html(rendered).strip())

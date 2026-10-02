@@ -16,6 +16,11 @@ Route 通过声明使用：
 
     @route("/settings", methods=["GET", "POST"], auth="required")
     @route("/admin", methods=["GET"], permission="admin")
+
+`auth=` 与 `permission=` 最终走**同一套**判定（`check_permission`）：
+`auth="required"` 只是 `auth="authenticated"` 的别名。两者的区别仅在语义命名：
+`auth` 回答"要不要登录"，`permission` 回答"要哪个档位"。
+声明了未知取值会在**路由注册时**直接报错，而不是留到运行时失效开放。
 """
 from __future__ import annotations
 
@@ -33,12 +38,36 @@ PUBLIC = "public"
 AUTHENTICATED = "authenticated"
 ADMIN = "admin"
 
+#: `auth=` 的别名：路由里写 `auth="required"` 表达"必须已登录"。
+#: 保留它是为了可读性（"这个路由需要认证"比 `auth="authenticated"` 更直白），
+#: 但它必须与 AUTHENTICATED 等价，否则又会变成"声明了却没人认识"。
+REQUIRED = "required"
+
 #: 已知档位。**不在这个集合里的值一律拒绝**（失效关闭）：
 #: 把 `permission="amin"` 这类拼写错误当成"无限制"是最危险的失效方式。
 KNOWN_PERMISSIONS = frozenset({PUBLIC, AUTHENTICATED, ADMIN})
 
+#: `auth=` 允许的取值（`None`/`""` 表示未声明 = public）。
+#: **不含 owner**：资源归属不是路由级声明，必须由业务显式调用 require_owner()，
+#: 因为 Core 无从知道"哪个资源"属于谁。
+KNOWN_AUTH = frozenset({PUBLIC, AUTHENTICATED, ADMIN, REQUIRED})
+
+#: `auth=` 里这些值表示"要求已登录或更强"
+AUTH_REQUIRED_VALUES = frozenset({AUTHENTICATED, REQUIRED, ADMIN})
+
 #: 这些值表示"不限制"（None / 空串来自未声明的路由）
 NO_REQUIREMENT = (None, "")
+
+
+def normalize_auth(value):
+    """把 `auth=` 的取值规范化成权限档位；未声明返回 None。
+
+    `"required"` 是 `"authenticated"` 的别名 —— 两者必须走**同一条**判定路径，
+    否则又会出现"声明了但闸门不认识"的失效开放（历史上正是这个 bug）。
+    """
+    if value in NO_REQUIREMENT:
+        return None
+    return AUTHENTICATED if value == REQUIRED else value
 
 #: 认证结果原因（供 Feature 映射成提示文案，不直接暴露给用户）
 OK = "ok"

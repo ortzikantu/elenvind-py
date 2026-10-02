@@ -1,12 +1,20 @@
 """Pages Feature 路由：/theme 与自定义页面兜底。
 
-`/theme` 是 GET 请求写"偏好"Cookie（不是状态变更）：只写 theme、只跳站内路径，
-因此不需要 CSRF；但它确实会写 Cookie，所以这里显式说明其边界。
+`/theme` 用 GET 写"站内偏好"Cookie。这是**刻意**的宽松设计，边界写在下面：
+
+- 它写的是**这个浏览器自己的显示偏好**，不是服务端状态：不影响任何其他人、
+  不改变任何数据、不产生任何可被第三方利用的后果；
+- 危害模型是"CSRF 强制切换某人的配色"，而这个cookie本来就只能由该浏览器自己
+  的偏好决定，被改一次用户再点一次就回来了 —— 因此不值得为它引入 CSRF 令牌
+  （那会让 `<a href="/theme?mode=dark">` 这种最简单的链接失效，并需要
+  在页面上放一个表单+令牌，代价远大于收益）；
+- 尽管如此，它**确实**写了 Cookie，所以这里显式说明，而不是默默为之。
+
+除偏好外，任何会改变状态的路径都必须由非安全方法 + CSRF 触发。
 """
 from __future__ import annotations
 
-from ...core.http import html, redirect
-from ...core.security import THEME_COOKIE, THEME_MAX_AGE
+from ...core.http import html, redirect, safe_next_path
 from ...core.templating import render_template
 from . import logic
 
@@ -14,18 +22,17 @@ from . import logic
 def register(router, *, render_not_found):
     @router.route("/theme", methods=["GET"])
     def theme(request):
-        """切换主题偏好并跳回站内页面（防开放重定向）。"""
-        mode = request.arg("mode", "")
-        target = request.arg("next", "/") or "/"
-        # 只接受站内绝对路径：不是"/"开头、或以"//"开头（协议相对 URL）都回首页
-        if not target.startswith("/") or target.startswith("//"):
-            target = "/"
-        target = target.replace("\r", "").replace("\n", "")
-        response = redirect(target)
-        if mode in ("light", "dark"):
-            # Cookie 名与有效期都取自 Core 常量，Feature 不自造
-            response.set_cookie(THEME_COOKIE, mode, max_age=THEME_MAX_AGE)
-        return response
+        """切换主题偏好并跳回站内页面（防开放重定向）。
+
+        - `next` 是用户可控输入，必须过 Core 的 `safe_next_path()`。
+          这里曾经自己写了一份更弱的校验（不拒绝反斜杠、只拒绝 CR/LF），
+          而反斜杠与 TAB 都会被浏览器归一化/剥离成 `//host`（跨站跳转）。
+        - Cookie 由 Core 下发：Feature 只说"把 theme 偏好设为 dark"，
+          不知道 Cookie 名字、有效期与属性（见 `PREFERENCE_COOKIES`）。
+        """
+        target = safe_next_path(request.arg("next", "/"), default="/")
+        request.set_preference("theme", request.arg("mode", ""))
+        return redirect(target)
 
     @router.route("/<slug>", methods=["GET"], fallback=True)
     def custom_page(request, slug):

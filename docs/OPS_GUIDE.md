@@ -37,8 +37,11 @@ journalctl -u elenvind -n 100 --no-pager      # 看 systemd 侧输出
   正文按文件状态缓存，改完保存即可，无需重启；
 - 首页按 front matter 的 `date` 倒序排列（缺 date 视为最早）；
 - 单文件上限 1 MB，超出会拒绝解析并在日志报错；
-- 图片/视频等媒体请放静态托管处，正文里用标准 Markdown 图片语法
-  或 `<video src="…" controls></video>` 引用绝对 URL。
+- 图片/视频等媒体请放静态托管处或直接给绝对 URL：
+  - 图片用标准 Markdown 语法 `![alt](https://…)`；
+  - 视频用 **`@video(https://…)` 指令**（单独一行），它会渲染成
+    `<video controls>`。**不要写原始 `<video …>` 标签** —— 正文里的原始 HTML
+    会被转义成可见文本（这是 Zero-JS + 净化设计的一部分，不是 bug）。
 
 ### 自定义页面
 
@@ -47,15 +50,26 @@ journalctl -u elenvind -n 100 --no-pager      # 看 systemd 侧输出
 
 ### 静态资源
 
-CSS/图标/图片由 Nginx 托管，与应用无关；同步文件后即可，
-浏览器侧强缓存资源（图片 7 天、CSS 1 小时）想立即看到效果可临时改 URL 加查询串。
+`elenvind/static/` 整个目录由**应用自己**发出，URL 与磁盘一一对应
+（`/css/style.css` ↔ `elenvind/static/css/style.css`，**没有 `/static` 前缀**）。
+同步文件后刷新即可，不需要重启。
+
+浏览器侧统一 `Cache-Control: public, max-age=86400`（**1 天**，所有静态类型一致），
+同时带一个基于文件内容的 `ETag`：改了文件刷新即刻生效，不会让你一直看到旧副本。
+若挂了 CDN 且想让改动更快扩散，清理 CDN 缓存或在 URL 上加查询串即可。
+
+（如果让 Nginx 直接服务这些路径，就由 Nginx 的 `expires` 决定缓存时长，
+以 `docs/nginx.conf.example` 为准。）
 
 ## 三、用户与评论
 
 ### 管理员
 
 - `config.toml` 顶层 `admin_user_id` 指定的用户即站长（默认 `1`，即最早注册的账号）：
-  导航带徽章、可删除任意评论、可恢复已删评论；把该项删掉或改成非法值 = **没有管理员**；
+  导航带徽章、可删除任意评论、可恢复已删评论；
+- **要取消管理员**：把该键显式写为 `null`（`admin_user_id = null`）。
+  写成 `0` / 负数 / 非整数会**拒绝启动**——这是刻意的，避免"以为关掉了管理入口、
+  其实配置没生效"；
 - 恢复/删除是**软删除**：访客看到等长方块打码，站长看到删除线，可随时恢复；
 - **没有物理删除入口**：评论只做软删除，永久保留在库里（这是审计与误删恢复的前提）。
   数据库层 `parent_id` 是 `ON DELETE SET NULL`，因此即便在库外手工清理了父行，
@@ -69,9 +83,17 @@ CSS/图标/图片由 Nginx 托管，与应用无关；同步文件后即可，
 
 ### 会话
 
-- 登录会话 7 天过期；登录会先清除该账号旧会话（防会话固定）；
+- **绝对过期 30 天**：会话创建后活够 30 天就必须重新登录，与活跃程度无关
+  （token 泄露后风险窗口的硬上限）；
+- **滑动过期 15 天**：闲置超过 15 天即失效；有效访问会刷新 `last_seen`，
+  所以常用设备不会被踢；
+- 两者都由 `[server]` 之外的顶层键 `session_absolute_days` /
+  `session_idle_days` 控制，设为 `0` 表示该维度不过期；
+- 登录会先清除该账号**全部**旧会话再颁发新 token（防会话固定）；
 - 修改密码 / 注销账号会**立即踢掉该账号全部会话**并清除浏览器 Cookie，
-  表现为"被强制回到登录页"，属预期行为。
+  表现为"被强制回到登录页"，属预期行为；
+- 会话 Cookie 只在**会话发生变化**时下发（登录/轮换/登出），
+  普通页面与静态资源请求不会回带 `Set-Cookie`。
 
 ## 四、数据库
 
@@ -80,6 +102,9 @@ CSS/图标/图片由 Nginx 托管，与应用无关；同步文件后即可，
 - schema 版本记录在 `PRAGMA user_version`（当前版本见 `db_base.SCHEMA_VERSION`）。
   启动时若版本落后，会自动执行迁移（含重建表）并更新版本号，**幂等、可重复执行**，
   旧库无需手工处理；升级前仍建议备份；
+- 迁移在**单个事务**内完成（显式 `BEGIN IMMEDIATE`），失败整体回滚、
+  版本号不变；若发现上次中断留下的 `*_legacy` 备份表，**拒绝启动**并打印表名
+  （而不是带着半迁移的数据继续跑，那会表现为"评论全部消失"）；
 - 备份（WAL 下勿直接拷贝）：
 
 ```bash
@@ -107,16 +132,18 @@ python -m unittest tests.test_http -v              # 单个模块
 **不会触碰生产数据库与文章目录**。升级代码后建议先跑一遍。
 
 需要一次"真实 uvicorn 冷启动"验证时（例如换机器、换 Python 版本后），
-可以跑冒烟驱动（`scripts/` 下）：
+可以跑冒烟驱动（在**项目根目录**，不在 `scripts/` 下）：
 
 ```bash
-python scripts/smoke_driver.py   # 需要环境里已安装 uvicorn
+python smoke_driver.py    # 需要环境里已安装 uvicorn
 ```
 
 它会在临时目录（`.smoketmp/`）里起一个真实服务并走完整流程：首页 / 文章 /
 Markdown / 自定义页面 / 内置样式表 / 登录 / 注册 / 注销 / 改密 / 发表评论 /
 回复评论 / 软删除 / 恢复 / SEO / 主题 / 404 / 405，以及请求体边界
-（411 / 413 / 415）与 Host 头投毒，共 50 余项断言。
+（411 / 413 / 415）与 Host 头投毒，共 61 项断言。
+
+端口默认自动挑选空闲端口；要固定端口可设 `SMOKE_PORT`。
 
 从任何工作目录运行都可以（脚本自己切到项目根），结束后清理临时目录，
 不影响仓库里的真实数据。
@@ -192,4 +219,4 @@ sqlite3 sqlite.db "DELETE FROM login_attempts WHERE ip = '1.2.3.4';"          # 
 | 11 | 注册策略 | 需要私有站点时设 `registration_enabled = false`，或保持注册并依赖 IP 限流 |
 | 12 | 管理员账号 | 第一个注册的账号 id 记为 `admin_user_id`，或显式设定；确认导航出现管理员徽章 |
 | 13 | 静态资源 | `[static]` 与 `params.social.icon` 的 URL 在浏览器可 200 打开（无裂图） |
-| 14 | 自检命令 | `python -m unittest discover -s tests -t .` 全绿；`python scripts/smoke_driver.py` 全绿 |
+| 14 | 自检命令 | `python -m unittest discover -s tests -t .` 全绿；`python smoke_driver.py` 全绿 |

@@ -270,6 +270,172 @@ class CacheLeakTests(ElenvindTestCase):
         self.assertNotIn("cache2@example.com", response.text)
 
 
+class ServerErrorPageTests(ElenvindTestCase):
+    """500 必须走自定义错误页，且**绝不**泄露 traceback / 异常类型。
+
+    三层兜底都要拦住：
+    1. Feature 提供 server_error -> 带布局的错误页；
+    2. 没提供 / 渲染失败 -> 纯文本 "Internal Server Error"；
+    3. 请求对象都没有（畸形请求）-> 纯文本。
+    """
+
+    #: 任何一层都不允许出现在响应体里的痕迹
+    NEVER_LEAK = ("Traceback", "traceback", "RuntimeError", "ValueError",
+                  "File \"", 'File "', "internal detail", "/etc/passwd",
+                  "SECRET-MARKER", "SiteError")
+
+    def _boom_response(self, message="internal detail: /etc/passwd"):
+        """把首页 handler 换成一个必抛异常的版本，拿到 500 响应。"""
+        from elenvind.app import app
+
+        target = next(route for route in app.router.routes if route.path == "/")
+        original = target.handler
+
+        def boom(request):
+            raise RuntimeError(message)
+
+        target.handler = boom
+        try:
+            with self.assertLogs("elenvind.core.app", level="ERROR") as captured:
+                response = self.app.request("GET", "/")
+        finally:
+            target.handler = original
+        return response, captured
+
+    def test_500_uses_the_html_error_template(self):
+        response, _ = self._boom_response()
+        self.assertEqual(response.status, 500)
+        self.assertTrue(response.content_type.startswith("text/html"),
+                        response.content_type)
+        self.assertIn("<!DOCTYPE html>", response.text)
+        self.assertIn("500 Internal Server Error", response.text)
+        # 带布局：站点页头/页脚都在（与 404/403 观感一致）
+        self.assertIn("<header>", response.text)
+        self.assertIn("<footer>", response.text)
+
+    def test_500_never_leaks_exception_details(self):
+        response, _ = self._boom_response()
+        for leak in self.NEVER_LEAK:
+            with self.subTest(leak=leak):
+                self.assertNotIn(leak, response.text)
+
+    def test_traceback_goes_to_the_log_instead(self):
+        _, captured = self._boom_response()
+        logged = "\n".join(captured.output)
+        self.assertIn("Traceback", logged)          # 堆栈确实被记录了
+        self.assertIn("RuntimeError", logged)
+        self.assertIn("/etc/passwd", logged)
+
+    def test_500_response_carries_security_headers(self):
+        """错误响应也走统一的响应收尾（安全头 + 缓存策略）。"""
+        response, _ = self._boom_response()
+        self.assertEqual(response.header("x-content-type-options"), "nosniff")
+        self.assertEqual(response.header("referrer-policy"),
+                         "strict-origin-when-cross-origin")
+        self.assertIsNotNone(response.header("content-security-policy"))
+        self.assertEqual(response.header("cache-control"), "no-store")
+
+    def test_falls_back_to_plain_text_without_handler(self):
+        """没提供 server_error 时回落纯文本，且同样不泄露。"""
+        from elenvind.core.app import App
+        from tests.support import run_async
+        import logging
+
+        mini = App()
+
+        def boom(request):
+            raise ValueError("layer2-marker")
+
+        mini.router.route("/boom", methods=["GET"])(boom)
+        status, body, content_type = self._drive(mini, "/boom")
+        self.assertEqual(status, 500)
+        self.assertTrue(content_type.startswith("text/plain"), content_type)
+        self.assertEqual(body, b"Internal Server Error")
+        self.assertNotIn(b"layer2-marker", body)
+
+    def test_falls_back_when_error_page_rendering_itself_fails(self):
+        """错误页渲染本身抛异常时也必须给出 500，而不是二级异常。"""
+        from elenvind.core.app import App
+
+        mini = App()
+
+        def bad_renderer(request):
+            raise RuntimeError("layer3-render-failed")
+
+        mini.server_error = bad_renderer
+
+        def boom(request):
+            raise ValueError("original-failure")
+
+        mini.router.route("/boom", methods=["GET"])(boom)
+        status, body, content_type = self._drive(mini, "/boom")
+        self.assertEqual(status, 500)
+        self.assertTrue(content_type.startswith("text/plain"), content_type)
+        self.assertNotIn(b"layer3-render-failed", body)
+        self.assertNotIn(b"original-failure", body)
+
+    def test_malformed_request_error_page_is_plain_text(self):
+        """请求对象还没构造出来时（畸形 Content-Length）也是纯文本 500/400。"""
+        response = self.app.raw_request(
+            "POST", "/login", b"",
+            [("host", "example.com"), ("content-length", "not-a-number")], body=b"")
+        self.assertEqual(response.status, 400)
+        self.assertTrue(response.content_type.startswith("text/plain"),
+                        response.content_type)
+
+    def test_error_template_renders_no_dynamic_exception_data(self):
+        """模板本身只输出固定文案：结构上就不存在泄漏通道。"""
+        import pathlib
+        from tests.support import PROJECT_ROOT
+        template = (PROJECT_ROOT / "elenvind" / "templates" / "errors"
+                    / "error.html").read_text(encoding="utf-8")
+        # 只允许固定文案变量，不允许任何"异常/堆栈/路径"类变量
+        for forbidden in ("traceback", "exception", "exc_info", "error_detail",
+                          "error_debug", "stack", "repr(", "args"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, template.lower())
+        self.assertIn("error_title", template)
+        self.assertIn("error_message", template)
+
+    def test_server_error_handler_is_wired(self):
+        """回归：error_handlers() 提供了 server_error，就必须真的接到 App 上。
+
+        曾经它被定义但从未装配 —— 500 一直走裸文本。
+        """
+        from elenvind.app import app
+        from elenvind.features import registry
+        self.assertIsNotNone(app.server_error)
+        self.assertIs(app.server_error, registry.error_handlers()["server_error"])
+
+    @staticmethod
+    def _drive(mini, path):
+        from tests.support import run_async
+        import logging
+
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {"type": "http", "method": "GET", "path": path, "scheme": "https",
+                 "headers": [], "query_string": b"",
+                 "client": ("127.0.0.1", 1)}
+        logging.disable(logging.CRITICAL)
+        try:
+            run_async(mini(scope, receive, send))
+        finally:
+            logging.disable(logging.NOTSET)
+        start = [m for m in sent if m["type"] == "http.response.start"][0]
+        body = b"".join(m.get("body", b"") for m in sent
+                        if m["type"] == "http.response.body")
+        content_type = {k.decode(): v.decode()
+                        for k, v in start["headers"]}.get("content-type", "")
+        return start["status"], body, content_type
+
+
 class ErrorHandlingTests(ElenvindTestCase):
     def test_unexpected_exception_becomes_500_without_leaking_details(self):
         from elenvind.app import app
@@ -282,14 +448,27 @@ class ErrorHandlingTests(ElenvindTestCase):
 
         target.handler = boom
         try:
-            response = self.app.request("GET", "/")
+            with self.assertLogs("elenvind.core.app", level="ERROR") as captured:
+                response = self.app.request("GET", "/")
         finally:
             target.handler = original
 
         self.assertEqual(response.status, 500)
-        self.assertEqual(response.text, "Internal Server Error")
-        self.assertNotIn("/etc/passwd", response.text)
-        self.assertNotIn("Traceback", response.text)
+        # 现在 500 走带布局的错误页（与 404/403 一致），不再是裸文本
+        self.assertIn("<!DOCTYPE html>", response.text)
+        self.assertIn("500", response.text)
+
+        # 关键：页面上不得出现任何异常细节
+        for leak in ("/etc/passwd", "RuntimeError", "Traceback", "traceback",
+                     "internal detail", 'File "', "line "):
+            with self.subTest(leak=leak):
+                self.assertNotIn(leak, response.text)
+
+        # traceback 必须进了日志（而不是被丢弃）
+        logged = "\n".join(captured.output)
+        self.assertIn("RuntimeError", logged)
+        self.assertIn("/etc/passwd", logged)
+        self.assertIn("Traceback", logged)
 
     def test_404_page_is_rendered_html(self):
         response = self.app.request("GET", "/nope")

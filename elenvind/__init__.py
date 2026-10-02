@@ -7,7 +7,8 @@
 
 分层（唯一允许的依赖方向）：
 
-    features/          业务：blog / pages / users / auth / admin
+    features/          业务：blog / pages / users / auth / admin /
+                       seo（robots+sitemap）/ system（错误页）
         ↓ 只使用
     core/              Web 安全与基础设施：request / response / routing /
                        session / csrf / auth / authorization / cookie /

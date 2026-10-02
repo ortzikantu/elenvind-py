@@ -14,16 +14,26 @@
 import time
 
 from .db_base import connect
+from .db_prune import prune
+
+#: 登录流水保留期（天）。启动清理与运行期机会式清理共用。
+RETENTION_DAYS = 30
 
 
 def record_login_attempt(email: str, ip: str, success: bool):
-    """记录一次登录尝试（成败都记，成功记录用于审计）。"""
+    """记录一次登录尝试（成败都记，成功记录用于审计）。
+
+    提交后做一次机会式清理（每小时最多一次，见 `core.db_prune`）：
+    登录失败是攻击者最容易制造的行增长来源，只靠启动清理在长跑进程上
+    会让表无限膨胀。
+    """
     with connect() as conn:
         conn.execute(
             "INSERT INTO login_attempts (email, ip, attempted_at, success) VALUES (?, ?, ?, ?)",
             (email, ip, time.time(), 1 if success else 0)
         )
         conn.commit()
+    prune("login_attempts", "attempted_at", RETENTION_DAYS)
 
 
 def count_email_failures(email: str, window_seconds: int = 900) -> int:
@@ -68,7 +78,7 @@ def clear_login_attempts(email: str):
         conn.commit()
 
 
-def cleanup_old_login_attempts(days: int = 30):
+def cleanup_old_login_attempts(days: int = RETENTION_DAYS):
     """启动时删除指定天数之前的流水，控制表体积。"""
     with connect() as conn:
         cutoff = time.time() - days * 86400

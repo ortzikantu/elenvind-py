@@ -16,17 +16,16 @@
 from __future__ import annotations
 
 import json
-from http.cookies import SimpleCookie
+import logging
 from urllib.parse import parse_qs
 
 from .context import current_request
 from .security import (
-    BASE_SECURITY_HEADERS,
-    CSP,
     CSRF_COOKIE,
     CSRF_MAX_AGE,
-    HSTS_HEADER,
+    PREFERENCE_COOKIES,
     SESSION_COOKIE,
+    build_security_headers,
     cookie_name,
     cookie_names,
     csrf_cookie_header,
@@ -35,6 +34,8 @@ from .security import (
     pick_cookie,
 )
 from .utils import escape_html, get_client_ip
+
+logger = logging.getLogger(__name__)
 
 #: 允许的请求方法；其余一律 405（带 Allow 头）
 ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
@@ -105,7 +106,8 @@ class Request:
     __slots__ = ("scope", "method", "path", "query", "headers", "cookies",
                  "raw_body", "_form", "content_type", "content_length",
                  "client_ip", "secure", "user", "session_token", "lang",
-                 "_csrf", "_csrf_dirty")
+                 "_csrf", "_csrf_dirty", "_preferences",
+                 "_session_cookie_dirty", "_session_cookie_clear_pending")
 
     def __init__(self, *, scope, method, path, query, headers, cookies, raw_body,
                  form, content_type, content_length, client_ip, secure, lang,
@@ -127,6 +129,12 @@ class Request:
         self.session_token = session_token  # 从 Cookie 解析（可能为 None）
         self._csrf = None
         self._csrf_dirty = False
+        #: 本次请求要写入的站内偏好（见 set_preference）
+        self._preferences = {}
+        #: 会话 Cookie 需要下发（新颁发/轮换）—— 普通请求不下发，见 pending_cookies
+        self._session_cookie_dirty = False
+        #: 会话已被本请求作废，需要在响应里清除浏览器 Cookie（见 pending_cookies）
+        self._session_cookie_clear_pending = False
 
     # ---------- 构造 ----------
     @classmethod
@@ -201,20 +209,93 @@ class Request:
     def set_session_token(self, token) -> None:
         """Core 会话层在轮换/颁发会话后调用（Cookie 由 send_response 统一下发）。"""
         self.session_token = token
+        self._session_cookie_dirty = bool(token)
 
     def pending_cookies(self):
-        """本次请求需要下发的全部 Cookie 头（会话 + CSRF）。
+        """本次请求需要下发的全部 Cookie 头（会话 + CSRF + 站内偏好）。
 
         集中在一处，避免"某个分支忘了发 Cookie"这类不一致
         （例如登录成功后只设了 session 却漏了 csrf，导致下一次 POST 被 403）。
+
+        会话 Cookie 只在**会话本身发生变化**时下发：
+        - 新颁发 / 轮换（`set_session_token`）-> 下发新 token；
+        - 被作废（登出 / 改密 / 删号）-> 下发清除指令；
+        - 其它情况（用已有会话访问页面、取静态资源）-> **不下发**。
+
+        最后一条很重要：静态资源与 robots/sitemap 是 `Cache-Control: public`，
+        在那些响应里回带 `Set-Cookie: session=…` 会让任何"缓存 Set-Cookie"
+        的中间层（CDN 缓存一切、nginx `proxy_ignore_headers Set-Cookie`）
+        有机会把某人的会话 token 回放给其他访客。
+        顺带也省掉了"每取一张图片就写一次 last_seen"的无谓 DB 写。
         """
         headers = []
-        if self.session_token:
-            from .security import set_cookie_header
-            headers.append(set_cookie_header(self.session_token, secure=self.secure))
+        from .security import clear_cookie_headers, set_cookie_header
+        if self.session_token and self._session_cookie_dirty:
+            from .session import session_cookie_max_age
+            # Cookie 寿命跟随"绝对过期"窗口（见 session_cookie_max_age）
+            headers.append(set_cookie_header(self.session_token, secure=self.secure,
+                                             max_age=session_cookie_max_age()))
+        elif self._session_cookie_clear_pending:
+            # 服务端已经作废了会话：必须让浏览器也丢掉它。
+            # 用 clear_cookie_headers（同时清理可能的 __Host- 前缀变体），
+            # 由 Core 统一做，Feature 不需要知道 Cookie 名字。
+            headers.extend(clear_cookie_headers(secure=self.secure))
         csrf_header = self.csrf_cookie_header()
         if csrf_header:
             headers.append(csrf_header)
+        headers.extend(self.preference_cookie_headers())
+        return headers
+
+    def invalidate_session_cookie(self):
+        """作废本次请求的会话：清服务端会话 + 让浏览器 Cookie 立即过期。
+
+        这也是 Feature 侧"我只想让这个会话失效"的**唯一**入口 ——
+        Feature 不拼 Cookie、不 import SESSION_COOKIE。
+        """
+        from .session import delete_session
+
+        if self.session_token:
+            delete_session(self.session_token)
+        self.session_token = None
+        self.user = None
+        self._session_cookie_dirty = False
+        self._session_cookie_clear_pending = True
+
+    # ---------- 站内偏好（主题等） ----------
+    def set_preference(self, name: str, value: str) -> None:
+        """设置一个站内偏好（白名单内），由 Core 在响应收尾时下发 Cookie。
+
+        Feature 通过它写入偏好，**不需要知道 Cookie 名字、有效期或属性**。
+        为什么偏好不放 Response 上：偏好不属于某一次响应，而属于"这个浏览器"；
+        统一由 `pending_cookies()` 下发，能让所有响应路径（重定向、错误页）
+        行为一致。
+        """
+        if name not in PREFERENCE_COOKIES:
+            raise ValueError(f"unknown preference {name!r}; "
+                             f"expected one of {sorted(PREFERENCE_COOKIES)}")
+        self._preferences[name] = value
+
+    def preference(self, name: str, default=None):
+        """读取当前请求携带的站内偏好（未设置返回 default）。"""
+        from .security import pick_cookie
+
+        if name not in PREFERENCE_COOKIES:
+            raise ValueError(f"unknown preference {name!r}")
+        cookie_name, _max_age, allowed = PREFERENCE_COOKIES[name]
+        value = pick_cookie(self.cookies, cookie_name)
+        # 白名单校验：Cookie 是客户端可控输入，绝不原样回显到 HTML/属性里
+        return value if value in allowed else default
+
+    def preference_cookie_headers(self):
+        """本次需要下发的偏好 Cookie（未变更则为空）。"""
+        from .security import _make_cookie
+
+        headers = []
+        for name, value in self._preferences.items():
+            cookie_name, max_age, allowed = PREFERENCE_COOKIES[name]
+            if value not in allowed:
+                continue
+            headers.append(_make_cookie(cookie_name, value, self.secure, max_age))
         return headers
 
 
@@ -249,11 +330,17 @@ async def _read_body(scope, receive, headers):
             raise BadRequest("client disconnected")
         if message_type != "http.request":
             raise BadRequest("unexpected ASGI message")
+        # 计数器必须对**每一个**分片递增，包括空分片。
+        #
+        # 回归：旧代码把递增写在 `if chunk:` 里面，于是"空 body + more_body 永真"
+        # 既推进不了 len(body)、也不增加计数 -> 无界循环，
+        # 而 MAX_BODY_CHUNKS 这道防线**永远不可达**（注释却声称它防的就是这个）。
+        # 实测：喂 20 万个空分片仍在循环，直到客户端断开才由别的分支结束。
+        chunks += 1
+        if chunks > MAX_BODY_CHUNKS:
+            raise PayloadTooLarge("too many body chunks")
         chunk = message.get("body", b"")
         if chunk:
-            chunks += 1
-            if chunks > MAX_BODY_CHUNKS:
-                raise PayloadTooLarge("too many body chunks")
             body.extend(chunk)
             if len(body) > limit:
                 raise PayloadTooLarge("body too large")
@@ -277,20 +364,14 @@ def _collect_headers(scope) -> dict:
 def _parse_cookie_header(raw: str) -> dict:
     """按 RFC 6265 宽松解析 Cookie；一个畸形片段不该丢掉整条头。
 
-    不用 http.cookies.SimpleCookie 的原因：它遇到 `=broken` 这类片段会
-    把整个头部的 Cookie 全部丢弃，导致一个无关的坏 Cookie 让所有人掉线。
+    实现委托 `core.security.parse_cookie_header` —— Cookie 解析只有那一处。
+    （曾经 http 与 security 各有一份几乎相同的解析器，其中一份是死代码；
+    `_collect_headers` 只保留最后一个 `cookie` 头，而 security 那份会合并
+    多个头，两者行为**已经不同**，迟早有人按"另一份"的语义改坏其中一处。）
     """
-    cookies = {}
-    for part in raw.split(";"):
-        name, sep, value = part.partition("=")
-        if not sep:
-            continue
-        name = name.strip()
-        value = value.strip()
-        if not name or "=" in name or value.startswith('"'):
-            continue
-        cookies[name] = value
-    return cookies
+    from .security import parse_cookie_header
+
+    return parse_cookie_header(raw)
 
 
 def _parse_form(raw_body: bytes) -> dict:
@@ -375,8 +456,20 @@ def json_response(payload, *, status=200, headers=None, cache_control=None) -> R
 
 
 def redirect(location: str, *, status=302, headers=None) -> Response:
-    """重定向。Location 必须由调用方给出站内路径（Core 会去掉 CR/LF）。"""
+    """重定向。
+
+    Location 必须由调用方给出**站内路径**。这里做两层防护：
+    1. 去掉 CR/LF（响应头注入原料）；
+    2. 若结果里仍有**任何控制字符**，整个 Location 直接丢弃
+       （宁可让响应没有 Location，也不放出一个浏览器会自行"剥离控制字符后"
+       再解析的地址 —— 那正是 `/\t/evil.com` 变 `//evil.com` 的成因）。
+
+    用户可控的回跳地址请先过 `safe_next_path()`，不要把原始输入直接传进来。
+    """
     safe = _sanitize_location(location)
+    if safe and _has_url_control_chars(safe):
+        logger.warning("refusing to emit a Location containing control characters")
+        safe = ""
     extra = [(b"location", safe.encode("latin-1", "replace"))] if safe else []
     return Response(b"", status=status, content_type="text/plain; charset=utf-8",
                     headers=(headers or []) + extra)
@@ -389,6 +482,48 @@ def _sanitize_location(location: str) -> str:
     return location.replace("\r", "").replace("\n", "")
 
 
+#: 视为"会改变 URL 解析结果"的控制字符：C0（含 TAB/CR/LF）、DEL、C1。
+#: 为什么不能只拒绝 CR/LF：
+#:   浏览器在解析 URL 前会先**剥离** ASCII TAB 与换行（URL 标准），
+#:   于是 `/\t/evil.com` 在浏览器眼里就是 `//evil.com`（协议相对 = 跨站）。
+#:   反斜杠同理：URL 标准把它归一化成 `/`，所以 `/\evil.com` 也是跨站。
+#: 注意这里用 `unicodedata` 之外的白名单并集：允许所有可打印字符，
+#:   但**显式排除控制类**，避免将来又冒出一个"某个 unicode 空白被剥离"的变体。
+def _has_url_control_chars(value: str) -> bool:
+    import unicodedata
+
+    for ch in value:
+        if ch in "\t\r\n" or "\x00" <= ch <= "\x1f" or ch == "\x7f":
+            return True
+        if "\x80" <= ch <= "\x9f":
+            return True
+        if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp"):
+            return True
+    return False
+
+
+def safe_next_path(raw, default: str = "/") -> str:
+    """把"回跳地址"规范化为**站内路径**；不合法一律返回 `default`。
+
+    这是全项目唯一的回跳地址校验（Feature 不得自己实现一份）。
+    拒绝：
+      - 非字符串 / 空串；
+      - 任何控制字符（含 TAB —— 见 `_has_url_control_chars` 的说明）；
+      - 反斜杠（浏览器会归一化成 `/`，`/\\evil.com` -> `//evil.com`）；
+      - 不以 `/` 开头（相对路径、绝对 URL、`javascript:` 等）；
+      - 以 `//` 开头（协议相对 URL = 跨站）。
+    返回值一定是可以安全放进 `Location` 的站内路径。
+    """
+    if not isinstance(raw, str):
+        return default
+    value = raw.strip()
+    if not value or not value.startswith("/") or value.startswith("//"):
+        return default
+    if "\\" in value or _has_url_control_chars(value):
+        return default
+    return value
+
+
 # ======================= 安全响应头与最终发送 =======================
 
 # 安全头的**定义**在 security.py（全项目唯一处）；http.py 只负责装配到响应上。
@@ -398,21 +533,29 @@ def default_cache_control(request: Request, response: Response) -> str:
     """默认缓存策略：登录态页面 no-store，匿名 HTML no-cache，其余 no-store。
 
     带用户状态的页面绝不允许 public——否则会被中间缓存泄漏给他人。
+
+    **错误响应一律 no-store**：错误页代表"这次请求失败了"，没有复用价值，
+    而且被缓存下来还会让访客在服务恢复后仍然看到旧的报错。
     """
+    if response.status >= 400:
+        return "no-store"
     if response.is_html():
         return "no-store" if request.user else "no-cache"
     return "no-store"
 
 
 def build_headers(request: Request, response: Response, *, head_only=False):
-    """把 Response 组装成完整的 ASGI 响应头（安全头 + Cookie 统一在此加）。"""
+    """把 Response 组装成完整的 ASGI 响应头（安全头 + Cookie 统一在此加）。
+
+    **这是安全响应头的唯一注入点**：Feature 返回的 Response 都会经过这里，
+    因此它们不需要（也不应该）自己加任何安全头。CSP / Permissions-Policy /
+    HSTS 的具体取值来自配置，见 `core/security.build_security_headers()`。
+    """
     headers = [
         (b"content-type", response.content_type.encode("utf-8")),
         (b"content-length", str(len(response.body)).encode("ascii")),
     ]
-    headers.extend(BASE_SECURITY_HEADERS)
-    if request.is_secure():
-        headers.append(HSTS_HEADER)
+    headers.extend(build_security_headers(secure=request.is_secure()))
 
     cache_control = response.cache_control or default_cache_control(request, response)
     if cache_control:
@@ -427,17 +570,16 @@ def build_headers(request: Request, response: Response, *, head_only=False):
 
 
 def _set_cookie_header(name, value, *, max_age, http_only, secure):
-    """唯一的 Set-Cookie 构造点（HttpOnly / SameSite=Lax / Path=/ / 可选 Secure）。"""
-    cookie = SimpleCookie()
-    cookie[name] = value
-    cookie[name]["path"] = "/"
-    if http_only:
-        cookie[name]["httponly"] = True
-    cookie[name]["samesite"] = "Lax"
-    cookie[name]["max-age"] = int(max_age)
-    if secure:
-        cookie[name]["secure"] = True
-    return (b"set-cookie", cookie[name].OutputString().encode("utf-8"))
+    """`Response.set_cookie()` 排队的 Cookie 的构造入口。
+
+    **构造实现委托 `core.security._make_cookie`**（全项目唯一的 Set-Cookie
+    拼装点，HttpOnly / SameSite=Lax / Path=/ / 可选 Secure 的策略都在那里）。
+    这里曾经是一份逐行重复的拷贝 —— 两份策略迟早会各自漂移，
+    例如有人只给其中一处加上 `__Host-` 要求的新属性。
+    """
+    from .security import _make_cookie
+
+    return _make_cookie(name, value, secure, int(max_age), http_only=http_only)
 
 
 async def send_response(send, request: Request, response: Response, *, head_only=False):
@@ -479,7 +621,8 @@ __all__ = [
     "HttpError", "BadRequest", "LengthRequired", "PayloadTooLarge",
     "UnsupportedMediaType", "MethodNotAllowed", "Forbidden", "NotFound", "CsrfError",
     "Request", "Response", "html", "text", "json_response", "redirect",
-    "BASE_SECURITY_HEADERS", "HSTS_HEADER", "CSP",
+    "BASE_SECURITY_HEADERS", "build_security_headers",
     "build_headers", "send_response", "error_response", "max_body_size",
-    "escape_html", "current_request", "cookie_name", "SESSION_COOKIE", "CSRF_MAX_AGE",
+    "escape_html", "current_request", "cookie_name", "SESSION_COOKIE",
+    "CSRF_MAX_AGE",
 ]

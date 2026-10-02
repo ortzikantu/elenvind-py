@@ -17,7 +17,7 @@ elenvind/
     routing.py          @route 声明 + 调度器（CSRF / 认证 / 权限闸门）
     http.py             Request / Response / 安全头 / Cookie 下发
     security.py         密码哈希、Cookie 构造、CSP 与安全头定义
-    session.py          服务端会话（轮换、失效、清理）
+    session.py          服务端会话（轮换、两级过期、清理）
     auth.py             认证与授权（verify_credentials / check_permission）
     csrf.py             CSRF 单点实现 + 模板全局 csrf_input()
     templating.py       Jinja2 唯一入口 render_template()
@@ -206,7 +206,7 @@ def profile_update(request): ...
 ### 4.1 允许
 
 ```python
-from ...core.http import html, text, redirect, json_response, Response
+from ...core.http import html, text, redirect, Response
 from ...core.http import BadRequest, Forbidden, NotFound, PayloadTooLarge
 from ...core.templating import render_template
 from ...core.markdown import render_markdown
@@ -228,7 +228,9 @@ if row is None:
 
 | 禁止 | 原因 | 正确做法 |
 |---|---|---|
-| `SimpleCookie()` / 手拼 `Set-Cookie` | Cookie 属性会漏 | `Response.set_cookie()` |
+| `SimpleCookie()` / 手拼 `Set-Cookie` | Cookie 属性会漏 | 见下方"Cookie 的唯一出口" |
+| `Response.set_cookie()` / `.delete_cookie()` | Feature 不该知道 Cookie 名与属性策略 | 会话用 `request.invalidate_session_cookie()`；偏好用 `request.set_preference()` |
+| `from ...core.security import SESSION_COOKIE` | import 了它说明你想自己操作那个 Cookie | 同上（静态守卫会拦） |
 | 自定义 `hash_password` / `verify_password` | 密码逻辑只能有一份 | `core.security` |
 | 自定义 CSRF 校验 | 会出现"某条路径忘了校验" | 什么都不做，调度器默认施加 |
 | `get_connection()` | 会用完不关（连接泄漏） | `with connect() as conn:` |
@@ -236,6 +238,20 @@ if row is None:
 | `markdown.markdown(...)` | 绕过净化 = 存储型 XSS | `render_markdown()` |
 | 手写 `<script>` / `on*=` 等标记 | 绕过模板转义 | 写进模板文件 |
 | `from ..features import ...`（在 core 里） | 依赖方向反转 | 用启动钩子 |
+
+#### Cookie 的唯一出口
+
+Cookie 由 Core 在响应收尾阶段统一下发（`Request.pending_cookies()`），
+Feature 只表达"我想要什么"，不碰 `Set-Cookie`：
+
+| 需求 | Feature 写什么 | Core 做什么 |
+|---|---|---|
+| 让当前会话失效（登出 / 改密 / 删号） | `request.invalidate_session_cookie()` | 删服务端会话 + 下发 `Max-Age=0`（含 `__Host-` 前缀兼容名） |
+| 记住一个站内偏好（如主题） | `request.set_preference("theme", "dark")` | 按 `core.security.PREFERENCE_COOKIES` 白名单校验后下发 |
+| 读一个站内偏好 | `request.preference("theme")` | 白名单校验后返回，非法值给 `None` |
+
+好处是 Cookie 名、有效期、`HttpOnly` / `SameSite` / `Secure` / 前缀策略
+全项目只有一处定义；切换 `cookie_prefix` 时 Feature 一行都不用改。
 
 ### 4.3 关于 `markupsafe.Markup`
 
@@ -351,7 +367,7 @@ Python 里 `from ...core.i18n import t` + `t(current_lang(), 'key', ...)`。
 ```bash
 python -m unittest discover -s tests -t .      # 全部
 python -m unittest tests.test_core_contract -v # 契约守卫
-python scripts/smoke_driver.py                 # 真起服务跑 50+ 项检查
+python smoke_driver.py                         # 真起服务跑 61 项检查（在项目根）
 ```
 
 写 Feature 测试时继承 `tests.support.ElenvindTestCase`：它提供临时数据库、

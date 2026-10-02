@@ -4,44 +4,128 @@
 - token 是 32 字节 cryptographically-secure 随机串，仅存在于服务端表与用户 Cookie 中，
   攻击者无法预测，也不像 JWT 那样携带可伪造的载荷。
 - 登录成功会先 delete_user_sessions(user_id) 再发新证，防止会话固定攻击。
-- 每次发证顺带清理过期会话，避免长运行后表无限增长。
+- 每次发证与每次校验都顺带清理过期会话，避免长运行后表无限增长。
+
+过期策略（两个维度，都需要满足才有效）：
+- **绝对过期** `created_at + absolute_days`：会话无论多活跃，活够这么久就必须重新登录。
+  这是"token 泄露后风险窗口"的硬上限。
+- **滑动过期** `last_seen + idle_days`：闲置超过这么久即失效。
+  每次有效访问会刷新 `last_seen`，所以常用设备不会被踢。
+两者任一超时都视为无效，并**当场删除**该行（不给重复利用留机会）。
+阈值来自 config.toml（`session_absolute_days` / `session_idle_days`），
+设为 0 表示该维度不过期——那会显著放大 token 泄露的风险，站长需自行权衡。
 """
 import secrets
 import time
 
 from .db_base import connect
 
-# 会话有效期：与 security.SESSION_MAX_AGE 的 Cookie max-age 保持同一数值（7 天）
-SESSION_DAYS = 7
+#: 兜底默认值（配置缺失时使用）。config.toml 里的同名键是实际生效来源。
+DEFAULT_ABSOLUTE_DAYS = 30
+DEFAULT_IDLE_DAYS = 15
+
+DAY_SECONDS = 86400
 
 
-def create_session(user_id: int, days: int = SESSION_DAYS) -> str:
+def _session_limits():
+    """返回 (absolute_days, idle_days)；0 表示该维度不设过期。
+
+    配置在启动时已由 config.validate_config() 校验过类型与范围，
+    这里再做一次防御性转换：配置层若被绕过，也不能让非数值混进来。
+    """
+    from .config import config
+
+    def read(key, default):
+        value = config.get(key, default)
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            return default
+
+    return read("session_absolute_days", DEFAULT_ABSOLUTE_DAYS), \
+        read("session_idle_days", DEFAULT_IDLE_DAYS)
+
+
+def _is_expired(row, absolute_days: int, idle_days: int, now: float) -> bool:
+    """判断会话行是否已过期（两个维度任一命中）。
+
+    **失败关闭**：时间戳只要不是可用数值（NULL、字符串、NaN）就视为已过期。
+    SQLite 是动态类型，声明为 REAL 的列其实可以存进 TEXT；旧实现只判了 NULL，
+    遇到字符串会直接 `TypeError` 冒到 500 —— 那样每个带该 Cookie 的请求都 500，
+    而不是干脆当作未登录（用户重新登录即可自愈）。
+    """
+    created_at = _as_timestamp(row["created_at"])
+    last_seen = _as_timestamp(row["last_seen"])
+    if created_at is None or last_seen is None:
+        return True
+    if absolute_days and now - created_at >= absolute_days * DAY_SECONDS:
+        return True
+    if idle_days and now - last_seen >= idle_days * DAY_SECONDS:
+        return True
+    return False
+
+
+def _as_timestamp(value):
+    """把时间戳列转成 float；不可用时返回 None（调用方按"已过期"处理）。
+
+    接受 int/float 与"看起来像数字的字符串"（SQLite 动态类型可能存成 TEXT），
+    拒绝 NaN / inf —— 它们参与比较的结果不可预测。
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        candidate = float(value)
+    elif isinstance(value, (str, bytes)):
+        try:
+            candidate = float(value)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if candidate != candidate or candidate in (float("inf"), float("-inf")):
+        return None                                   # NaN / ±inf
+    return candidate
+
+
+def create_session(user_id: int) -> str:
     """为用户颁发新会话 token 并入库，返回 token（由调用方写入 Cookie）。"""
     token = secrets.token_urlsafe(32)
-    expires = time.time() + days * 86400
+    now = time.time()
     with connect() as conn:
         # 顺带清理已过期会话（低成本，不需要额外定时任务）
-        conn.execute("DELETE FROM session WHERE expires < ?", (time.time(),))
+        _delete_expired(conn, now)
         conn.execute(
-            "INSERT OR REPLACE INTO session (token, user_id, expires) VALUES (?, ?, ?)",
-            (token, user_id, expires)
+            "INSERT OR REPLACE INTO session "
+            "(token, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)",
+            (token, user_id, now, now)
         )
         conn.commit()
     return token
 
 
 def get_session_user(token: str):
-    """按 token 查会话所属用户 id；过期会话顺手删除并视为未登录。"""
+    """按 token 查会话所属用户 id；过期会话顺手删除并视为未登录。
+
+    有效访问会刷新 `last_seen`（滑动窗口）——这正是"常用设备不被踢"的来源。
+    """
+    if not token:
+        return None
+    absolute_days, idle_days = _session_limits()
+    now = time.time()
     with connect() as conn:
         row = conn.execute(
-            "SELECT user_id, expires FROM session WHERE token = ?", (token,)
+            "SELECT user_id, created_at, last_seen FROM session WHERE token = ?",
+            (token,)
         ).fetchone()
-    if not row:
-        return None
-    if row["expires"] < time.time():
-        delete_session(token)
-        return None
-    return row["user_id"]
+        if not row:
+            return None
+        if _is_expired(row, absolute_days, idle_days, now):
+            conn.execute("DELETE FROM session WHERE token = ?", (token,))
+            conn.commit()
+            return None
+        conn.execute("UPDATE session SET last_seen = ? WHERE token = ?", (now, token))
+        conn.commit()
+        return row["user_id"]
 
 
 def delete_session(token: str):
@@ -58,8 +142,30 @@ def delete_user_sessions(user_id: int):
         conn.commit()
 
 
+def _delete_expired(conn, now: float) -> int:
+    """在当前连接上删除已过期会话，返回删除行数。
+
+    判定条件与 `_is_expired()` 一一对应，避免"清理用一套、校验用另一套"
+    导致某些行永远清不掉。
+    """
+    absolute_days, idle_days = _session_limits()
+    clauses = []
+    params = []
+    if absolute_days:
+        clauses.append("created_at IS NULL OR ? - created_at >= ?")
+        params.extend([now, absolute_days * DAY_SECONDS])
+    if idle_days:
+        clauses.append("last_seen IS NULL OR ? - last_seen >= ?")
+        params.extend([now, idle_days * DAY_SECONDS])
+    if not clauses:
+        return 0                      # 两个维度都关了：没有"过期"可言
+    cursor = conn.execute(f"DELETE FROM session WHERE {' OR '.join(clauses)}", params)
+    return cursor.rowcount or 0
+
+
 def cleanup_expired_sessions():
-    """启动时清理全部过期会话。"""
+    """启动时清理全部过期会话（与 comment_rate 清理任务同一风格）。"""
     with connect() as conn:
-        conn.execute("DELETE FROM session WHERE expires < ?", (time.time(),))
+        removed = _delete_expired(conn, time.time())
         conn.commit()
+    return removed

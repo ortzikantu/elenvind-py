@@ -1,6 +1,7 @@
 """文章索引/正文缓存与自定义页面测试：缓存原子性、热更新、错误隔离、路径安全。"""
 import os
 import unittest
+from datetime import datetime, timezone
 
 from tests.support import ElenvindTestCase
 
@@ -9,6 +10,7 @@ from elenvind.features.blog.content import (
     ContentError,
     normalize_metadata,
     parse_document,
+    sort_key,
     validate_slug,
 )
 from elenvind.features.pages import logic as pages
@@ -65,6 +67,82 @@ class ContentFormatTests(unittest.TestCase):
             self.assertTrue(validate_slug(good), good)
         for bad in ("..", ".", "a/b", "a\\b", "a b", "", ".hidden", "a\x00b"):
             self.assertFalse(validate_slug(bad), bad)
+
+
+class DateSortKeyTests(unittest.TestCase):
+    """`sort_key` 必须对**混合日期写法**可比较。
+
+    回归：曾经直接返回 `datetime.fromisoformat(...)`，带偏移的返回 aware、
+    不带偏移的返回 naive，两者不能比较（TypeError）。而排序发生在
+    `load_articles` 的 per-file try/except **之外**，且 `load_articles` 是启动钩子
+    —— 一篇日期风格不同（或没写 date）的文章就能让整站起不来。
+    """
+
+    #: 各种合法与非法写法：重点是要能**混在一起排序**
+    CASES = (
+        ("2026-09-07T10:00:00+08:00", "aware 带偏移"),
+        ("2026-09-08T10:00:00", "naive 无偏移"),
+        ("2026-09-09", "只有日期"),
+        ("2026-09-06T00:00:00Z", "UTC Z 后缀"),
+        ("2026-09-05T00:00:00+00:00", "显式 UTC"),
+        ("2026-09-04T10:00:00-05:00", "负偏移"),
+    )
+
+    def _meta(self, raw, title="T"):
+        return normalize_metadata({"title": title, "date": raw}, slug="s",
+                                 require_header=True)
+
+    def test_all_keys_are_timezone_aware(self):
+        for raw, label in self.CASES:
+            with self.subTest(case=label):
+                key = sort_key(self._meta(raw))
+                self.assertIsNotNone(key.tzinfo,
+                                     f"{label} 的排序键仍是无时区的，会与其他键不可比")
+
+    def test_missing_date_is_aware_and_earliest(self):
+        for meta in ({"title": "no date"}, {"title": "bad", "date": "nope"},
+                     {"title": "empty", "date": ""}):
+            normalized = normalize_metadata(meta, slug="s", require_header=True)
+            key = sort_key(normalized)
+            self.assertIsNotNone(key.tzinfo, meta)
+            self.assertEqual(key, datetime.min.replace(tzinfo=timezone.utc))
+
+    def test_mixed_formats_sort_without_error(self):
+        """核心回归：混排不得抛 TypeError。"""
+        keys = [sort_key(self._meta(raw, f"T{i}"))
+                for i, (raw, _) in enumerate(self.CASES)]
+        keys.append(sort_key(normalize_metadata({"title": "nodate"}, slug="s",
+                                               require_header=True)))
+        keys.sort()                       # 不抛异常即通过
+        keys.sort(reverse=True)
+        self.assertEqual(len(keys), len(self.CASES) + 1)
+
+    def test_mixed_formats_via_real_index(self):
+        """走真实索引：混写日期的文章目录必须能加载。
+
+        这是本次缺陷的真实触发路径 —— `load_articles` 是启动钩子，
+        排序抛异常等于整站起不来。
+        """
+        case = ElenvindTestCase("runTest")
+        case.setUp()
+        try:
+            directory = case.articles_dir
+            for index, (raw, _) in enumerate(self.CASES):
+                (directory / f"{index}-post.md").write_text(
+                    f'+++\ntitle = "P{index}"\ndate = "{raw}"\n+++\n\nbody\n',
+                    encoding="utf-8")
+            # 再放一篇完全不写 date 的
+            (directory / "nodate.md").write_text(
+                '+++\ntitle = "NoDate"\n+++\n\nbody\n', encoding="utf-8")
+
+            blog._articles_cache = None
+            blog._body_cache.clear()
+            articles = blog.get_articles()      # 不抛异常才说明修好了
+            self.assertEqual(len(articles), len(self.CASES) + 1)
+            # 无日期的按"最早"处理，倒序时排在最后
+            self.assertEqual(articles[-1]["slug"], "nodate")
+        finally:
+            case.tearDown()
 
 
 class ArticleIndexTests(ElenvindTestCase):

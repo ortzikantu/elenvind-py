@@ -2,6 +2,12 @@
 {% block title %}{{ article.title }} - {{ site_title }}{% endblock %}
 
 {% block content %}
+  {# 评论被拒时的提示条：_article_error() 会把 message / message_kind 放进上下文
+     （限流命中、reply_to 非法、回复层级到顶等）。缺少这行渲染时，
+     用户提交后只会看到一个"什么都没变"的页面 —— 静默失败。
+     放在正文之前，保证不用滚动就能看见。 #}
+  {% include "partials/form_message.html" %}
+
   <article>
     <h2>{{ article.title }}</h2>
     <p class="article-meta">{{ t('article_published') }}:

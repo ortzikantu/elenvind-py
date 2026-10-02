@@ -13,7 +13,6 @@ from elenvind.core.markdown import (
     ALLOWED_TAGS,
     escape_raw_html_outside_code,
     render_markdown,
-    render_markdown_inline,
     sanitize_html,
 )
 
@@ -169,11 +168,11 @@ class MarkdownFeatureTests(unittest.TestCase):
         from markupsafe import Markup
         self.assertIsInstance(render_markdown("**x**"), Markup)
 
-    def test_inline_variant_escapes_and_sanitises(self):
-        out = str(render_markdown_inline("**bold**"))
-        self.assertIn("<strong>bold</strong>", out)
-        # 行内变体同样必须净化
-        self.assertNotIn("<script", str(render_markdown_inline("<script>alert(1)</script>")))
+    # 注意：这里原本还有一个 test_inline_variant_escapes_and_sanitises，
+    # 测的是 `render_markdown_inline()`。那个函数没有任何生产调用方
+    # （站点不渲染行内 Markdown：标题/摘要/描述都是纯文本），
+    # 属于"只有测试在用"的死代码 —— 已随 P3-2 一并删除。
+    # 保留一个死函数的唯一效果就是让覆盖率看起来更好。
 
     def test_deterministic_output(self):
         source = "# H\n\ntext **b** `c`\n\n| a |\n|---|\n| 1 |\n"

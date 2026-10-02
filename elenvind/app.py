@@ -18,7 +18,8 @@ from .features import registry
 def create_app() -> App:
     """构造应用：注册 Feature 路由、错误处理与启动钩子。"""
     handlers = registry.error_handlers()
-    app = App(not_found=handlers["not_found"], forbidden=handlers["forbidden"])
+    app = App(not_found=handlers["not_found"], forbidden=handlers["forbidden"],
+              server_error=handlers["server_error"])
     registry.install(app.router)
     registry.register_startup_hooks()
     return app

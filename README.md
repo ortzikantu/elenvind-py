@@ -138,28 +138,76 @@ Feature 里**不写** CSRF、不拼 Cookie、不加安全头、不检查请求�
 | Database | SQLite (WAL, `PRAGMA foreign_keys=ON`, `user_version` migrations) |
 | Content | Markdown body + TOML front matter (`+++` fence), rendered by `core.markdown` |
 | Markup safety | Whitelist HTML sanitiser in `core.markdown` (stdlib `html.parser`) |
-| Sessions | Server-side random tokens in SQLite (not JWT) |
+| Sessions | Server-side random tokens in SQLite (not JWT), with absolute + idle expiry |
 | Passwords | `hashlib.scrypt`, self-describing hashes, transparent rehash on login |
 | CSRF | Double-submit cookie, enforced in one dispatcher gate |
 | AuthZ | Declarative `auth="required"` / `permission="admin"` on the route |
 | Cache | In-process file-snapshot caches for articles and custom pages |
+| Security headers | Injected by Core on every response (including 404/500) — features never set them |
+
+### Security response headers
+
+Core appends these on the way out, so a feature just returns a `Response` and the
+headers are there. Nothing to remember, nothing to duplicate.
+
+| Header | Default |
+|---|---|
+| `Content-Security-Policy` | `default-src 'self'; script-src 'none'; style-src 'self' 'unsafe-inline'; …` |
+| `X-Content-Type-Options` | `nosniff` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `Permissions-Policy` | camera/microphone/geolocation/payment/usb/… all `()` |
+| `Strict-Transport-Security` | only when **configured on** *and* the request is HTTPS |
+
+CSP and HSTS live in `config.toml` under `[security]` — turn them off or adjust any
+directive. HSTS is **off by default**; enabling it takes both `hsts_enabled = true`
+and an actual HTTPS request (a stale HSTS header on a site that still serves plain
+HTTP locks visitors out).
+
+The CSP is strict where it counts and honest about where it can't be: the site is
+Zero-JS, so `script-src 'none'` applies, and the templates contain **no inline
+`<script>`, no inline event handlers and no `<style>` blocks** — there is a test that
+walks the rendered pages and fails if anyone reintroduces one.
+
+`style-src` does keep `'unsafe-inline'`, and that is deliberate rather than lazy: CSP's
+`style-src` governs `style=` **attributes** as well as `<style>` elements, and the
+home-page hero background is an inline `style="background-image:url(…)"`. Dropping
+`'unsafe-inline'` makes the hero image silently vanish and floods the console with
+`style-src-elem` errors. (A hash or nonce won't help — those apply to `<style>`
+elements; `style=` attributes would need `'unsafe-hashes'`.) The injection risk is
+closed at the config layer instead: `[static].hero` must pass a character whitelist
+(no quotes, parens, backslashes or whitespace) and a scheme whitelist (http(s) or a
+site-relative path only). To remove `'unsafe-inline'` entirely you'd first have to
+reimplement the hero without an inline style. See
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#security-安全响应头).
+
+See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#security-安全响应头) for the full
+key table. One footgun worth repeating: `[security]` must sit at the **end** of
+`config.toml`, because a TOML table swallows every top-level key written after it.
+A test guards the shipped configs against exactly that mistake.
 
 ## Any Tips
 
-No environment variables. No signing key. No secret to generate and paste into a
-systemd unit at 3am. Just:
+No secrets to manage. No signing key. Nothing to generate and paste into a systemd
+unit at 3am. Just:
 
 ```bash
 python run.py
 ```
 
-Why it works without one: sessions are **server-side random tokens** in SQLite (the
-client only ever holds an unguessable opaque value), CSRF is a **double-submit cookie**
-(the token itself is the random value), and passwords are **self-describing scrypt
-hashes**. Nothing here derives anything from a shared secret, so requiring one would
-have been pure ceremony.
+There is exactly **one** optional environment variable, `ELENVIND_DB` (override the
+SQLite file path, e.g. to isolate staging from production). You never *need* it.
+Everything else lives in `config.toml`.
 
-HTTPS? Cookies get `Secure` automatically — as long as your reverse proxy speaks `X-Forwarded-Proto`. Behind Nginx, just follow the example config and you're done. No code edits required.
+Why it works without a secret: sessions are **server-side random tokens** in SQLite
+(the client only ever holds an unguessable opaque value), CSRF is a **double-submit
+cookie** (the token itself is the random value), and passwords are **self-describing
+scrypt hashes**. Nothing here derives anything from a shared secret, so requiring one
+would have been pure ceremony.
+
+HTTPS? Cookies get `Secure` automatically — as long as your reverse proxy speaks
+`X-Forwarded-Proto`, and its address is listed in `[server].trusted_proxies`. Behind
+Nginx, just follow the example config and you're done. No code edits required.
+
 ```bash
 sudo cp docs/nginx.conf.example /etc/nginx/sites-available/elenvind
 ```

@@ -446,9 +446,11 @@ class ConfigBehaviorTests(ElenvindTestCase):
 
                     session = self.app.set_cookie_value(login, expected_name)
                     self.assertTrue(session)
-                    # 读取：用写入时的名字能取回同一会话
+                    # 读取：用写入时的名字能取回同一会话。
+                    # 邮箱在写入侧被规范化成小写（见 db_user.create_user），
+                    # 所以这里期望小写形式。
                     page = self.app.request("GET", "/user", cookies={expected_name: session})
-                    self.assertIn(f"cp{enabled}@example.com", page.text)
+                    self.assertIn(f"cp{str(enabled).lower()}@example.com", page.text)
 
                     # 删除：清理头覆盖同一个名字，且立即过期
                     csrf = self.fetch_csrf()

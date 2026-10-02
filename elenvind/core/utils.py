@@ -64,12 +64,6 @@ def _trusted_proxies() -> tuple:
     return resolved
 
 
-def truncate(text, length=100, suffix="..."):
-    """将文本截断至指定长度，超出部分追加后缀"""
-    text = str(text)
-    if len(text) <= length:
-        return text
-    return text[:length] + suffix
 
 def format_datetime(value):
     """

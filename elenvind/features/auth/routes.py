@@ -16,14 +16,13 @@ from ...core.config import config
 from ...core.context import current_lang
 from ...core.db_register import try_register_attempt
 from ...core.db_user import create_user, get_user_by_email
-from ...core.http import html, redirect
+from ...core.http import html, redirect, safe_next_path
 from ...core.i18n import t
 from ...core.security import (
     EMAIL_MAX,
     NICKNAME_MAX,
     PASSWORD_MAX,
     PASSWORD_MIN,
-    SESSION_COOKIE,
     dummy_verify,
     hash_password,
 )
@@ -83,8 +82,14 @@ def _message(lang, key):
     return t(lang, key)
 
 
-def register(router, *, render_forbidden=None):
-    """把认证路由装到 router 上。"""
+def register(router):
+    """把认证路由装到 router 上。
+
+    曾经这里收 `render_forbidden=` 参数，但它**从未被使用**：
+    认证闸门的 403 是 Core 的 `router.dispatch(forbidden=...)` 处理的，
+    Feature 只需要声明 `auth=` / `permission=`。一个收下却永远不用的参数
+    会让读者以为"权限被拒时会走这里"，从而在错误的地方排查问题。
+    """
     @router.route("/login", methods=["GET", "POST"])
     def login(request):
         lang = current_lang()
@@ -135,10 +140,11 @@ def register(router, *, render_forbidden=None):
 
     @router.route("/logout", methods=["POST"], auth="required")
     def logout(request):
+        # 只调 Core：它负责删服务端会话**并**让浏览器 Cookie 立即过期。
+        # Feature 不 delete_cookie、不 import SESSION_COOKIE（否则既知道 Cookie
+        # 名字、又得自己处理 __Host- 前缀，两套策略迟早漂移）。
         logout_user(request)
-        response = redirect("/")
-        response.delete_cookie(SESSION_COOKIE)
-        return response
+        return redirect("/")
 
     return router
 
@@ -146,17 +152,17 @@ def register(router, *, render_forbidden=None):
 def safe_next(raw) -> str:
     """把回跳地址规范化成**站内路径**；不合法一律返回空串。
 
-    拒绝：非字符串、不以内 `/` 开头、协议相对（`//host`）、含 CR/LF、
-    反斜杠（浏览器会把它当斜杠，可能变成协议相对 URL）。
+    实现收敛到 Core 的 `core.http.safe_next_path`（全项目唯一一处）。
+    **不要**在 Feature 里再写一份：历史上存在四份严格程度不同的实现，
+    其中 `/theme` 那份不拒绝反斜杠，而四份都只拒绝 CR/LF、**都不拒绝 TAB**，
+    于是 `/\t/evil.com` 经浏览器解析（URL 标准会先剥离 TAB）变成
+    `//evil.com` —— 登录后跨站跳转。
     """
     if not isinstance(raw, str) or not raw:
         return ""
-    value = raw.strip()
-    if not value.startswith("/") or value.startswith("//"):
-        return ""
-    if "\\" in value or "\r" in value or "\n" in value:
-        return ""
-    return value
+    value = safe_next_path(raw, default="")
+    # Core 用 "/" 表示"回退到首页"；本函数的契约是用空串表示"没有合法目标"
+    return "" if (value == "/" and raw.strip() != "/") else value
 
 
 def _try_login(request, email, password, lang):

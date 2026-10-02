@@ -25,6 +25,15 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
+class MigrationError(RuntimeError):
+    """迁移无法安全继续（例如上次迁移留下的半成品备份表）。
+
+    启动阶段抛出它会中止进程（lifespan 启动失败），这是刻意的：
+    宁可拒绝启动让你去看一眼数据库，也不要静默把数据搁置在 `*_legacy` 表里。
+    """
+
+
 # 默认数据库位于项目根目录；可用 ELENVIND_DB 环境变量覆盖（部署隔离 / 自动化测试用）
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent / "sqlite.db"
 DB_PATH = Path(os.environ.get("ELENVIND_DB", str(DEFAULT_DB_PATH)))
@@ -54,7 +63,7 @@ def apply_db_path():
 
 
 # schema 版本：每次结构变更 +1，并在 _MIGRATIONS 登记迁移函数
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 # 连接级 PRAGMA：每个连接都必须设置（SQLite 没有全局开关）
 _BUSY_TIMEOUT_MS = 5000
@@ -113,12 +122,16 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     # 会话表：登录颁发随机 token 存入，注销/过期即删（服务端会话，无 JWT）
-    # 删号若走物理删除，会话随外键级联清理，不留悬空 token
+    # - created_at：创建时刻，用于**绝对过期**（活多久都必须重新登录）
+    # - last_seen ：最近活跃时刻，用于**滑动过期**（闲置太久即失效）
+    # 两个阈值都在 config.toml 里配置（0 = 该维度不过期）。
+    # 删号若走物理删除，会话随外键级联清理，不留悬空 token。
     """
     CREATE TABLE IF NOT EXISTS session (
         token TEXT PRIMARY KEY,
         user_id INTEGER NOT NULL,
-        expires REAL NOT NULL,
+        created_at REAL NOT NULL,
+        last_seen REAL NOT NULL,
         FOREIGN KEY(user_id) REFERENCES user(id) ON DELETE CASCADE
     )
     """,
@@ -172,6 +185,9 @@ _SCHEMA_STATEMENTS = (
     """,
     # 文章页评论按文章聚合读取，给 (article_slug) 建索引
     "CREATE INDEX IF NOT EXISTS idx_comment_article ON comment(article_slug)",
+    # 会话按用户删除（每次登录的轮换都会跑），必须走索引而不是全表扫描。
+    # 放在 _SCHEMA_STATEMENTS 里，新建库直接就有；已有库由 v4 迁移补上。
+    "CREATE INDEX IF NOT EXISTS idx_session_user ON session(user_id)",
 )
 
 
@@ -250,23 +266,163 @@ def _migrate_to_2(conn):
     _repair_orphan_comments(conn)
 
 
+#: 迁移旧 session 表时用的历史会话时长（天）。
+#: 旧实现写死 7 天（`expires = 创建时刻 + 7 天`）。v3 需要把 `expires`
+#: 反推回创建时刻，所以必须用**当时的**数值，而不是现在的配置值——
+#: 否则会凭空延长或缩短已有会话的绝对寿命。
+_LEGACY_SESSION_DAYS = 7
+
+
+def _migrate_to_3(conn):
+    """v3：session 表由单个 `expires` 改为 created_at + last_seen。
+
+    绝对过期与滑动过期需要两个不同时间戳，单个 `expires` 表达不了。
+    旧行按"最保守"方式回填（不会延长任何已有会话的寿命）：
+
+        created_at = expires - 7 天     （等价于保留原来的绝对到期时刻）
+        last_seen  = created_at         （旧实现里只要被读取就会续期，
+                                          但无从得知真实活跃时刻，
+                                          因此按"从未活跃"处理）
+
+    即：老会话要么在原 expires 到期，要么在滑动窗口到期，取先到者——
+    绝不比迁移前活得更久。
+
+    幂等：表里已有 created_at 时只做一次兜底回填。
+    """
+    sql = _table_sql(conn, "session") or ""
+    if "created_at" not in sql or "last_seen" not in sql:
+        logger.info("Migrating schema to v3: rebuilding session table")
+        conn.execute("ALTER TABLE session RENAME TO session_legacy")
+        conn.execute("""
+            CREATE TABLE session (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                last_seen REAL NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES user(id) ON DELETE CASCADE
+            )
+        """)
+        if "expires" in (sql or ""):
+            legacy_span = _LEGACY_SESSION_DAYS * 86400
+            conn.execute("""
+                INSERT INTO session (token, user_id, created_at, last_seen)
+                SELECT token, user_id,
+                       expires - ?,
+                       expires - ?
+                FROM session_legacy
+            """, (legacy_span, legacy_span))
+        else:
+            # 结构未知时宁可丢弃会话（让用户重新登录），也不要留下无时间戳的行
+            logger.warning("Legacy session table has no expires column; "
+                           "dropping %s session rows", _table_row_count(conn,
+                                                                        "session_legacy"))
+        conn.execute("DROP TABLE session_legacy")
+    else:
+        # 已是目标结构：补齐历史迁移可能留下的 NULL/非法值
+        conn.execute("UPDATE session SET last_seen = created_at "
+                     "WHERE last_seen IS NULL OR last_seen < created_at")
+
+
+def _table_row_count(conn, table: str) -> int:
+    try:
+        return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    except Exception:                                  # noqa: BLE001
+        return 0
+
+
+def _migrate_to_4(conn):
+    """v4：补齐会话索引，并让邮箱查询能走索引。
+
+    两个性能问题（都是全表扫描，而其中一条每次登录都跑）：
+
+    1. `session.user_id` 没有索引 —— `delete_user_sessions()` 是
+       `DELETE FROM session WHERE user_id = ?`，每次登录轮换都会全表扫描。
+
+    2. `user.email` 的隐式 UNIQUE 索引是 **BINARY** 排序规则，而查询写的是
+       `WHERE email = ? COLLATE NOCASE` —— 排序规则不匹配，索引用不上，
+       于是**每次登录/注册/改邮箱都全表扫描 user 表**。
+       修法是让数据本身就规范化：写入侧（`normalize_email`）一直转小写，
+       迁移这里把历史遗留的大写邮箱也转小写，之后查询用 BINARY 比较即可命中索引。
+
+    幂等：索引用 IF NOT EXISTS；邮箱只有当真的存在非小写行时才更新。
+    """
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_user ON session(user_id)")
+
+    # GLOB 是大小写敏感的，因此这条能精确找出"含非小写字符"的邮箱。
+    # 加 ASCII 范围判断是防御性的：normalize_email 只保证 strip+lower，
+    # 不会把非 ASCII 大写字母降为小写（Python 的 lower() 其实会，
+    # 但库里若有异常数据，宁可跳过也不要用 SQL 的 lower() 悄悄改坏它）。
+    uppercase = conn.execute(
+        "SELECT COUNT(*) FROM user "
+        "WHERE email GLOB '*[A-Z]*' AND email NOT GLOB '*[^ -~]*'"
+    ).fetchone()[0]
+    if uppercase:
+        logger.info("Migrating schema to v4: normalizing %s email(s) to lowercase",
+                    uppercase)
+        conn.execute(
+            "UPDATE user SET email = lower(email) "
+            "WHERE email GLOB '*[A-Z]*' AND email NOT GLOB '*[^ -~]*'")
+    else:
+        logger.info("Migrating schema to v4: emails already normalized")
+
+
 _MIGRATIONS = {
     2: _migrate_to_2,
+    3: _migrate_to_3,
+    4: _migrate_to_4,
 }
 
 
+def _leftover_rebuild_tables(conn):
+    """列出上次迁移失败留下的 `*_legacy` 备份表。
+
+    这些表的存在意味着某个表重建（RENAME -> CREATE -> INSERT..SELECT -> DROP）
+    只做了一半。绝不能当作"已迁移"继续往下走——那会把备份表里仅存的
+    数据永久搁置（目标表是空的，而 user_version 会被写成最新版）。
+    """
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%\\_legacy' "
+        "ESCAPE '\\'").fetchall()
+    return sorted(row[0] for row in rows)
+
+
 def _run_migrations(conn):
-    """在给定连接上执行缺失的迁移（调用方负责事务与关闭）。"""
+    """在给定连接上执行缺失的迁移（调用方负责关闭）。
+
+    **显式开启事务**是必须的：CPython 的 sqlite3 只为 INSERT/UPDATE/DELETE/REPLACE
+    开隐式事务，**DDL 与 PRAGMA 不会**。表重建里的 `ALTER TABLE ... RENAME` 与
+    `CREATE TABLE` 都属于 DDL，所以不开显式事务时它们会被立即提交——
+    一旦后续步骤失败/进程被杀，就会留下"备份表有数据、目标表为空"的半迁移态，
+    而迁移逻辑靠子串匹配判断"已迁移"，会把这个状态误认为成功。
+
+    先做一次残留检查：发现 `*_legacy` 就抛错拒绝启动，
+    由运维决定是恢复备份还是丢弃（绝不静默继续）。
+    """
+    leftovers = _leftover_rebuild_tables(conn)
+    if leftovers:
+        raise MigrationError(
+            "检测到上次迁移未完成，以下备份表仍存在：" + ", ".join(leftovers)
+            + "。请先用 sqlite3 检查并恢复数据（备份表里通常还有完整数据），"
+              "确认后再手工删除这些表重启。为避免数据丢失，迁移已中止。")
+
     version = _read_version(conn)
     if version >= SCHEMA_VERSION:
         return version
-    for target in range(version + 1, SCHEMA_VERSION + 1):
-        migration = _MIGRATIONS.get(target)
-        if migration is None:
-            continue
-        migration(conn)
-        _write_version(conn, target)
-        logger.info("Database migrated to schema version %s", target)
+
+    conn.execute("BEGIN IMMEDIATE")           # 让后续 DDL 也进入同一事务
+    try:
+        for target in range(version + 1, SCHEMA_VERSION + 1):
+            migration = _MIGRATIONS.get(target)
+            if migration is None:
+                continue
+            migration(conn)
+            _write_version(conn, target)
+            logger.info("Database migrated to schema version %s", target)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.exception("Migration failed; schema rolled back to version %s", version)
+        raise
     return _read_version(conn)
 
 
@@ -280,9 +436,19 @@ def migrate():
 
 
 def init_db():
-    """启动时调用：幂等地创建全部表与索引，然后执行 schema 迁移。"""
+    """启动时调用：幂等地创建全部表与索引，然后执行 schema 迁移。
+
+    注意顺序：先 `_create_schema`（`CREATE TABLE IF NOT EXISTS`）再迁移。
+    对**全新**数据库这是对的；对已有库，`_create_schema` 不会改已有表，
+    而残留检查会拦住半迁移态，因此不会出现"空表被误认为已迁移"。
+    """
     apply_db_path()
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
+        leftovers = _leftover_rebuild_tables(conn)
+        if leftovers:
+            raise MigrationError(
+                "检测到上次迁移未完成，备份表仍存在：" + ", ".join(leftovers)
+                + "。请先恢复数据再启动（详见 _run_migrations 的说明）。")
         _create_schema(conn)
     migrate()

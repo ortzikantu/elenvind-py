@@ -9,9 +9,17 @@
 - 配置错误在启动时一次性暴露（validate_config 抛 ConfigError，服务拒绝启动），
   而不是运行到某个页面才 500。
 """
+import re
 import tomllib
 from pathlib import Path
 from urllib.parse import urlparse
+
+#: 控制字符（含 CR/LF）：任何进入响应头的配置值都不允许包含，
+#: 否则可以伪造出额外的响应头。
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+#: CSP 指令名必须是合法 token（RFC 7230）：小写字母、数字与连字符。
+_CSP_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
 # 项目根目录：elenvind/core/config.py -> 上溯三级（core -> elenvind -> 项目根）
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -142,7 +150,9 @@ def validate_config(cfg=None):
     _check_int(cfg.get("max_comment_depth", 32), "max_comment_depth", 1, 10000)
     _check_int(cfg.get("max_comments_per_article", 1000), "max_comments_per_article", 1, 1000000)
 
-    # 管理员：必须是正整数；缺失即"无管理员"（不静默回退到 id=1）
+    # 管理员：必须是正整数。键缺失时默认 1（最早的账号）；显式 null 表示
+    # "没有管理员"；其它非法值一律拒绝启动，避免"以为关掉了管理入口、
+    # 其实配置没生效"这类静默失败。
     admin_user_id = cfg.get("admin_user_id", 1)
     if admin_user_id is not None:
         _check_int(admin_user_id, "admin_user_id", 1, 2 ** 31 - 1)
@@ -171,9 +181,56 @@ def validate_config(cfg=None):
     _require(isinstance(server.get("cookie_prefix", False), bool),
              "server.cookie_prefix must be a boolean")
 
+    # ----- 安全响应头（Core 统一注入，见 core/security.build_security_headers） -----
+    security = cfg.get("security", {}) or {}
+    _require(isinstance(security, dict), "security must be a table")
+    for key in ("csp_enabled", "hsts_enabled", "hsts_include_subdomains"):
+        value = security.get(key)
+        _require(value is None or isinstance(value, bool),
+                 f"security.{key} must be a boolean")
+    hsts_max_age = security.get("hsts_max_age", 31536000)
+    _require(isinstance(hsts_max_age, int) and not isinstance(hsts_max_age, bool),
+             "security.hsts_max_age must be an integer (seconds)")
+    _require(0 <= hsts_max_age <= 63072000,
+             "security.hsts_max_age must be between 0 and 63072000 (2 years)")
+
+    policy = security.get("permissions_policy")
+    _require(policy is None or isinstance(policy, str),
+             "security.permissions_policy must be a string")
+    _require(not isinstance(policy, str) or _CONTROL_RE.search(policy) is None,
+             "security.permissions_policy must not contain control characters")
+
+    csp = security.get("csp", {}) or {}
+    _require(isinstance(csp, dict), "security.csp must be a table of directives")
+    for name, value in csp.items():
+        _require(isinstance(name, str) and name.strip() != "",
+                 "security.csp directive names must be non-empty strings")
+        # 指令名必须是合法 token：否则可能拼出畸形头（甚至注入换行）
+        _require(_CSP_NAME_RE.match(name) is not None,
+                 f"security.csp.{name} is not a valid directive name")
+        if value is None or value is False:
+            continue                        # 显式关闭该指令
+        if isinstance(value, str):
+            # 字符串形式按空白切分：既接受 "a b" 也接受单个值
+            _require(_CONTROL_RE.search(value) is None,
+                     f"security.csp.{name} must not contain control characters")
+            continue
+        _require(isinstance(value, list)
+                 and all(isinstance(item, str) for item in value),
+                 f"security.csp.{name} must be a list of strings or a string")
+        for item in value:
+            _require(_CONTROL_RE.search(item) is None,
+                     f"security.csp.{name} values must not contain control characters")
+
     # ----- 数据库与请求体 -----
     _require(isinstance(cfg.get("database", "sqlite.db"), str), "database must be a string path")
     _check_int(cfg.get("max_body_size", 1024 * 1024), "max_body_size", 1024, 64 * 1024 * 1024)
+
+    # ----- 会话过期（天数；0 = 该维度不过期） -----
+    # 绝对过期是 token 泄露后的风险窗口硬上限，所以上限给到 10 年也基本等价于"不过期"；
+    # 真正的"不过期"请显式写 0，这样意图清楚（并会在文档里看到风险提示）。
+    _check_int(cfg.get("session_absolute_days", 30), "session_absolute_days", 0, 3650)
+    _check_int(cfg.get("session_idle_days", 15), "session_idle_days", 0, 3650)
 
     # ----- 内容目录与模板目录 -----
     # 全部走同一套校验：非空路径 + 存在时必须是目录。

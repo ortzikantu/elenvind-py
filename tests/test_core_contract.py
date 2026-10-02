@@ -19,6 +19,7 @@ from urllib.parse import quote
 from tests.support import PROJECT_ROOT, ElenvindTestCase
 
 from elenvind.app import app
+from elenvind.core.context import build_render_context
 
 FEATURES_DIR = PROJECT_ROOT / "elenvind" / "features"
 CORE_DIR = PROJECT_ROOT / "elenvind" / "core"
@@ -214,17 +215,101 @@ class DeclarativeSecurityTests(ElenvindTestCase):
                           lang="en")
         return request
 
+    #: 闸门保护的方法（与 core.csrf.PROTECTED_METHODS 一致）
+    PROTECTED_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+    def _declared_protected(self):
+        return {method for route in app.router.routes for method in route.methods} \
+            & set(self.PROTECTED_METHODS)
+
     def test_every_declared_route_reaches_the_gate(self):
-        """所有 POST 路由都必须经过 CSRF 闸门（无 token -> 400）。"""
-        post_routes = [r for r in app.router.routes if "POST" in r.methods]
-        self.assertTrue(post_routes, "no POST routes found")
-        for route in post_routes:
-            path = (route.path.replace("<slug>", "post")
-                    .replace("<comment_id>", "1"))
-            with self.subTest(path=path):
-                response = self.app.request("POST", path, form={})
-                self.assertEqual(response.status, 400,
-                                 f"{path} did not enforce CSRF: {response.status}")
+        """所有非安全方法的**声明路由**都必须经过 CSRF 闸门（无 token -> 400）。
+
+        回归：这条测试以前只遍历 `"POST" in r.methods` 的路由。而 CSRF 闸门
+        保护的是 `PROTECTED_METHODS = {POST, PUT, PATCH, DELETE}` ——
+        PUT / PATCH / DELETE 这三条分支完全没有测试覆盖：有人把
+        `requires_protection()` 改成只认 POST，测试依然全绿。
+
+        本测试只遍历**实际声明了**的方法（生产路由目前全是 POST），
+        尚未被任何路由使用的分支由下面两条测试直接覆盖判定函数。
+        """
+        declared = self._declared_protected()
+        self.assertTrue(declared, "没有找到任何受保护方法的路由")
+
+        checked = 0
+        for route in app.router.routes:
+            for method in sorted(set(route.methods) & set(self.PROTECTED_METHODS)):
+                path = (route.path.replace("<slug>", "post")
+                        .replace("<comment_id>", "1"))
+                with self.subTest(method=method, path=path):
+                    response = self.app.request(method, path, form={})
+                    self.assertEqual(
+                        response.status, 400,
+                        f"{method} {path} did not enforce CSRF: {response.status}")
+                    checked += 1
+        self.assertGreaterEqual(checked, 1, "受保护方法的用例数为 0")
+
+    def test_requires_protection_covers_all_unsafe_methods(self):
+        """闸门判定表本身：四种非安全方法都必须为真，安全方法必须为假。
+
+        这条才是 PUT / PATCH / DELETE 分支的真正守卫 ——
+        生产路由目前没有声明它们，所以走不到 HTTP 层。
+        """
+        from elenvind.core.csrf import requires_protection
+
+        for method in ("POST", "PUT", "PATCH", "DELETE",
+                       "post", "put", "patch", "delete"):
+            with self.subTest(method=method):
+                self.assertTrue(requires_protection(method),
+                                f"{method} 没有被 CSRF 闸门保护")
+        for method in ("GET", "HEAD", "OPTIONS", "get", "head", ""):
+            with self.subTest(method=method):
+                self.assertFalse(requires_protection(method),
+                                 f"{method} 不该被 CSRF 闸门保护")
+
+    def test_route_declaration_rejects_a_protected_method_somewhere(self):
+        """记录当前事实：生产路由只用了 POST。
+
+        这不是缺陷（站点只有表单 POST），但如果将来有人加了 PUT/PATCH/DELETE
+        路由，`test_every_declared_route_reaches_the_gate` 会自动把它纳入覆盖。
+        这里显式断言，避免"以为已经覆盖了四种方法"。
+        """
+        declared = self._declared_protected()
+        self.assertEqual(declared, {"POST"},
+                         f"路由声明里出现了新的受保护方法 {sorted(declared)}；"
+                         "请确认 CSRF 闸门对它们生效（上面的测试已自动覆盖）")
+
+    def test_unused_protected_method_on_an_existing_path_is_405(self):
+        """已声明路径上用未声明的方法 -> 405（而不是 400/500）。
+
+        这条同时说明"405 早于 CSRF 闸门"：路由匹配先失败，闸门根本没跑。
+        """
+        for method in ("PUT", "PATCH", "DELETE"):
+            with self.subTest(method=method):
+                response = self.app.request(method, "/logout", form={})
+                self.assertEqual(response.status, 405, response.status)
+                self.assertIsNotNone(response.header("allow"))
+
+    def test_csrf_gate_runs_before_auth_gate(self):
+        """CSRF 判定必须在认证判定**之前**。
+
+        否则"未登录 + 无 CSRF"会先跳登录页，攻击者可以据此探测
+        "哪些路径存在且需要认证"。用真实存在的 POST 路由 `/logout`
+        （声明了 `auth="required"`）来验证：无 token 时必须 400，而不是 302。
+        """
+        response = self.app.request("POST", "/logout", form={})
+        self.assertEqual(response.status, 400,
+                         "未登录 + 无 CSRF 时应先被 CSRF 闸门拦下（400），"
+                         f"而不是 {response.status}")
+        self.assertNotEqual(response.status, 302)
+
+    def test_valid_token_reaches_the_auth_gate_on_a_post_route(self):
+        """反向确认：带合法 token 时不再因 CSRF 被拒（会因未登录走认证闸门）。"""
+        csrf = self.fetch_csrf()
+        response = self.app.request("POST", "/logout", form={"csrf_token": csrf},
+                                    cookies={self.csrf_cookie_name(): csrf})
+        self.assertNotEqual(response.status, 400, response.text[:200])
+        self.assertNotIn("Invalid CSRF token", response.text)
 
 
 class NoDuplicateSecurityTests(unittest.TestCase):
@@ -261,6 +346,188 @@ class NoDuplicateSecurityTests(unittest.TestCase):
         "scrypt": "密码哈希必须走 core.security",
         "compare_digest": "常量时间比对必须走 core.csrf",
     }
+
+    #: Feature 里**不得出现的 Response Cookie 方法**。
+    #:
+    #: 回归：契约写着"Feature 不拼 Cookie"，但守卫只禁了**定义** helper，
+    #: 于是 4 处 Feature 直接调用 `response.set_cookie(...)` /
+    #: `response.delete_cookie(SESSION_COOKIE)` 完全合法地绕过了它 ——
+    #: Feature 既知道了 Cookie 名字，又得自己处理 `__Host-` 前缀策略。
+    #: 正确做法：会话走 `request.invalidate_session_cookie()`，
+    #: 偏好走 `request.set_preference()`，由 Core 统一下发。
+    FORBIDDEN_COOKIE_METHODS = {
+        "set_cookie": "Feature 不得自己写 Cookie；偏好请用 request.set_preference()",
+        "delete_cookie": "Feature 不得自己删 Cookie；会话请用 request.invalidate_session_cookie()",
+    }
+
+    def test_features_do_not_set_or_delete_cookies(self):
+        """Feature 不得触碰 Response 的 Cookie API。"""
+        offenders = []
+        for path, source in _feature_sources():
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not isinstance(func, ast.Attribute):
+                    continue
+                reason = self.FORBIDDEN_COOKIE_METHODS.get(func.attr)
+                if reason:
+                    offenders.append(
+                        f"{path.name}:{node.lineno}: .{func.attr}() -> {reason}")
+        self.assertEqual(offenders, [],
+                         "Feature 在操作 Cookie：\n" + "\n".join(offenders))
+
+    def test_features_do_not_import_session_cookie_constant(self):
+        """Feature 不得 import 会话 Cookie 名（说明它想自己操作那个 Cookie）。"""
+        offenders = []
+        for path, source in _feature_sources():
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                for alias in node.names:
+                    if alias.name in ("SESSION_COOKIE", "CSRF_COOKIE"):
+                        offenders.append(f"{path.name}:{node.lineno}: {alias.name}")
+        self.assertEqual(offenders, [],
+                         "Feature import 了 Core 的 Cookie 常量：\n"
+                         + "\n".join(offenders))
+
+    def test_footer_copyright_falls_back_to_site_title(self):
+        """版权署名缺省时必须回落到站点名，而不是字面量 "title" 或 "None"。
+
+        回归：旧代码是 `config.get("copyright", "title")` ——
+        那个 `"title"` 是字面量字符串（不是"取 title 键"），键缺失时页脚显示
+        `© 2026 title`；键存在但为 None 时 `.get` 返回 None，显示 `© 2026 None`。
+        项目自带的 config.toml 恰好设了 copyright，所以一直没被发现。
+
+        传入 `{"user_count": 0}` 是为了跳过 `get_user_number()` 的数据库查询 ——
+        本类不带 ElenvindTestCase 夹具（它只做源码级静态检查）。
+        """
+        from elenvind.core.config import config as live_config
+
+        saved_copyright = live_config.get("copyright", None)
+        saved_title = live_config.get("title", None)
+        had_copyright = "copyright" in live_config
+
+        def render():
+            return build_render_context({"user_count": 0})
+
+        try:
+            for value, expected in ((None, "Test Site"), ("", "Test Site"),
+                                    ("   ", "Test Site"),
+                                    ("Alice", "Alice"),
+                                    ("  Alice  ", "  Alice  ")):
+                with self.subTest(value=value):
+                    live_config["copyright"] = value
+                    live_config["title"] = "Test Site"
+                    self.assertEqual(render()["copyright_name"], expected)
+
+            # 连 title 也没有时才回落到 "Elenvind"
+            live_config["copyright"] = None
+            live_config["title"] = None
+            self.assertEqual(render()["copyright_name"], "Elenvind")
+        finally:
+            if had_copyright:
+                live_config["copyright"] = saved_copyright
+            else:
+                live_config.pop("copyright", None)
+            live_config["title"] = saved_title
+
+    def test_illegal_auth_declarations_raise_at_registration(self):
+        """非法的 `auth=` / `permission=` 取值必须在**注册时**就报错。
+
+        这是 P1-1 的核心回归：旧实现把 `auth` 只与 `{"authenticated",
+        "required"}` 比对，`auth="admin"` / `auth="owner"` / `auth=True`
+        这类写错的值会让闸门**整体跳过** —— 匿名即可执行（失效开放）。
+        拼错一个档位就静默公开端点，所以现在宁可注册时报错。
+
+        ⚠️ 这道校验是注册期的**唯一**防线（不像 `safe_next` 有多层兜底），
+        所以必须直接测 `_validate_declaration` 本身：只在 HTTP 层断言
+        "非法 auth 被拒"会被"路由根本没注册上"掩盖。
+        """
+        from elenvind.core.routing import Route
+
+        def handler(request):
+            return None
+
+        illegal_auth = ("owner", "true", "True", "Authentication",
+                        "amin", "required ", " public", "ADMIN", True, False,
+                        1, 0, [], {}, "authenticated ")
+        for value in illegal_auth:
+            with self.subTest(auth=value):
+                with self.assertRaises(ValueError, msg=f"auth={value!r} 未被拒绝"):
+                    Route("/x", ["GET"], handler, auth=value)
+
+        # `admin` 是**合法**取值（与 permission="admin" 等价）
+        legal_auth = (None, "", "public", "authenticated", "required", "admin")
+        for value in legal_auth:
+            with self.subTest(auth=value):
+                Route("/x", ["GET"], handler, auth=value)   # 不得抛异常
+
+    def test_illegal_permission_declarations_raise_at_registration(self):
+        from elenvind.core.routing import Route
+
+        def handler(request):
+            return None
+
+        illegal_permission = ("owner", "true", "ADMIN", " admin", True, 1,
+                              [], {}, "admin ")
+        for value in illegal_permission:
+            with self.subTest(permission=value):
+                with self.assertRaises(ValueError,
+                                       msg=f"permission={value!r} 未被拒绝"):
+                    Route("/x", ["GET"], handler, permission=value)
+
+        # `authenticated` 是合法取值（permission 侧与 auth 侧同一套判定）
+        for value in (None, "", "public", "authenticated", "admin"):
+            with self.subTest(permission=value):
+                Route("/x", ["GET"], handler, permission=value)
+
+    def test_non_string_declarations_raise_value_error_not_type_error(self):
+        """非字符串必须报 `ValueError`（不是 `TypeError`）。
+
+        回归：旧实现只写 `if value in known`，对不可哈希取值（list/dict/set）
+        成员判断会抛 `TypeError: unhashable type`，与"注册时报 ValueError"
+        的契约不符，调用方 `except ValueError` 会漏掉它。
+        """
+        from elenvind.core.routing import Route
+
+        def handler(request):
+            return None
+
+        for value in ([], {}, set(), ["admin"], {"a": 1}):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    Route("/x", ["GET"], handler, auth=value)
+                with self.assertRaises(ValueError):
+                    Route("/x", ["GET"], handler, permission=value)
+
+    def test_validate_declaration_rejects_unknown_values_directly(self):
+        """直接测校验函数（不经过 Route），确保它不是"碰巧"被别处拦下。"""
+        from elenvind.core.auth import KNOWN_AUTH, KNOWN_PERMISSIONS
+        from elenvind.core.routing import _validate_declaration
+
+        with self.assertRaises(ValueError):
+            _validate_declaration("auth", "owner", KNOWN_AUTH, "/x")
+        with self.assertRaises(ValueError):
+            _validate_declaration("permission", "owner", KNOWN_PERMISSIONS, "/x")
+
+        # 允许的取值：None / "" / 已知集合内的值
+        for value in (None, ""):
+            _validate_declaration("auth", value, KNOWN_AUTH, "/x")
+        for value in KNOWN_AUTH:
+            _validate_declaration("auth", value, KNOWN_AUTH, "/x")
+
+    def test_admin_auth_declaration_actually_gates(self):
+        """`auth="admin"` 与 `permission="admin"` 必须完全等价地拦人。"""
+        from elenvind.core.auth import AUTH_REQUIRED_VALUES, normalize_auth
+
+        self.assertIn("admin", AUTH_REQUIRED_VALUES)
+        for value in AUTH_REQUIRED_VALUES:
+            with self.subTest(auth=value):
+                self.assertEqual(normalize_auth(value), value
+                                 if value != "required" else "authenticated")
 
     def test_features_do_not_reimplement_security(self):
         offenders = []
@@ -428,20 +695,62 @@ class DefaultSecurityTests(ElenvindTestCase):
                                          f"{header} missing on {method} {path} "
                                          f"({response.status})")
 
+    def test_footer_never_renders_a_placeholder_name(self):
+        """端到端：页脚版权署名不得出现 `None` / 字面量 `title`。
+
+        回归见 `test_footer_copyright_falls_back_to_site_title`：
+        `config.get("copyright", "title")` 在两种缺省情形下会渲染出
+        `© 2026 None` 或 `© 2026 title`。
+        """
+        from elenvind.core.config import config as live_config
+
+        saved_copyright = live_config.get("copyright", None)
+        saved_title = live_config.get("title", None)
+        had_copyright = "copyright" in live_config
+        try:
+            live_config["title"] = "My Site"
+            for value in (None, "", "   "):
+                with self.subTest(copyright=value):
+                    live_config["copyright"] = value
+                    response = self.app.request("GET", "/")
+                    self.assertNotIn("None", response.text)
+                    self.assertNotIn("© 2026 title", response.text)
+                    self.assertIn("My Site", response.text)
+        finally:
+            if had_copyright:
+                live_config["copyright"] = saved_copyright
+            else:
+                live_config.pop("copyright", None)
+            live_config["title"] = saved_title
+
     def test_csp_forbids_scripts(self):
         response = self.app.request("GET", "/")
         csp = response.header("content-security-policy") or ""
+        self.assertIn("default-src 'self'", csp)
         self.assertIn("script-src 'none'", csp)
         self.assertIn("object-src 'none'", csp)
         self.assertIn("base-uri 'none'", csp)
         self.assertIn("frame-ancestors 'none'", csp)
+        # 脚本相关的放宽一律不允许（style 的 'unsafe-inline' 是 hero 所需，
+        # 见 tests/test_security_headers.py 的说明与守卫）
+        self.assertNotIn("unsafe-eval", csp)
+        self.assertNotIn("script-src 'self'", csp)
 
-    def test_hsts_only_on_https(self):
-        secure = self.app.request("GET", "/")
-        self.assertIsNotNone(secure.header("strict-transport-security"))
-        plain = self.app.raw_request("GET", "/", b"", [("host", "example.com")])
-        # scheme 由 AppHarness 决定；这里只断言"HTTP 不带 HSTS"的分支存在
-        self.assertIn(plain.status, (200, 301, 302))
+    def test_hsts_only_when_configured_and_https(self):
+        """HSTS 需要显式开启；且只在 HTTPS 请求上下发。"""
+        self._config["security"] = {"hsts_enabled": True}
+        self.app.scheme = "https"
+        self.assertIsNotNone(self.app.request("GET", "/")
+                             .header("strict-transport-security"))
+        self.app.scheme = "http"
+        self.assertIsNone(self.app.request("GET", "/")
+                          .header("strict-transport-security"))
+
+    def test_hsts_absent_by_default(self):
+        self._config["security"] = {}
+        self.app.scheme = "https"
+        self.assertIsNone(self.app.request("GET", "/")
+                          .header("strict-transport-security"))
 
     def test_every_set_cookie_is_hardened(self):
         """所有 Set-Cookie 必须 HttpOnly + SameSite=Lax + Path=/。"""

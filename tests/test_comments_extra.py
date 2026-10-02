@@ -18,28 +18,18 @@ from elenvind.features.blog import logic as blog
 
 
 def expand_tree(comments):
-    """与生产实现同构的树展开（供纯内存性能测试使用）。"""
+    """树展开 —— 直接调生产实现 `core.db_comment.flatten_comment_tree`。
+
+    返回 `(ordered, by_id)` 以保持原调用点不变。
+    这里曾经有一份"与生产实现同构"的副本；副本与生产**都**缺少对
+    不可达环的处理（root + 环 2<->3 时两边都只渲染出 root），
+    而副本多出的 `seen` 又让缺陷看起来已经被处理。详见 test_comments.py
+    里 CommentTreeTests 的说明。
+    """
+    from elenvind.core.db_comment import flatten_comment_tree
+
     by_id = {row["id"]: row for row in comments}
-    children = {}
-    roots = []
-    for row in comments:
-        parent_id = row["parent_id"]
-        if parent_id is None or parent_id not in by_id:
-            roots.append(row)
-        else:
-            children.setdefault(parent_id, []).append(row)
-    ordered = []
-    seen = set()
-    stack = [(row, 1) for row in reversed(roots)]
-    while stack:
-        row, depth = stack.pop()
-        if row["id"] in seen:
-            continue
-        seen.add(row["id"])
-        ordered.append((row, depth))
-        for child in reversed(children.get(row["id"], ())):
-            stack.append((child, depth + 1))
-    return ordered, by_id
+    return flatten_comment_tree(comments), by_id
 
 
 class CrossArticleReplyTests(ElenvindTestCase):

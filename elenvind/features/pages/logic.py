@@ -40,20 +40,24 @@ def _get_file_stats(dir_path: Path):
 
 
 def _load_pages(dir_path: Path, stats: dict):
-    """扫描目录渲染全部页面；单文件失败不影响其它页面。"""
+    """扫描目录渲染全部页面；单文件失败不影响其它页面，只记日志。
+
+    只返回成功的页面。曾经这里还收集一个 `failed` 字典
+    （{文件名: 上次快照}）并一路返回，但**没有任何调用方读它** ——
+    调用方写的是 `new_pages, _failed = ...`，下划线就说明了一切。
+    失败信息已经由 logger.error 记录，那个字典纯粹是死数据。
+    """
     pages = {}
-    failed = {}
     if not dir_path.exists():
-        return pages, failed
+        return pages
     for path in dir_path.glob("*.md"):
         try:
             if path.stat().st_size > MAX_PAGE_SIZE:
                 raise ContentError(f"page too large: {path.name}")
             pages[path.stem] = render_markdown(path.read_text(encoding="utf-8"))
         except (ContentError, OSError, UnicodeDecodeError, ValueError) as exc:
-            failed[path.name] = stats.get(path.name)
             logger.error("Failed to load page %s: %s", path.name, exc)
-    return pages, failed
+    return pages
 
 
 def _rescan() -> None:
@@ -61,7 +65,7 @@ def _rescan() -> None:
     global _pages_cache, _file_stats
     directory = custom_pages_dir()
     new_stats = _get_file_stats(directory)
-    new_pages, _failed = _load_pages(directory, new_stats)
+    new_pages = _load_pages(directory, new_stats)
     _file_stats = new_stats
     _pages_cache = new_pages
 

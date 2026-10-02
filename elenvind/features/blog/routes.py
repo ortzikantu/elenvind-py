@@ -29,8 +29,13 @@ def _safe_int(value, default=None):
         return default
 
 
-def register(router, *, render_not_found, render_forbidden):
-    """把一个 Blog 路由集合装到给定 router 上。"""
+def register(router, *, render_not_found):
+    """把一个 Blog 路由集合装到给定 router 上。
+
+    只收 `render_not_found`（文章/页面不存在时渲染带布局的 404）。
+    不收 `render_forbidden`：评论等写操作的 403 由 Core 的
+    `router.dispatch(forbidden=...)` 统一处理。
+    """
 
     @router.route("/", methods=["GET"])
     def home(request):
@@ -58,10 +63,17 @@ def register(router, *, render_not_found, render_forbidden):
             if reply_to is None:
                 return _article_error(request, slug, "Invalid reply target")
             parent = get_comment_by_id(reply_to)
+            # 这里只做"能给出更友好提示"的预检 + 需要父行内容的判断。
+            # 权威判定在 core/db_comment_rate.try_post_comment 的事务内
+            # （存在性 + 同文章 + 深度上限），即使有人绕过表单直接 POST 也拦得住。
             if not parent or parent["article_slug"] != slug:
                 return _article_error(request, slug, "Invalid reply target")
-            if parent["is_deleted"]:
-                return _article_error(request, slug, "Cannot reply to a deleted comment")
+            # 刻意**不**校验 parent["is_deleted"]：删除是软删除、可恢复，
+            # 已删除评论仍可被回复（对访客打码展示，关系链保持完整）。
+            #
+            # 深度上限也刻意只在这里"顺手一提"：预检在事务外，属于 TOCTOU
+            # （并发时两个请求可能都看到"还没到顶"）。真正的判定在事务内，
+            # 这里提前拦只是为了少走一趟事务、并给出同样的文案。
             if logic.comment_depth(parent) + 1 > logic._max_depth():
                 return _article_error(request, slug, "Reply depth limit reached")
 
@@ -80,6 +92,18 @@ def register(router, *, render_not_found, render_forbidden):
             if outcome == "too_many":
                 logger.warning("Comment count limit hit: slug=%s", slug)
                 return _article_error(request, slug, message, status=429)
+            if outcome == "bad_parent":
+                # 走到这里说明事务内的权威校验拒绝了它（存在性/跨文章）
+                logger.warning("Comment rejected (bad parent): user_id=%s ip=%s "
+                               "slug=%s parent_id=%s",
+                               user["id"], request.client_ip, slug, reply_to)
+                return _article_error(request, slug, message, status=400)
+            if outcome == "too_deep":
+                # 事务内的深度判定（预检在事务外，这里才是权威）
+                logger.warning("Comment rejected (too deep): user_id=%s ip=%s "
+                               "slug=%s parent_id=%s",
+                               user["id"], request.client_ip, slug, reply_to)
+                return _article_error(request, slug, message, status=400)
             return _article_error(request, slug, message, status=400)
         return redirect(f"/article/{slug}#comments")
 

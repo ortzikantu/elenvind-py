@@ -213,6 +213,50 @@ class IconDowngradeTests(ElenvindTestCase):
         self.assertEqual(tags[0], b"IHDR")
         self.assertEqual(tags[-1], b"IEND")
 
+    def test_the_actually_served_default_icon_is_structurally_valid(self):
+        """真正被发出的缺省图标必须结构有效。
+
+        回归：`test_default_icon_file_is_valid_png` 只在**缺省图标是 PNG** 时
+        才跑，而 `DEFAULT_ICON_CANDIDATES` 把 `.ico` 排在前面，于是那个测试
+        长期处于 skipped 状态 —— 实际被 `<link rel="icon">` 引用、
+        真正有浏览器去取的 `.ico` 文件**从来没有被校验过**。
+
+        这里按扩展名分派：`.png` 校验 PNG 块与 CRC，`.ico` 校验 ICONDIR 头
+        与目录里每个图像的尺寸/偏移（不依赖任何第三方库）。
+        """
+        import struct
+
+        path = assets.default_icon_file()
+        self.assertIsNotNone(path, "仓库必须附带缺省图标")
+        payload = path.read_bytes()
+
+        if path.suffix == ".png":
+            self.assertEqual(payload[:8], b"\x89PNG\r\n\x1a\n")
+            return
+
+        self.assertEqual(path.suffix, ".ico", f"未知的图标格式：{path.name}")
+        # ICONDIR: reserved(2) type(2) count(2)；type=1 表示图标
+        reserved, kind, count = struct.unpack("<HHH", payload[:6])
+        self.assertEqual(reserved, 0, "ICONDIR.reserved 必须为 0")
+        self.assertEqual(kind, 1, "ICONDIR.type 必须为 1（图标）")
+        self.assertGreater(count, 0, "图标目录里没有任何图像")
+        self.assertGreaterEqual(len(payload), 6 + 16 * count,
+                                "文件长度不足以容纳图标目录")
+
+        # 每一项都有 IHDR 级的最小结构：尺寸、颜色数与数据偏移
+        for index in range(count):
+            offset = 6 + 16 * index
+            entry = payload[offset:offset + 16]
+            width = entry[0] or 256          # 0 表示 256
+            height = entry[1] or 256
+            data_size, data_offset = struct.unpack("<II", entry[8:16])
+            with self.subTest(image=index):
+                self.assertGreater(width, 0)
+                self.assertGreater(height, 0)
+                self.assertGreater(data_size, 0, "图像数据长度为 0")
+                self.assertLessEqual(data_offset + data_size, len(payload),
+                                     "图像数据偏移超出了文件末尾")
+
     def test_logo_falls_back_to_configured_favicon(self):
         self._config["static"] = {"css": "", "favicon": "/assets/icon.png"}
         page = self.app.request("GET", "/").text

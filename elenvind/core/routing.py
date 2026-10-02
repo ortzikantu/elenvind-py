@@ -23,7 +23,16 @@
 """
 from __future__ import annotations
 
-from .auth import AUTHENTICATED, PUBLIC, check_permission
+from .auth import (
+    AUTHENTICATED,
+    AUTH_REQUIRED_VALUES,
+    KNOWN_AUTH,
+    KNOWN_PERMISSIONS,
+    NO_REQUIREMENT,
+    PUBLIC,
+    check_permission,
+    normalize_auth,
+)
 from .csrf import requires_protection, validate_request
 from .http import HttpError, error_response, redirect
 
@@ -50,12 +59,6 @@ def _login_redirect(request):
         if pairs:
             target = f"{target}?{'&'.join(pairs)}"
     return redirect(f"{LOGIN_PATH}?{NEXT_PARAM}={quote(target, safe='')}")
-
-#: `auth=` 声明为这些值之一时，要求已登录。
-#: `"required"` 是路由里实际使用的写法；`"authenticated"` 作为同义词一并接受，
-#: 避免"声明了但 Gate 不认识"这种**失效开放**的隐患。
-AUTH_REQUIRED_VALUES = frozenset({AUTHENTICATED, "required"})
-
 
 class RouteMiss(Exception):
     """路由"路径匹配但资源不存在"，请尝试下一个候选路由。
@@ -94,6 +97,34 @@ def _is_catch_all(part: str) -> bool:
     return part.startswith("<path:")
 
 
+def _validate_declaration(kind: str, value, known, path: str) -> None:
+    """校验路由上的安全声明取值；未知值一律**报错**而不是静默放行。
+
+    `None` / `""` 表示未声明（等价于 public），这是允许的。
+
+    只接受字符串与 `None`：非字符串（`True` / `1` / `[...]` / `{...}`）一律拒绝。
+    不能只写 `if value in known` —— 对不可哈希的取值（list/dict/set）
+    成员判断会抛 `TypeError` 而不是 `ValueError`，调用方（以及
+    "注册时报 ValueError"的契约）就看不到预期的错误类型。
+    而 `True` / `1` 这类即使可哈希，也绝不该被当成合法的权限声明。
+    """
+    if value is None or value == "":
+        return
+    if not isinstance(value, str):
+        raise ValueError(
+            f"route {path!r}: {kind}={value!r} must be a string or None, "
+            f"got {type(value).__name__}")
+    if value in known:
+        return
+    hint = ""
+    if kind == "auth" and value == "owner":
+        hint = ("（资源归属请由业务调用 require_owner()，"
+                "它不是路由级声明——Core 不知道哪个资源属于谁）")
+    raise ValueError(
+        f"route {path!r}: unknown {kind}={value!r}; "
+        f"expected one of {sorted(known)} or None{hint}")
+
+
 #: 一个已注册路由
 class Route:
     __slots__ = ("path", "methods", "handler", "auth", "permission", "name",
@@ -104,6 +135,13 @@ class Route:
         self.path = path
         self.methods = tuple(method.upper() for method in methods)
         self.handler = handler
+        # 声明式安全：取值必须在注册时就校验。
+        # 曾经 `auth=` 只被拿去和 {"authenticated","required"} 比对，
+        # 写 `auth="admin"` / `auth="owner"` / `auth=True` 这类值会让闸门
+        # **整体跳过** —— 匿名即可执行（失效开放）。拼错一个档位就静默公开端点，
+        # 这是最危险的一类 bug，因此宁可启动/注册时直接炸掉。
+        _validate_declaration("auth", auth, KNOWN_AUTH, path)
+        _validate_declaration("permission", permission, KNOWN_PERMISSIONS, path)
         self.auth = auth
         self.permission = permission
         self.name = name or getattr(handler, "__name__", "handler")
@@ -264,22 +302,19 @@ class Router:
             if requires_protection(request.method) and not validate_request(request):
                 return error_response(400, "Invalid CSRF token")
 
-            # --- 认证声明 ---
-            # 路由写 `auth="required"`；`"authenticated"` 是等价同义词
-            # （Gate 必须接受两者，否则路由声明会静默失效 = 失效开放）。
+            # --- 认证与权限声明 ---
+            # `auth=` 与 `permission=` 走**同一条**判定（`check_permission`）：
+            #   auth="required" -> 规范化成 "authenticated"
+            #   auth="admin"    -> 与 permission="admin" 完全等价
+            # 取值合法性已在 Route 构造时校验，因此这里不可能遇到未知档位；
+            # 即便遇到，check_permission 对未知档位也是**拒绝**（失效关闭）。
             #
-            # 友好语义：浏览器导航（GET）跳登录页并带回跳地址；
-            # 表单提交/其它方法没有"跳转"可言，直接 403。
-            if route.auth in AUTH_REQUIRED_VALUES and not check_permission(
-                    request, AUTHENTICATED):
-                if request.method == "GET":
-                    return _login_redirect(request)
-                return forbidden(request) if forbidden else error_response(403)
-
-            # --- 权限声明 ---
-            # 已登录但权限不足 -> 403（跳登录页没有意义，重新登录也还是这个身份）；
-            # 未登录 -> 同上的友好跳转。
-            if route.permission and not check_permission(request, route.permission):
+            # 友好语义（只对浏览器导航 GET 生效）：
+            #   未登录 -> 跳登录页并带回跳地址；
+            #   已登录但权限不足 -> 403（重新登录也还是这个身份，跳转没有意义）；
+            #   非 GET（表单提交）-> 一律 403，没有"跳转"可言。
+            requirement = route.permission or normalize_auth(route.auth)
+            if requirement and not check_permission(request, requirement):
                 if request.method == "GET" and not check_permission(
                         request, AUTHENTICATED):
                     return _login_redirect(request)

@@ -1,17 +1,27 @@
 # 站点部署指南（生产环境）
 
-Elenvind 是"应用服务器 + 独立静态托管"两段式架构：
+Elenvind 是"应用服务器 + 可选前置静态托管"的两段式架构：
 
-- **应用**：uvicorn 跑 Python SSR（账号/评论/文章渲染/SEO 文件），只监听本机回环；
-- **静态**：CSS、图标、图片由 Nginx（或 CDN）直接服务，应用不参与。
+- **应用**：uvicorn 跑 Python SSR（账号/评论/文章渲染/SEO 文件），默认只监听
+  `[server].host`（代码缺省 `127.0.0.1`），由前置反代对外。
+- **静态**：应用**自带**静态服务 —— `elenvind/static/` 整个目录挂在站点根，
+  URL 与磁盘一一对应（`/css/style.css` → `elenvind/static/css/style.css`；
+  见《配置指南》的"通用静态服务"）。缺省样式表与图标就是从那里发出的。
+- **可选**：让 Nginx / CDN 直接服务这些路径，把静态流量从 Python 进程分流掉
+  （下面的拓扑就是这个形态）。**不是必须的** —— 个人站流量下让应用自己发完全
+  够用；真正必须的是别把 `[server].host` 直接暴露到公网。
 
-推荐拓扑：
+推荐拓扑（静态交给 Nginx 时）：
 
 ```
 浏览器 ──HTTPS──> Nginx(80/443)
-                    ├── /static、/assets、*.ico、*.png … → 磁盘静态文件
+                    ├── /css、/imgs、/fonts … → 磁盘静态文件（与 elenvind/static/ 对应）
                     └── 其余全部路径 ──反代──> 127.0.0.1:6789 (uvicorn/Elenvind)
 ```
+
+> 注意路径前缀：应用把 `elenvind/static/` **内容**挂在站点根，所以对应关系是
+> `/css/style.css` ↔ `<static根>/css/style.css`、`/imgs/favicon.ico` ↔
+> `<static根>/imgs/favicon.ico`。**没有 `/static` 这一层前缀**。
 
 ---
 
@@ -19,10 +29,10 @@ Elenvind 是"应用服务器 + 独立静态托管"两段式架构：
 
 | 项目 | 要求 |
 |---|---|
-| Python | **3.11+**（配置解析使用标准库 `tomllib`） |
-| 依赖 | 仅 `uvicorn`（`requirements.txt` 另含其间接依赖 click/h11） |
-| 数据库 | 无需安装——SQLite，首次启动自动建表（WAL 模式） |
-| 反向代理 | Nginx（或等效），负责 HTTPS 与静态资源 |
+| Python | **3.11+**（配置解析用标准库 `tomllib`，3.11 才引入） |
+| 依赖 | `uvicorn` + `Jinja2` + `Markdown` + `MarkupSafe`（`uvicorn` 另需 `click` / `h11`）。全部锁在 `requirements.txt` |
+| 数据库 | 无需安装——SQLite（标准库 `sqlite3`），首次启动自动建表并迁移（WAL 模式） |
+| 反向代理 | 可选。Nginx（或等效）负责 HTTPS；静态资源可由应用自己发，也可交给它分流 |
 
 ## 二、安装与首次启动
 
@@ -65,9 +75,19 @@ site_url = "https://example.com"   # robots.txt / sitemap.xml 的绝对地址来
 **样式表是可选的**：`[static].css` 留空时，应用自己会发出内置样式表
 （`/css/style.css`），因此"只跑 `python run.py`"也有完整排版。
 
-**仓库不附带图片资产**（favicon / logo / 社交图标 / hero 图）。这些 URL 留空时
-对应元素**不渲染**，所以开箱不会有裂图或 404；要显示它们就把自己的文件放到
-Nginx 站点根目录，再在 `[static]` 与 `params.social.icon` 里填 URL
+**仓库自带**下面这些图片资产（都在 `elenvind/static/imgs/`，由应用自己发出）：
+
+| 文件 | 用途 |
+|---|---|
+| `favicon.ico` / `favicon.png` | `[static].favicon` 留空时的缺省图标 |
+| `logo.png` | `[static].logo` 留空时回退到 `favicon` → 缺省图标，因此这个文件**不会**被自动使用，需要显式填 `logo = "/imgs/logo.png"` |
+| `codeberg.svg` `github.svg` `email.svg` `bilibili.svg` `steam.svg` `tiktok.svg` `youtube.svg` | 社交图标，供 `params.social[].icon` 引用，例如 `icon = "/imgs/github.svg"` |
+
+**唯一需要你自己准备的是首页 hero 背景图**（`[static].hero`）—— 它没有缺省值，
+留空则整个 hero 区不渲染，所以开箱不会有裂图或 404。
+
+想换成自己的图标，把文件放进 `elenvind/static/imgs/`（或让 Nginx 从别的静态根
+发出同名路径），再在 `[static]` 与 `params.social[].icon` 里填 URL 即可
 （目录结构见 `docs/nginx.conf.example` 头部注释）。
 
 想把 CSS 也交给 Nginx 托管（更省应用进程、便于 CDN 缓存），就把仓库根的

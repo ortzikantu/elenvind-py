@@ -50,6 +50,64 @@ def run_async(coro):
     return asyncio.run(coro)
 
 
+def _remove_tmpdir(tmpdir, *, attempts=5):
+    """删除用例临时目录；失败时**看得见**，并顺带清理同级的陈旧目录。
+
+    为什么不用 `shutil.rmtree(..., ignore_errors=True)`：
+    Windows 上若还有 sqlite 句柄没释放，rmtree 会抛
+    `PermissionError: [WinError 32] ... being used by another process`，
+    而 `ignore_errors=True` 把它彻底吞掉 —— 于是"清理失败"会安静地
+    累积成几百个残留目录，谁也不知道清理逻辑什么时候坏掉的。
+    改成：先重试几次（句柄释放有微小延迟），仍失败就打印到 stderr。
+
+    另外顺手清掉 `.testtmp/` 下的**其它**目录：如果某次运行是被强杀的
+    （中断、超时、崩溃），tearDown 根本没机会跑，那些目录会一直留着。
+    每个用例开始时自愈一次，残留就不会无限增长。
+    """
+    import sys as _sys
+    import time as _time
+
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(tmpdir)
+            break
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            if attempt == attempts - 1:
+                print(f"[test-harness] could not remove {tmpdir}: {exc}",
+                      file=_sys.stderr)
+                break
+            _time.sleep(0.05 * (attempt + 1))
+
+    # 自愈：清掉父目录下**明显早已废弃**的陈旧目录（跳过当前这个）。
+    #
+    # 只删 mtime 超过 10 分钟的：如果有人用 `--parallel` 之类跑并发测试，
+    # 兄弟目录可能正被另一个进程使用，凭"名字像 case-"就删会破坏它。
+    # 正常一次 tearDown 到下一次测试开始是毫秒级，10 分钟只会命中
+    # "上次运行被强杀（中断/超时/崩溃）留下的孤儿"。
+    parent = Path(tmpdir).parent
+    if not parent.name.startswith(".testtmp"):
+        return
+    import time as _time
+
+    cutoff = _time.time() - 600
+    try:
+        for sibling in parent.iterdir():
+            if sibling == Path(tmpdir) or not sibling.is_dir():
+                continue
+            if not sibling.name.startswith("case-"):
+                continue
+            try:
+                if sibling.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            shutil.rmtree(sibling, ignore_errors=True)
+    except OSError:
+        pass
+
+
 class Response:
     """ASGI 响应的解析结果。"""
 
@@ -213,7 +271,11 @@ class AppHarness:
         if query:
             raw_query = urlencode({k: v for k, v in query.items() if v is not None})
 
-        if method in ("POST", "PUT", "PATCH"):
+        # 与 Core 的 `http._FORM_METHODS` 对齐：这四种方法都会被解析表单，
+        # 也都要求 Content-Length。曾经这里漏了 DELETE，于是
+        # "DELETE 无 body" 在测试里表现为 400/405 而在真实请求里是 411，
+        # 让方法级的测试写出与生产不符的期望。
+        if method in ("POST", "PUT", "PATCH", "DELETE"):
             if body is None:
                 body = urlencode(form or {}).encode("utf-8")
             if content_type is not None:
@@ -285,12 +347,16 @@ class ElenvindTestCase(unittest.TestCase):
         blog_logic._failed_stats = {}
         pages_logic._pages_cache = None
         pages_logic._file_stats = None
+        # 机会式清理的"上次清理时间"是模块级内存状态：不重置的话，
+        # 前一个用例刚清理过会让后一个用例的清理被节流跳过（顺序耦合）。
+        from elenvind.core.db_prune import reset_state as reset_prune_state
+        reset_prune_state()
         lifespan_module.clear_startup_hooks()
         from elenvind.core.templating import reset_environment
         reset_environment()
         from elenvind.core.db_user import _invalidate_user_count
         _invalidate_user_count()
-        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        _remove_tmpdir(self.tmpdir)
 
     def base_config(self) -> dict:
         """测试用的最小可用配置（等价于 config.toml 的结构）。"""

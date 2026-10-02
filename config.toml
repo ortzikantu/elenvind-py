@@ -16,10 +16,27 @@ admin_user_id = 1
 admin_badge = ""   # 管理员徽章文字（admin_user_id 用户昵称旁）；留空彻底不显示，缺失时默认 "BIG BOSS"
 deleted_user_nickname = "已远行"
 max_length = 1000   # 单条评论最大长度（字符）：textarea 与后端双重限制
-max_comment_depth = 32             # 评论最大层级（顶层 = 1），到顶后不再提供回复入口
+max_comment_depth = 32             # 评论最大层级（顶层 = 1）；**硬约束**：写入侧在事务内校验，超层回复被拒
 max_comments_per_article = 1000    # 单篇文章评论总数上限
 
 registration_enabled = true        # 是否开放公开注册
+
+###################################################################################################
+# 服务端会话过期（两个维度都要满足会话才有效；任一超时即失效并当场删除该会话）
+#
+# 绝对过期：会话创建后活够这么多天就必须重新登录。与活跃程度无关，
+#           这是"token 泄露后风险窗口"的硬上限。
+# 滑动过期：闲置超过这么多天即失效；有效访问会刷新 last_seen，
+#           所以常用设备不会被踢，只是长期不用的会话会自然消失。
+#
+# 设为 0 = 该维度**不过期**。⚠️ 两个都设 0 等于回到"永久有效"：
+# token 一旦泄露，攻击者可以无限期使用。除非你完全清楚代价，否则别这么写。
+#
+# 两者都超过 10 年（3650 天）会被启动校验拒绝（那基本等于不想过期，请显式写 0）。
+###################################################################################################
+session_absolute_days = 30         # 绝对过期：30 天（默认）
+session_idle_days = 15             # 滑动过期：15 天不活跃即失效（默认）
+
 max_body_size = 1048576            # POST 表单体积上限（1 MB），超出返回 413
 database = "sqlite.db"             # 相对项目根；也可用环境变量 ELENVIND_DB 覆盖
 articles_dir = "articles"          # 文章目录（相对项目根）
@@ -31,6 +48,9 @@ templates_dir = "elenvind/templates"  # Jinja2 模板目录（相对项目根）
 #   true （默认）：配置为空 -> 用内置样式，站点不会变成裸 HTML
 #   false        ：配置为空 -> 不输出 <link>，完全由你掌控样式
 use_builtin_css = true
+
+# 安全响应头（Core 统一注入，Feature 不感知）见文件末尾的 [security]：
+# TOML 的表会"吃掉"它之后的所有顶层键，所以所有表都必须排在这些顶层键之后。
 
 [server]
     host = "0.0.0.0"
@@ -122,3 +142,37 @@ use_builtin_css = true
     file = "logs/app.log"        # 日志文件路径（相对项目根目录）
     max_bytes = 10485760         # 10 MB
     backup_count = 5
+
+###################################################################################################
+# 安全响应头（Core 在响应收尾阶段统一注入，Feature 层不感知）
+#
+# 默认值已经够用；这里把关键项显式写出来，方便按需调整。
+# 整节删掉也能正常启动（走代码内默认值）。
+#
+# 注意：TOML 的表会"吃掉"它之后的所有顶层键，因此本文件把所有
+# [table] 都排在前面的顶层键之后。
+###################################################################################################
+
+[security]
+csp_enabled = true                 # false = 完全不下发 CSP（不推荐）
+# 留空字符串 = 不下发该头
+permissions_policy = "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), usb=(), xr-spatial-tracking=(), interest-cohort=()"
+
+# HSTS：开启后**仅 HTTPS 请求**才下发。
+# 若 [server].cookie_prefix = true（__Host- 前缀要求全程 HTTPS），留空即视为启用。
+hsts_enabled = true
+hsts_max_age = 31536000            # 秒；首次上线建议先用 300 确认无误再调大
+hsts_include_subdomains = false    # 子域全部支持 HTTPS 后再开
+
+# CSP 指令覆盖：只写要改的条目，其余用默认值。
+# 默认：script-src 'none'（本站 Zero-JS）、style-src 'self' 'unsafe-inline'
+#       （'unsafe-inline' 是首页 hero 的 style 属性所需，**别删**，
+#        删掉会让 hero 图静默失效并刷 style-src-elem 报错）、
+#       default-src 'self'、object-src / base-uri / frame-ancestors 'none'。
+[security.csp]
+# 现用外链图片（hero 托管在 GitHub），因此保留 http/https 通配；
+# 若把图片全部收进站内（elenvind/static/imgs/），可收紧成 ["'self'", "data:"]。
+img-src = ["'self'", "data:", "http:", "https:"]
+# 视频同理：@video(url) 支持外部地址
+media-src = ["'self'", "http:", "https:"]
+

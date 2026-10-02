@@ -287,6 +287,34 @@ def run_checks():
           "HttpOnly" in (headers.get("set-cookie") or "")
           and "SameSite=Lax" in (headers.get("set-cookie") or ""))
 
+    # 会话过期：两个时间戳都在，且绝对过期窗口决定 Cookie 寿命
+    import sqlite3
+    absolute_days = int(config.get("session_absolute_days", 30))
+    idle_days = int(config.get("session_idle_days", 15))
+    db_file = db_base.DB_PATH
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = {row["name"] for row in
+                   conn.execute("PRAGMA table_info(session)")}
+        rows = conn.execute(
+            "SELECT token, created_at, last_seen FROM session").fetchall()
+    finally:
+        conn.close()
+    check("会话表有 created_at / last_seen",
+          {"created_at", "last_seen"} <= columns and "expires" not in columns,
+          sorted(columns))
+    check("登录后写入一条会话", len(rows) == 1, len(rows))
+    if rows:
+        now = time.time()
+        fresh = (now - rows[0]["created_at"] < 60
+                 and now - rows[0]["last_seen"] < 60)
+        check("新会话的时间戳是刚刚", fresh)
+    check(f"绝对过期窗口 = {absolute_days} 天（Cookie Max-Age 对应）",
+          f"Max-Age={absolute_days * 86400}" in (headers.get("set-cookie") or ""),
+          headers.get("set-cookie"))
+    check(f"滑动过期窗口 = {idle_days} 天（配置已生效）", idle_days > 0)
+
     # 个人中心
     status, body, _ = fetch(opener, "GET", "/user")
     check("个人中心", status == 200 and "smoke@example.com" in body)

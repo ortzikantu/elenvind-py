@@ -49,8 +49,6 @@ def clear_startup_hooks() -> None:
     _STARTUP_HOOKS.clear()
 
 
-def installed_hooks():
-    return list(_STARTUP_HOOKS)
 
 
 async def handle_lifespan(receive, send):
@@ -105,11 +103,14 @@ def startup():
     init_db()
     success("Database initialized and migrated")
 
-    cleanup_expired_sessions()
+    # 会话过期清理：与限流流水清理同一风格（启动时统一扫一遍）。
+    # 运行期间读过期会话也会顺手删除，这里只是兜住"长期没被访问"的那些行。
+    removed_sessions = cleanup_expired_sessions()
     cleanup_old_login_attempts(days=30)
     cleanup_old_comment_attempts(days=7)
     cleanup_old_attempts(days=7)
-    success("Expired sessions and rate-limit history cleaned")
+    success(f"Expired sessions and rate-limit history cleaned "
+            f"({removed_sessions} session(s) removed)")
 
     for label, hook in _STARTUP_HOOKS:
         hook()

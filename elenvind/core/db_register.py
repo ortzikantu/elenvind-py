@@ -3,23 +3,20 @@
 与登录限流同款思路（逐条流水 + 窗口统计），但只按 IP 计数：
 注册请求没有可信的账号维度，IP 是唯一可用信号。
 默认窗口 1 小时、上限 5 次；个人站正常流量远低于此。
+
+流水清理分两层（见 `core.db_prune`）：启动时全量清一次，
+运行期在提交之后机会式清理（每小时最多一次）。
+**刻意不放在写事务里**：那是 O(表大小) 的 DELETE，会拉长写锁持有时间
+（`db_comment_rate` 早先也是这个策略，两者现已统一）。
 """
 import time
 
 from .db_base import connect
+from .db_prune import prune
 
 RETENTION_DAYS = 7
 
 
-def count_recent(ip: str, window_seconds: int) -> int:
-    """统计窗口期内该 IP 的注册尝试次数。"""
-    cutoff = time.time() - window_seconds
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM register_attempts WHERE ip = ? AND attempted_at > ?",
-            (ip, cutoff)
-        ).fetchone()
-    return row[0] if row else 0
 
 
 def try_register_attempt(ip: str, *, max_per_ip: int, window_seconds: int) -> bool:
@@ -33,8 +30,6 @@ def try_register_attempt(ip: str, *, max_per_ip: int, window_seconds: int) -> bo
     with connect() as conn:
         try:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute("DELETE FROM register_attempts WHERE attempted_at < ?",
-                         (now - RETENTION_DAYS * 86400,))
             count = conn.execute(
                 "SELECT COUNT(*) FROM register_attempts WHERE ip = ? AND attempted_at > ?",
                 (ip, cutoff)
@@ -45,10 +40,12 @@ def try_register_attempt(ip: str, *, max_per_ip: int, window_seconds: int) -> bo
             conn.execute("INSERT INTO register_attempts (ip, attempted_at) VALUES (?, ?)",
                          (ip, now))
             conn.commit()
-            return True
         except Exception:
             conn.rollback()
             raise
+    # 事务外做机会式清理，避免 DELETE 拉长刚刚的写锁持有时间
+    prune("register_attempts", "attempted_at", RETENTION_DAYS)
+    return True
 
 
 def cleanup_old_attempts(days: int = RETENTION_DAYS):

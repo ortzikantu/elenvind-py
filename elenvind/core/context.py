@@ -71,11 +71,13 @@ def build_render_context(context: dict) -> dict:
     merged.setdefault("csrf_token", request.csrf_token() if request else "")
     merged.setdefault("lang", current_lang())
     merged.setdefault("config", config)
-    merged.setdefault("site_title", config.get("title", "Elenvind"))
+    site_title = config.get("title") or "Elenvind"
+    merged.setdefault("site_title", site_title)
 
-    # 主题偏好（Cookie -> data-theme / 切换目标）
-    theme = request.cookies.get("theme") if request else None
-    merged.setdefault("theme", theme if theme in ("light", "dark") else None)
+    # 主题偏好（Cookie -> data-theme / 切换目标）。
+    # 走 request.preference() 而不是直接读 cookies：偏好命名与允许值由
+    # core.security.PREFERENCE_COOKIES 统一定义，白名单校验也在那里。
+    merged.setdefault("theme", request.preference("theme") if request else None)
 
     # SEO meta
     merged.setdefault("description", config.get("description") or "")
@@ -86,7 +88,18 @@ def build_render_context(context: dict) -> dict:
 
     # 页脚 / 徽章
     merged.setdefault("admin_badge", str(config.get("admin_badge", "BIG BOSS")).strip())
-    merged.setdefault("copyright_name", str(config.get("copyright", "title")))
+    # 版权署名缺省回落到站点名（再回落到 "Elenvind"）。
+    #
+    # 旧代码是 `config.get("copyright", "title")` —— 两处都错：
+    #   1. 那个 "title" 是**字面量字符串**，不是"取 title 键"的意思。
+    #      键缺失时页脚会显示 "© 2026 title"；键存在但为 None（TOML 里
+    #      `copyright = ""` 或整行注释掉后 load_config 补 None）时，
+    #      `.get` 返回那个 None，页脚显示 "© 2026 None"。
+    #   2. 从未有人注意到，因为项目自带的 config.toml 恰好设了 copyright。
+    copyright_name = config.get("copyright")
+    if not copyright_name or not str(copyright_name).strip():
+        copyright_name = site_title
+    merged.setdefault("copyright_name", str(copyright_name))
     merged.setdefault("current_year", datetime.now().year)
     if "user_count" not in merged:
         from .db_user import get_user_number

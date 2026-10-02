@@ -16,9 +16,9 @@ from elenvind.core.security import (
     password_needs_rehash,
     set_cookie_header,
     theme_cookie_header,
-    verify_csrf_token,
     verify_password,
 )
+from elenvind.core.csrf import tokens_match
 
 
 class PasswordHashFormatTests(unittest.TestCase):
@@ -127,6 +127,14 @@ class PasswordRehashTests(unittest.TestCase):
 
 
 class CsrfTokenTests(unittest.TestCase):
+    """CSRF 令牌原语。
+
+    格式校验与常量时间比对的**唯一实现**在 `core.csrf`
+    （`is_valid_token` / `tokens_match`）。这里测的是 `security` 侧
+    暴露的同语义入口（`is_valid_csrf_token` 现在只是委托），
+    并直接覆盖 csrf.py 的那一份，确保两者不会漂移。
+    """
+
     def test_generated_token_is_valid_and_unique(self):
         tokens = {generate_csrf_token() for _ in range(50)}
         self.assertEqual(len(tokens), 50)
@@ -148,19 +156,36 @@ class CsrfTokenTests(unittest.TestCase):
 
     def test_verify_requires_both_sides_valid(self):
         token = generate_csrf_token()
-        self.assertTrue(verify_csrf_token(token, token))
-        self.assertFalse(verify_csrf_token(token, generate_csrf_token()))
-        self.assertFalse(verify_csrf_token(None, token))
-        self.assertFalse(verify_csrf_token(token, None))
-        self.assertFalse(verify_csrf_token("", ""))
-        self.assertFalse(verify_csrf_token("x" * 43, token))
+        self.assertTrue(tokens_match(token, token))
+        self.assertFalse(tokens_match(token, generate_csrf_token()))
+        self.assertFalse(tokens_match(None, token))
+        self.assertFalse(tokens_match(token, None))
+        self.assertFalse(tokens_match("", ""))
+        self.assertFalse(tokens_match("x" * 43, token))
+
+    def test_verify_rejects_bad_format_on_either_side(self):
+        token = generate_csrf_token()
+        for bad in ("", None, "short", "a" * 43 + "\n", 42):
+            with self.subTest(bad=bad):
+                self.assertFalse(tokens_match(bad, token))
+                self.assertFalse(tokens_match(token, bad))
+
+    def test_security_and_csrf_agree(self):
+        """两个入口必须同语义（委托实现不该出现行为差异）。"""
+        from elenvind.core.csrf import is_valid_token
+
+        for candidate in (generate_csrf_token(), "", None, "x" * 43,
+                          "a" * 43 + "\n", 42, "!" * 43):
+            with self.subTest(candidate=candidate):
+                self.assertEqual(is_valid_csrf_token(candidate),
+                                 is_valid_token(candidate))
 
     def test_comparison_is_constant_time_helper(self):
         """比对必须走 hmac.compare_digest（此处验证行为等价且不改写入参）。"""
         token = generate_csrf_token()
         other = generate_csrf_token()
-        self.assertTrue(verify_csrf_token(token, token[:]))
-        self.assertFalse(verify_csrf_token(token, other))
+        self.assertTrue(tokens_match(token, token[:]))
+        self.assertFalse(tokens_match(token, other))
 
 
 class CookieHeaderTests(unittest.TestCase):

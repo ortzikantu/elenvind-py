@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 import tomllib
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 MARKER = "+++"
 #: slug 白名单：[A-Za-z0-9._-]，禁止 "." / ".." / 点开头
@@ -128,14 +128,37 @@ def normalize_metadata(metadata: dict, *, slug: str, require_header: bool):
 
 
 def sort_key(metadata: dict):
-    """按 date 倒序排序用的键：解析失败视为最早。"""
+    """按 date 倒序排序用的键：解析失败视为最早。
+
+    **必须归一化到同一时区意识**：`datetime.fromisoformat` 对带偏移的写法
+    （`2026-09-07T10:00:00+08:00`）返回 aware，对不带偏移的返回 naive，
+    两者**不能比较**（`TypeError: can't compare offset-naive and offset-aware`）。
+    而本 key 由 `articles.sort(...)` 使用，位置在 per-file try/except **之外**；
+    只要有一篇日期风格不同（或干脆没写 date，此时返回 naive 的 datetime.min），
+    排序就抛异常。`load_articles` 是启动钩子，等于整站起不来。
+
+    处理：统一转成 **UTC aware**，无时区的按 UTC 解释。这样两种写法都能比较，
+    且结果符合直觉（带偏移按真实时刻比较，不带偏移按 UTC 字面量比较）。
+    """
     raw = metadata.get("date")
     if not raw:
-        return datetime.min
+        return _EPOCH_UTC
     try:
-        return datetime.fromisoformat(str(raw))
+        value = datetime.fromisoformat(str(raw))
     except (TypeError, ValueError):
-        return datetime.min
+        return _EPOCH_UTC
+    return as_utc(value)
+
+
+#: 无日期 / 解析失败时使用的排序键（aware，可与其余 key 比较）。
+_EPOCH_UTC = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def as_utc(value: datetime) -> datetime:
+    """把 datetime 归一化成 UTC aware；无时区的按 UTC 解释。"""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def validate_slug(slug: str) -> bool:

@@ -8,7 +8,9 @@
     <span class="header-title">{{ site_title }}</span>
   </a>
 
-  <nav class="header-nav">
+  {#- aria-label 给这个 landmark 一个可访问名：页面上不止一个 <nav>（还有页脚），
+      没有名字时屏幕阅读器的导航列表会显示成两个无法区分的"导航"。 -#}
+  <nav class="header-nav" aria-label="{{ t('nav_site_menu') }}">
     <ul>
       <li class="nav-user">
         {% if user %}
@@ -19,11 +21,16 @@
         {% endif %}
       </li>
       <li class="nav-theme">
+        {#- 链接永远指向"另一种"主题，所以可访问名必须与切换**结果**绑定：
+            当前是 dark 时，点它是切到 light，标签就该是 "Light"。
+            用通用的 nav_theme_title 会让图标链接的可访问名丢失信息。 -#}
         {% set next_path = request.path if request else '/' %}
         {% if theme == 'dark' %}
-          <a href="/theme?mode=light&next={{ next_path | urlencode }}" title="{{ t('nav_theme_title') }}">{{ theme_icons.light | safe }}</a>
+          <a href="/theme?mode=light&next={{ next_path | urlencode }}"
+             title="{{ t('nav_theme_title') }}" aria-label="{{ t('nav_light') }}">{{ theme_icons.light | safe }}</a>
         {% else %}
-          <a href="/theme?mode=dark&next={{ next_path | urlencode }}" title="{{ t('nav_theme_title') }}">{{ theme_icons.dark | safe }}</a>
+          <a href="/theme?mode=dark&next={{ next_path | urlencode }}"
+             title="{{ t('nav_theme_title') }}" aria-label="{{ t('nav_dark') }}">{{ theme_icons.dark | safe }}</a>
         {% endif %}
       </li>
     </ul>

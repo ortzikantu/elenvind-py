@@ -32,7 +32,10 @@ from http.cookies import SimpleCookie
 SESSION_COOKIE = "session"
 CSRF_COOKIE = "csrf"
 THEME_COOKIE = "theme"              # 手动白/夜主题偏好（light/dark），无该 Cookie 时跟随系统
-SESSION_MAX_AGE = 7 * 86400      # 会话 Cookie 7 天，与 db_session.SESSION_DAYS 保持同一数值
+#: 会话 Cookie 的**兜底**寿命。真实值由 core.session.session_cookie_max_age()
+#: 按 config 的 session_absolute_days 计算（默认 30 天）；这里只在
+#: 绝对过期被设为 0（不过期）时兜底，避免下发一个立即过期的 Cookie。
+SESSION_MAX_AGE = 7 * 86400
 CSRF_MAX_AGE = 30 * 86400        # CSRF Cookie 30 天（仅做同源比对，无状态）
 THEME_MAX_AGE = 365 * 86400      # 主题 Cookie 1 年
 
@@ -204,13 +207,15 @@ def dummy_verify(password: str) -> bool:
     return verify_password(password, _DUMMY_HASH)
 
 
-# ----- CSRF 保护（Double-Submit Cookie，无服务端状态） -----
-# 随机令牌同时写入 Cookie 与表单隐藏域，校验时只做两者比对。
-# 攻击者无法在跨站请求中同时伪造两个值：Cookie 为 HttpOnly 且 SameSite=Lax，
-# 跨站 POST 请求根本不会携带该 Cookie。
-_CSRF_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}")
-
-
+# ----- CSRF 令牌原语 -----
+# 完整的 CSRF 实现（格式校验、常量时间比对、请求校验、模板输入）在 `core/csrf.py`，
+# 那里是**唯一**定义处。这里只保留"生成"与"格式校验"两个原语：
+# 前者给 csrf.py 用，后者给 http.py 判断 Cookie 里的令牌是否可用
+# （不可用就重新生成，避免把畸形值原样回写）。
+#
+# 曾经这里另有一份 `is_valid_csrf_token` / `verify_csrf_token`，
+# 与 csrf.py 的 `is_valid_token` / `tokens_match` 完全重复（连正则都一模一样），
+# 两处都可能漂移 —— 现在只剩 csrf.py 那一份。
 def generate_csrf_token() -> str:
     """生成 32 字节 URL-safe 随机令牌（固定 43 字符，便于格式校验）。"""
     return secrets.token_urlsafe(32)
@@ -221,15 +226,12 @@ def is_valid_csrf_token(token) -> bool:
 
     用 fullmatch 而非 match：`$` 在 match 语义下允许结尾多一个换行，
     会让 "43 个合法字符 + \\n" 通过校验（表单值里带换行并非不可能）。
+
+    实现委托 `core.csrf.is_valid_token` —— 比对逻辑只有那一处。
     """
-    return isinstance(token, str) and _CSRF_PATTERN.fullmatch(token) is not None
+    from .csrf import is_valid_token
 
-
-def verify_csrf_token(submitted, expected) -> bool:
-    """常量时间比对表单令牌与 Cookie 令牌。"""
-    if not is_valid_csrf_token(submitted) or not is_valid_csrf_token(expected):
-        return False
-    return hmac.compare_digest(submitted.encode("ascii"), expected.encode("ascii"))
+    return is_valid_token(token)
 
 
 # ----- 管理员判定 -----
@@ -307,31 +309,174 @@ def clear_session_cookie(secure: bool = False, base: str = SESSION_COOKIE) -> tu
 
 
 # ----- 安全响应头（全项目唯一定义处） -----
-# 站点零 JS：script-src 'none' 直接掐断 XSS 执行链。
-# style-src 的 'unsafe-inline' 是历史遗留（内联样式）；新模板已全部类化，
-# 后续可收紧——但收紧前必须先确认没有任何视图再依赖内联样式。
-CSP = (
-    "default-src 'none'; script-src 'none'; "
-    "style-src 'self' 'unsafe-inline' http: https:; "
-    "img-src 'self' data: http: https:; media-src 'self' http: https:; "
-    "font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; "
-    "form-action 'self'; frame-ancestors 'none'; manifest-src 'none'"
+#
+# 这些头由 Core 在响应收尾阶段统一注入，Feature 层**完全不需要感知**
+# （Feature 只要返回 Response，头一定带上）。注入点见 core/http.py:build_headers()。
+
+#: CSP 默认指令表（`[security.csp]` 未配置时使用）。
+#:
+#: 设计说明：
+#: - `default-src 'self'` 兜底：同源资源放行，其余默认拒绝。
+#: - `script-src 'none'`：本站 Zero-JS，直接掐断脚本执行链——比放开 'self'
+#:   更安全且不牺牲功能（模板里 inline script 与事件属性数量均为 0）。
+#: - `style-src 'self' 'unsafe-inline'`：**必须含 'unsafe-inline'**。
+#:   CSP 的 style-src 同时管 `<style>` 元素与 `style=` **属性**，
+#:   而首页 hero 的后台图就是靠 `style="background-image:url(…)"` 设置的
+#:   （见 templates/home.html）。去掉 'unsafe-inline' 会让 hero 图静默失效，
+#:   并在控制台刷 style-src-elem 报错——注意报错文案会提"hash/nonce"，
+#:   但那些只对 `<style>` 元素有效，对 style 属性需要 'unsafe-hashes'，
+#:   对我们这个场景既不适用也没必要。
+#:   注入风险由配置层兜住：`[static].hero` 要过 `_FORBIDDEN_URL_CHARS`
+#:   字符白名单 + `core.config._check_asset_url()` 的协议校验
+#:   （只允许 http(s) 或站内绝对路径；没有单独的 safe_css_url —— 从来就没有）。
+#:   想彻底收紧的话，需要先把 hero 改成非内联实现（往 CSS 里塞变量或类），
+#:   再把这里改成 `'self'`。
+#: - `img-src` / `media-src` 放开 http/https：正文与配置里的图片、视频可以是
+#:   任意外部地址（例如 hero 图托管在 GitHub）。想收紧就改成 `["'self'", "data:"]`。
+DEFAULT_CSP_DIRECTIVES = {
+    "default-src": ("'self'",),
+    "script-src": ("'none'",),
+    "style-src": ("'self'", "'unsafe-inline'"),
+    "img-src": ("'self'", "data:", "http:", "https:"),
+    "media-src": ("'self'", "http:", "https:"),
+    "font-src": ("'self'",),
+    "connect-src": ("'self'",),
+    "object-src": ("'none'",),
+    "base-uri": ("'none'",),
+    "form-action": ("'self'",),
+    "frame-ancestors": ("'none'",),
+}
+
+#: 默认 Permissions-Policy：把个人博客用不到的能力全部关掉。
+DEFAULT_PERMISSIONS_POLICY = (
+    "accelerometer=(), autoplay=(), camera=(), display-capture=(), "
+    "encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), "
+    "magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), "
+    "publickey-credentials-get=(), screen-wake-lock=(), usb=(), xr-spatial-tracking=(), "
+    "interest-cohort=()"
 )
 
-#: 每个响应都会带上的安全头
+#: 每个响应都会带上的**静态**安全头。
+#: CSP / Permissions-Policy / HSTS 因可配置，由 build_security_headers() 生成。
 BASE_SECURITY_HEADERS = (
     (b"x-content-type-options", b"nosniff"),
     (b"x-frame-options", b"DENY"),
     (b"referrer-policy", b"strict-origin-when-cross-origin"),
-    (b"content-security-policy", CSP.encode("utf-8")),
-    (b"permissions-policy",
-     b"camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"),
     (b"cross-origin-opener-policy", b"same-origin"),
     (b"cross-origin-resource-policy", b"same-origin"),
 )
 
-#: 仅 HTTPS 请求追加
-HSTS_HEADER = (b"strict-transport-security", b"max-age=31536000")
+def csp_directives():
+    """当前生效的 CSP 指令表（配置覆盖默认；配置为 false/空表示关闭该指令）。"""
+    from .config import config
+
+    overrides = (config.get("security", {}) or {}).get("csp", {}) or {}
+    directives = {}
+    for name, default_values in DEFAULT_CSP_DIRECTIVES.items():
+        if name not in overrides:
+            directives[name] = default_values
+            continue
+        override = overrides[name]
+        if override is None or override is False:
+            continue                        # 显式关闭该指令
+        if isinstance(override, str):
+            override = override.split()
+        cleaned = tuple(str(value) for value in override if str(value).strip())
+        if cleaned:
+            directives[name] = cleaned
+        # 空列表同样视为关闭该指令
+    return directives
+
+
+def csp_header_value() -> str:
+    """序列化后的 CSP 头值；站长关闭 CSP 时返回空串（此时不下发该头）。"""
+    from .config import config
+
+    if (config.get("security", {}) or {}).get("csp_enabled", True) is False:
+        return ""
+    return "; ".join(f"{name} {' '.join(values)}"
+                     for name, values in csp_directives().items())
+
+
+def permissions_policy_value() -> str:
+    """Permissions-Policy 头值；配置为空串表示不下发该头。"""
+    from .config import config
+
+    value = (config.get("security", {}) or {}).get("permissions_policy")
+    if value is None:
+        return DEFAULT_PERMISSIONS_POLICY
+    return str(value).strip()
+
+
+def hsts_header_value() -> str:
+    """HSTS 头值；未启用时返回空串。
+
+    启用判据（两个条件都要满足）：
+    1. `[security] hsts_enabled = true`；
+    2. 请求是 HTTPS —— 在 HTTP 上下发 HSTS 无意义（浏览器直接忽略），
+       而如果站点仍提供 HTTP 访问，误发会把访客锁死在 HTTPS。
+    未显式配置时应跟随 `__Host-` Cookie 前缀：那个前缀本来就要求全程 HTTPS，
+    因此开启它意味着站长已经把站点约束在 HTTPS 上。
+    """
+    from .config import config
+
+    configured = config.get("security", {}) or {}
+    enabled = configured.get("hsts_enabled")
+    if enabled is None:
+        enabled = bool(_COOKIE_PREFIX)
+    if not enabled:
+        return ""
+    try:
+        max_age = int(configured.get("hsts_max_age", 31536000))
+    except (TypeError, ValueError):
+        max_age = 31536000
+    max_age = max(max_age, 0)
+    parts = [f"max-age={max_age}"]
+    if configured.get("hsts_include_subdomains"):
+        parts.append("includeSubDomains")
+    return "; ".join(parts)
+
+
+def build_security_headers(secure: bool = False):
+    """组装**本次响应**要下发的全部安全头（Core 的唯一注入点）。
+
+    Feature 不需要调用它，也不应该自己加头——`core/http.py` 在每个响应收尾时
+    统一调用（含错误响应与请求解析阶段的早期错误）。
+    """
+    headers = list(BASE_SECURITY_HEADERS)
+    csp = csp_header_value()
+    if csp:
+        headers.append((b"content-security-policy", csp.encode("utf-8")))
+    policy = permissions_policy_value()
+    if policy:
+        headers.append((b"permissions-policy", policy.encode("utf-8")))
+    if secure:
+        hsts = hsts_header_value()
+        if hsts:
+            headers.append((b"strict-transport-security", hsts.encode("ascii")))
+    return headers
+
+
+def stylesheet_is_same_origin() -> bool:
+    """当前生效的样式表 URL 是否同源（决定 `style-src 'self'` 会不会拦掉它）。
+
+    样式表是页面渲染的必需品：如果站长把 `[static].css` 指到 CDN，
+    就必须同时把该来源加进 `style-src`，否则页面会裸奔。
+    这个函数给测试与自检用，避免"配置改了但 CSP 没跟上"。
+
+    没有样式表（`use_builtin_css = false` 且未配置）时返回 True：
+    没有东西需要放行。
+    """
+    from .templating import stylesheet_url
+
+    url = (stylesheet_url() or "").strip()
+    if not url:
+        return True
+    # 绝对 URL（含协议）或协议相对（//host/…）都算跨源
+    if url.startswith("//") or "://" in url:
+        return False
+    return url.startswith("/")
+
 
 def csrf_cookie_header(token: str, secure: bool = False, max_age: int = CSRF_MAX_AGE,
                        base: str = CSRF_COOKIE) -> tuple:
@@ -344,25 +489,48 @@ def theme_cookie_header(value: str, secure: bool = False, max_age: int = THEME_M
     return _make_cookie(THEME_COOKIE, value, secure, max_age)
 
 
-def parse_cookies(scope) -> dict:
-    """从 ASGI scope 的 Cookie 请求头解析为 {name: value}（同名取最后一个）。
+#: 站内偏好登记表：**唯一**定义"有哪些偏好 Cookie、有效期多久、允许什么值"。
+#:
+#: Feature 通过 `request.set_preference(name, value)` 写入、`request.preference(name)`
+#: 读取，两者都按这里的允许值集合校验。这样 Feature 既不需要知道 Cookie 名字，
+#: 也不可能把任意值写进 Cookie —— Cookie 是客户端可控输入，
+#: 必须经白名单才允许回显到页面属性里（例如 `data-theme`）。
+PREFERENCE_COOKIES = {
+    "theme": (THEME_COOKIE, THEME_MAX_AGE, frozenset({"light", "dark"})),
+}
 
-    自己按 RFC 6265 的语法切分而不是交给 http.cookies.SimpleCookie：
-    后者遇到一个畸形片段（如 "=broken"）会把**整个头部**的 Cookie 全部丢弃，
+
+def parse_cookie_header(raw: str) -> dict:
+    """把一个 `Cookie:` 请求头的值解析为 {name: value}（同名取最后一个）。
+
+    自己按 RFC 6265 的语法切分而不是交给 `http.cookies.SimpleCookie`：
+    后者遇到一个畸形片段（如 `=broken`）会把**整个头部**的 Cookie 全部丢弃，
     导致一个损坏的无关 Cookie 让所有人掉线。这里只跳过畸形的那个片段。
+
+    这是 Cookie 解析的**唯一实现**（Core 内部与测试都走这里）。
+    """
+    cookies = {}
+    for part in (raw or "").split(";"):
+        name, sep, value = part.partition("=")
+        if not sep:
+            continue
+        name = name.strip()
+        if not name or value.strip().startswith('"') or "=" in name:
+            # 空名 / 带引号的值（浏览器不会这样发）/ 名字里再出现 "=" 都跳过
+            continue
+        cookies[name.strip()] = value.strip()
+    return cookies
+
+
+def parse_cookies(scope) -> dict:
+    """从 ASGI scope 的 Cookie 请求头解析为 {name: value}。
+
+    与 `parse_cookie_header` 的区别只在于"输入是 scope 还是头部字符串"；
+    多个 `cookie` 头会**合并**（后出现的同名值覆盖先出现的）。
     """
     cookies = {}
     for header in scope.get("headers", []):
         if header[0] != b"cookie":
             continue
-        raw = header[1].decode("latin-1")
-        for part in raw.split(";"):
-            name, sep, value = part.partition("=")
-            if not sep:
-                continue
-            name = name.strip()
-            if not name or value.strip().startswith('"') or "=" in name:
-                # 空名 / 带引号的值（浏览器不会这样发）/ 名字里再出现 "=" 都跳过
-                continue
-            cookies[name] = value.strip()
+        cookies.update(parse_cookie_header(header[1].decode("latin-1")))
     return cookies

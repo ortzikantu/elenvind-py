@@ -20,6 +20,8 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from markupsafe import Markup
+
 from ...core.config import ROOT, config, resolve_path
 from ...core.db_comment import (
     get_comment_by_id,
@@ -27,10 +29,16 @@ from ...core.db_comment import (
     restore_comment,
     soft_delete_comment,
 )
+from ...core.db_comment import (
+    comment_depth as _core_comment_depth,
+)
+from ...core.db_comment import (
+    flatten_comment_tree,
+)
 from ...core.db_comment_rate import try_post_comment
 from ...core.markdown import render_markdown
 from ...core.security import is_admin, is_admin_id
-from ...core.utils import format_date
+from ...core.utils import escape_html, format_date
 from .content import (
     ContentError,
     normalize_metadata,
@@ -51,6 +59,35 @@ _articles_cache = None      # 元数据列表（新文章在前）；None 表示
 _file_stats = None          # {文件名: (mtime, size)}
 _body_cache = {}            # {绝对路径: (mtime, size, metadata, Markup)}
 _failed_stats = {}          # 解析失败的快照，用于抑制重复报错
+
+#: 正文缓存的条目上限。超出时先淘汰"已不在当前文章目录里"的条目
+#: （重命名/删除留下的死键），仍然超出才按 mtime 淘汰最旧的。
+#: 为什么需要：缓存键是**绝对路径**，重命名或重写文章会留下永远不再命中的
+#: 旧键，而渲染后的 Markup 体积不小 —— 长时间运行会稳定泄漏内存。
+BODY_CACHE_MAX_ENTRIES = 256
+
+
+def _evict_body_cache(keep_paths=None):
+    """把正文缓存压回上限内。
+
+    `keep_paths` 给出"当前仍然存在的文件路径"；不属于它的条目是死键，
+    优先淘汰（它们永远不会再被命中）。剩余按 mtime 从旧到新淘汰。
+    """
+    if len(_body_cache) <= BODY_CACHE_MAX_ENTRIES:
+        # 顺手清理死键，避免它们一直占位
+        if keep_paths is not None:
+            for key in [k for k in _body_cache if k not in keep_paths]:
+                del _body_cache[key]
+        return
+    if keep_paths is not None:
+        for key in [k for k in _body_cache if k not in keep_paths]:
+            del _body_cache[key]
+    if len(_body_cache) <= BODY_CACHE_MAX_ENTRIES:
+        return
+    # 仍然超限：按 (mtime, size) 排序淘汰最旧的，直到回到上限
+    stale = sorted(_body_cache.items(), key=lambda item: (item[1][0], item[1][1]))
+    for key, _value in stale[:len(_body_cache) - BODY_CACHE_MAX_ENTRIES]:
+        del _body_cache[key]
 
 
 def articles_dir() -> Path:
@@ -109,6 +146,8 @@ def _rescan() -> None:
     _file_stats = new_stats
     _articles_cache = new_articles
     _failed_stats = new_failed
+    # 索引刚刚重算过，正好知道"当前真实存在的文件"，借机淘汰正文缓存里的死键
+    _evict_body_cache({str(directory / name) for name in new_stats})
 
 
 def _has_changes() -> bool:
@@ -158,6 +197,7 @@ def load_article_body(slug: str, meta=None):
         return normalized, rendered
     if (after.st_mtime, after.st_size) == (before.st_mtime, before.st_size):
         _body_cache[key] = (before.st_mtime, before.st_size, normalized, rendered)
+        _evict_body_cache()
     else:
         logger.info("Article %s changed while rendering, cache not updated", slug)
     return normalized, rendered
@@ -245,26 +285,12 @@ def _max_comments_per_article() -> int:
 def build_comment_rows(slug: str, user, *, max_length: int):
     """把评论行组装成模板可直接渲染的结构（权限判断在 Feature 里完成）。
 
-    评论树用 children_by_parent + 显式栈迭代展开（O(n)，无递归）。
+    树展开委托 `core.db_comment.flatten_comment_tree` —— 那里是唯一定义，
+    带防环与"不可达评论补根"处理（否则坏数据里的环会让评论从页面上消失）。
     """
     comments = get_comments_by_article(slug)
     by_id = {row["id"]: row for row in comments}
-    children = {}
-    roots = []
-    for row in comments:
-        parent_id = row["parent_id"]
-        if parent_id is None or parent_id not in by_id:
-            roots.append(row)
-        else:
-            children.setdefault(parent_id, []).append(row)
-
-    ordered = []
-    stack = [(row, 1) for row in reversed(roots)]
-    while stack:
-        row, depth = stack.pop()
-        ordered.append((row, depth))
-        for child in reversed(children.get(row["id"], ())):
-            stack.append((child, depth + 1))
+    ordered = flatten_comment_tree(comments)
 
     admin = is_admin(user)
     deleted_nickname = config.get("deleted_user_nickname", "Journeyed On")
@@ -314,37 +340,46 @@ def _reply_label(parent, deleted_nickname: str) -> str:
     return f"Replying to @{_author_label(parent, deleted_nickname)}:"
 
 
+def _normalize_newlines(text: str) -> str:
+    """把 CRLF / 单独 CR 统一成 LF。
+
+    正文会以 `<br>` 的形式展示，换行风格不统一会让行数计算（打码方块数）
+    与实际渲染结果对不上，所以两个分支都必须先规范化再处理。
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+# ⚠️ 此处是全项目唯一的原始 HTML 注入点，改动前务必确认转义顺序 ⚠️
+#
+# 与文章正文不同：评论**不走** `core.markdown` 的白名单净化器
+# （评论是纯文本，不解析 Markdown），因此这里的转义是唯一防线。
+# 顺序必须是「先 escape_html，再替换换行」：
+#   - 先转义 -> `\n` 不受影响，可以安全换成 `<br>`
+#   - 先换行 -> `<br>` 会被后面的转义变成 `&lt;br&gt;`，页面上就会看到字面量
+# 任何时候都不要把 Markup() 用在未转义的 `row["content"]` 上。
 def _comment_content(row, admin: bool):
     """评论正文：已删除对访客打码，对管理员原文加删除线。返回 Markup。"""
-    from markupsafe import Markup
-
-    from ...core.utils import escape_html
-
     raw = row["content"]
     if row["is_deleted"] and not admin:
-        block_len = len(raw.replace("\r\n", "\n").replace("\r", "\n"))
+        block_len = len(_normalize_newlines(raw))
         return Markup(f'<span class="comment-content">{"█" * block_len}</span>')
-    text = escape_html(raw).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+    text = escape_html(raw)
+    text = _normalize_newlines(text).replace("\n", "<br>")
     css = "comment-content is-deleted" if row["is_deleted"] else "comment-content"
     return Markup(f'<span class="{css}">{text}</span>')
 
 
 def comment_depth(comment) -> int:
-    """沿 parent_id 回溯算层级；迭代 + 访问集合，数据成环也不死循环。"""
-    depth = 1
-    parent_id = comment["parent_id"]
-    seen = {comment["id"]}
-    limit = _max_depth() + 1
-    while parent_id is not None and depth < limit:
-        if parent_id in seen:
-            break
-        seen.add(parent_id)
-        parent = get_comment_by_id(parent_id)
-        if parent is None:
-            break
-        depth += 1
-        parent_id = parent["parent_id"]
-    return depth
+    """沿 parent_id 回溯算层级（顶层 = 1）。
+
+    实现在 `core.db_comment.comment_depth`——那是**层级计算的唯一定义**，
+    写入侧的 `try_post_comment` 也调用它（在事务内校验深度），
+    因此渲染与写入不可能算出不同的层级。这里只是按 Feature 的习惯
+    补上配置里的 max_depth 并转发，保持既有调用点与测试不变。
+
+    防环（访问集合）与 limit 兜底都在那个实现里，未改动。
+    """
+    return _core_comment_depth(comment, max_depth=_max_depth())
 
 
 def post_comment(slug: str, user_id: int, client_ip: str, content: str, reply_to):
@@ -366,11 +401,16 @@ def post_comment(slug: str, user_id: int, client_ip: str, content: str, reply_to
         window_seconds=limits["window_seconds"],
         max_per_article=_max_comments_per_article(),
         created_at=datetime.now().isoformat(),
+        max_depth=_max_depth(),
     )
     messages = {
         "rate_user": "Too many comments. Please slow down.",
         "rate_ip": "Too many comments from this address. Please slow down.",
         "too_many": "This article has reached the comment limit.",
+        # 父评论不存在或不属于本文：可能是手动改了表单，或原评论已被清掉
+        "bad_parent": "The comment you are replying to no longer exists.",
+        # 回复层级已达上限：模板不再显示回复按钮，但 reply_to 可以手工构造
+        "too_deep": "Replies to this comment have reached the maximum depth.",
     }
     return outcome, messages.get(outcome, "")
 

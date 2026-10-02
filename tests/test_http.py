@@ -110,14 +110,80 @@ class PostBodyFramingTests(ElenvindTestCase):
         self.assertEqual(response.status, 200)
 
     def test_endless_empty_chunks_are_bounded(self):
-        """more_body 永远为真时必须有上限，不能死循环。"""
+        """`more_body` 永远为真 + 空分片时必须有上限，不能无限循环。
+
+        回归：这条测试以前发的是 `Content-Length: 100` 配 2000 个空分片，
+        而**空分片根本不被计数**（计数器写在 `if chunk:` 里面），
+        循环靠"分片用完 -> 下一帧 KeyError/异常"结束，永远不会碰到
+        `MAX_BODY_CHUNKS` —— 测试通过，防线却不可达。
+        实测：喂 20 万个空分片时旧实现仍在循环。
+
+        现在：空分片也计数，第 `MAX_BODY_CHUNKS + 1` 个分片必须 413。
+        """
+        from elenvind.core.http import MAX_BODY_CHUNKS
+
         chunks = [{"type": "http.request", "body": b"", "more_body": True}
-                  for _ in range(2000)]
+                  for _ in range(MAX_BODY_CHUNKS + 10)]
+        chunks.append({"type": "http.disconnect"})
         response = self._post_raw(chunks=chunks, headers=[
             ("content-length", "100"),
             ("content-type", "application/x-www-form-urlencoded"),
         ])
-        self.assertIn(response.status, (400, 413))
+        self.assertEqual(response.status, 413, response.text[:200])
+
+    def test_chunk_count_caps_even_without_content_length(self):
+        """缺 Content-Length -> 411，而且不能先把分片全读进来再判。"""
+        chunks = [{"type": "http.request", "body": b"", "more_body": True}
+                  for _ in range(50)]
+        chunks.append({"type": "http.disconnect"})
+        response = self._post_raw(chunks=chunks, headers=[
+            ("content-type", "application/x-www-form-urlencoded"),
+        ])
+        self.assertEqual(response.status, 411, response.text[:200])
+
+    def test_nonempty_chunks_accumulate_up_to_declared_length(self):
+        """非空分片的正常路径不受影响：凑够声明的长度就结束（不再要求更多分片）。
+
+        每片 4096 字节、声明 1 MB 时，第 256 片恰好凑满 -> 循环正常退出，
+        随后由 CSRF 判定拒绝（400）。这确认新加的计数逻辑没有误伤正常分片。
+        """
+        chunk = b"a" * 4096
+        chunks = [{"type": "http.request", "body": chunk, "more_body": True}
+                  for _ in range(300)]
+        chunks.append({"type": "http.disconnect"})
+        response = self._post_raw(chunks=chunks, headers=[
+            ("content-length", "1048576"),
+            ("content-type", "application/x-www-form-urlencoded"),
+        ])
+        self.assertEqual(response.status, 400, response.text[:200])
+        self.assertIn("CSRF", response.text)
+
+    def test_oversize_without_declared_length_still_413(self):
+        """未声明长度时由分片累计拦下（体积上限这条路径）。"""
+        chunk = b"a" * 4096
+        chunks = [{"type": "http.request", "body": chunk, "more_body": True}
+                  for _ in range(600)]
+        chunks.append({"type": "http.disconnect"})
+        response = self._post_raw(chunks=chunks, headers=[
+            ("content-type", "application/x-www-form-urlencoded"),
+        ])
+        # 缺 Content-Length 时先 411（Core 的既定语义）
+        self.assertEqual(response.status, 411, response.text[:200])
+
+    def test_many_small_chunks_hit_the_chunk_cap_not_the_size_cap(self):
+        """小分片很多时，触发的是分片数上限而非体积上限（两条路径都要覆盖）。"""
+        from elenvind.core.http import MAX_BODY_CHUNKS
+
+        # 每片 1 字节：1024 片只有 1 KB，远达不到 1 MB，所以只能由分片数拦下
+        chunks = [{"type": "http.request", "body": b"a", "more_body": True}
+                  for _ in range(MAX_BODY_CHUNKS + 10)]
+        chunks.append({"type": "http.disconnect"})
+        response = self._post_raw(chunks=chunks, headers=[
+            ("content-length", "1048576"),
+            ("content-type", "application/x-www-form-urlencoded"),
+        ])
+        self.assertEqual(response.status, 413, response.text[:200])
+        self.assertIn("chunk", response.text.lower())
 
     def test_client_disconnect_is_400(self):
         chunks = [{"type": "http.disconnect"}]
@@ -258,15 +324,118 @@ class MethodAndRoutingTests(ElenvindTestCase):
                 self.assertNotIn("[static]", response.text)
 
     def test_theme_redirect_rejects_open_redirect(self):
+        """`next` 必须是站内路径，否则回落首页。
+
+        回归：这条测试曾经只断言 `location.startswith("/")` 且
+        `not location.startswith("//")` —— 而 `/\t/evil.com` 与 `/\\evil.com`
+        **同时满足**两个断言，于是测试通过而重定向实际是跨站的。
+        原因是浏览器在解析 URL 前会剥离 ASCII TAB / 把反斜杠归一化成 `/`，
+        因此 `/\t/evil.com` 与 `/\\evil.com` 在浏览器眼里都是 `//evil.com`。
+        现在断言改为「不许等于危险值」+「不许含任何控制字符或反斜杠」。
+        """
         for value in ("//evil.example.com", "https://evil.example.com", "\\\\evil",
-                      "javascript:alert(1)", "/\\evil", ""):
+                      "javascript:alert(1)", "/\\evil", "",
+                      # 下面两个是曾经漏掉的关键用例
+                      "/\t/evil.com", "/\\evil.com",
+                      # 编码与其它控制字符变体（应用侧不解码，交给解码后仍被拒）
+                      "/%09/evil.com", "/\n/evil.com", "/\r/evil.com",
+                      "/\u2028/evil.com", "/a\x00b"):
             with self.subTest(value=value):
                 response = self.app.request("GET", "/theme",
                                             query={"mode": "dark", "next": value})
                 self.assertEqual(response.status, 302)
-                location = response.header("location")
-                self.assertTrue(location.startswith("/"))
-                self.assertFalse(location.startswith("//"))
+                location = response.header("location") or ""
+                self.assertTrue(location.startswith("/"), location)
+                self.assertFalse(location.startswith("//"), location)
+                self.assertNotIn("\\", location, "Location 不得含反斜杠")
+                for ch in location:
+                    self.assertGreater(ord(ch), 0x1F,
+                                       f"Location 含控制字符 {ch!r}: {location!r}")
+                    self.assertNotEqual(ord(ch), 0x7F)
+
+    def test_login_next_rejects_open_redirect(self):
+        """登录后的回跳同样必须拒绝 TAB / 反斜杠。"""
+        from elenvind.features.auth.routes import safe_next
+        for value in ("/\t/evil.com", "/\\evil.com", "//evil.com",
+                      "https://evil.com", "\\\\evil", "javascript:alert(1)",
+                      "/\n/evil.com", "/\u2028/evil.com", "", None, 123):
+            with self.subTest(value=value):
+                self.assertEqual(safe_next(value), "")
+
+    def test_login_next_keeps_legitimate_paths(self):
+        from elenvind.features.auth.routes import safe_next
+        for value in ("/", "/about", "/article/x?y=1", "/a/b/c",
+                      "/user?next=/login", "/中文路径", "/a%20b"):
+            with self.subTest(value=value):
+                self.assertEqual(safe_next(value), value)
+
+    # ---------- safe_next 的每一道防线都必须**各自**有效 ----------
+
+    def test_control_char_rejection_has_two_independent_layers(self):
+        """TAB 必须同时被"控制字符区间"与"Unicode 类别"两条独立规则覆盖。
+
+        `safe_next_path` 用了两条互不依赖的判据：
+
+        1. `ch in "\\t\\r\\n" or "\\x00" <= ch <= "\\x1f" or ch == "\\x7f"`
+           （外加 C1 区间 `\\x80`–`\\x9f`）；
+        2. `unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp")`。
+
+        变异测试发现：单独去掉第 1 条里的 `\\t`，行为**不变** —— 因为
+        `unicodedata.category("\\t") == "Cc"` 又被第 2 条拦住。
+        这是有意为之的纵深防御，但也意味着"只测 TAB 被拒"无法证明第 1 条
+        还在工作。这里明确把两层的**各自**职责钉住：
+
+        - 纯 ASCII 控制字符（第 1 条覆盖）；
+        - Unicode 格式/行分隔符（只有第 2 条覆盖：Cf / Zl / Zp）。
+        """
+        import unicodedata
+
+        from elenvind.core.http import safe_next_path
+
+        # 第 2 条独有：Cf（格式字符）/ Zl（行分隔）/ Zp（段分隔）
+        category_only = {
+            "\u200b": "Cf",    # 零宽空格
+            "\u200e": "Cf",    # 从左至右标记
+            "\u00ad": "Cf",    # 软连字符
+            "\u2028": "Zl",    # 行分隔符
+            "\u2029": "Zp",    # 段分隔符
+        }
+        for ch, expected in category_only.items():
+            with self.subTest(char=repr(ch)):
+                self.assertEqual(unicodedata.category(ch), expected)
+                self.assertEqual(safe_next_path(f"/a{ch}b"), "/",
+                                 f"{expected} 类字符未被拒绝")
+
+        # 第 1 条覆盖：ASCII 控制字符（含 TAB/CR/LF/DEL 与 C1）
+        for code in list(range(0x00, 0x20)) + [0x7F] + list(range(0x80, 0xA0)):
+            ch = chr(code)
+            with self.subTest(code=hex(code)):
+                self.assertEqual(safe_next_path(f"/a{ch}b"), "/",
+                                 f"U+{code:04X} 未被拒绝")
+
+    def test_ascii_control_range_is_checked_independently_of_unicode_category(self):
+        """即使 Unicode 类别判据被去掉，ASCII 控制字符仍必须被拒绝。
+
+        单独验证第 1 条的**区间**部分：把 `\\t` 从显式列举里去掉后，
+        `\\x0b`–`\\x1f` 这段区间仍要覆盖 TAB 以外的控制字符，
+        而 TAB 自己由 Cf/Cc 类别与区间共同兜住。
+        """
+        from elenvind.core.http import _has_url_control_chars
+
+        for code in (0x00, 0x01, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                     0x1F, 0x7F, 0x80, 0x85, 0x9F):
+            with self.subTest(code=hex(code)):
+                self.assertTrue(_has_url_control_chars(chr(code)),
+                                f"U+{code:04X} 未被判定为控制字符")
+
+    def test_legitimate_unicode_is_not_treated_as_a_control_char(self):
+        """反向：正常的多语言字符不能被误判（否则中文/日文路径全被拒）。"""
+        from elenvind.core.http import _has_url_control_chars
+
+        for value in ("/中文路径", "/日本語", "/Ελληνικά", "/emoji-🎉",
+                      "/a-b_c.d~e", "/a%20b", "/x?y=1#z"):
+            with self.subTest(value=value):
+                self.assertFalse(_has_url_control_chars(value), value)
 
     def test_theme_redirect_keeps_site_relative_path(self):
         response = self.app.request("GET", "/theme", query={"mode": "light", "next": "/about"})
@@ -302,16 +471,41 @@ class SecurityHeaderTests(ElenvindTestCase):
         self.assertEqual(response.header("x-frame-options"), "DENY")
         self.assertEqual(response.header("referrer-policy"), "strict-origin-when-cross-origin")
         csp = response.header("content-security-policy") or ""
+        self.assertIn("default-src 'self'", csp)
         self.assertIn("script-src 'none'", csp)
         self.assertIn("frame-ancestors 'none'", csp)
         self.assertIn("object-src 'none'", csp)
+        self.assertIn("base-uri 'none'", csp)
 
-    def test_hsts_only_on_https(self):
-        secure_response = self.app.request("GET", "/")
-        self.assertIsNotNone(secure_response.header("strict-transport-security"))
+    def test_hsts_requires_config_opt_in(self):
+        """默认不配 HSTS：即使 HTTPS 也不下发（避免把访客误锁在 HTTPS）。"""
+        self.app.scheme = "https"
+        self._config["security"] = {}
+        self.assertIsNone(self.app.request("GET", "/").header("strict-transport-security"))
+
+    def test_hsts_on_https_when_enabled(self):
+        self.app.scheme = "https"
+        self._config["security"] = {"hsts_enabled": True}
+        self.assertEqual(self.app.request("GET", "/").header("strict-transport-security"),
+                         "max-age=31536000")
+
+    def test_hsts_never_sent_over_http(self):
+        """HTTP 上下发 HSTS 没有意义（浏览器忽略），误发反而会把访客锁死。"""
+        self._config["security"] = {"hsts_enabled": True}
         self.app.scheme = "http"
-        plain_response = self.app.request("GET", "/")
-        self.assertIsNone(plain_response.header("strict-transport-security"))
+        self.assertIsNone(self.app.request("GET", "/").header("strict-transport-security"))
+
+    def test_hsts_max_age_and_subdomains_are_configurable(self):
+        self.app.scheme = "https"
+        self._config["security"] = {"hsts_enabled": True, "hsts_max_age": 300,
+                                    "hsts_include_subdomains": True}
+        self.assertEqual(self.app.request("GET", "/").header("strict-transport-security"),
+                         "max-age=300; includeSubDomains")
+
+    def test_hsts_can_be_disabled_explicitly(self):
+        self.app.scheme = "https"
+        self._config["security"] = {"hsts_enabled": False}
+        self.assertIsNone(self.app.request("GET", "/").header("strict-transport-security"))
 
     def test_cache_control_no_cache_for_anonymous_html(self):
         response = self.app.request("GET", "/")
