@@ -2,7 +2,7 @@
 # Elenvind 生产部署 Nginx 配置案例（HTTPS 反代 + 静态资源分离）
 #
 # 拓扑假设（与本项目代码的安全边界一一对应）：
-#   浏览器 → Nginx(443/80, 静态资源+反代) → 127.0.0.1:6789 (uvicorn/Elenvind)
+#   浏览器 → Nginx(443/80, 静态资源+反代) → 127.0.0.1:6789 (Gunicorn/Elenvind)
 #
 # 目录假设（Nginx 站点根 /var/www/elenvind，按需调整）。
 #
@@ -22,10 +22,13 @@
 #    受信列表是 `config.toml` 的 `[server].trusted_proxies`（默认 127.0.0.1 与 ::1）。
 #    生产环境请把 `[server].host` 设为 "127.0.0.1"（或保持 0.0.0.0
 #    但用防火墙封闭 6789 的外网访问）。
-# 2. `run.py` 会把**同一份** `[server].trusted_proxies` 交给 uvicorn 的
-#    `forwarded_allow_ips`，因此只要上面那条配对，uvicorn 就会依据
-#    `X-Forwarded-Proto` 把请求标记为 https：Secure Cookie、HSTS 自动生效。
-#    （两处若不一致，表现是"HTTPS 下 Cookie 丢了 Secure、也没有 HSTS"。）
+# 2. `run.py` 会把**同一份** `[server].trusted_proxies` 交给 Gunicorn 的
+#    `forwarded_allow_ips`，而应用自己也会用这份白名单采信
+#    `X-Forwarded-Proto`，因此只要上面那条配对，请求就会被标记为 https：
+#    Secure Cookie、HSTS 自动生效。
+#    （直接用 Gunicorn CLI 启动时，记得同时传
+#      `--forwarded-allow-ips="<代理地址>"`；两处若不一致，表现是
+#      "HTTPS 下 Cookie 丢了 Secure、也没有 HSTS"。）
 # 3. 安全响应头（CSP/nosniff/COOP 等）已由应用在 HTTP 层统一下发，
 #    Nginx 不要重复添加 CSP（多个 CSP 头会取并集，容易误伤页面样式）。
 # ============================================================

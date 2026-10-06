@@ -9,6 +9,8 @@ dist/
 *.egg-info/
 *.db
 *.db-*
+# C0 写协调的锁文件（<database>.write.lock）：稳定路径，不应提交
+*.write.lock
 logs/
 .testtmp/
 .smoketmp/

@@ -274,7 +274,7 @@ def is_admin_id(user_id) -> bool:
 
 # ----- Cookie 构造 -----
 def _make_cookie(name: str, value: str, secure: bool, max_age: int, http_only: bool = True) -> tuple:
-    """构造 Set-Cookie 响应头（bytes 键值对，供 ASGI headers 使用）。"""
+    """构造 Set-Cookie 响应头（bytes 键值对，交给 `build_headers` 统一组装）。"""
     cookie = SimpleCookie()
     cookie[name] = value
     cookie[name]["path"] = "/"
@@ -310,8 +310,8 @@ def clear_session_cookie(secure: bool = False, base: str = SESSION_COOKIE) -> tu
 
 # ----- 安全响应头（全项目唯一定义处） -----
 #
-# 这些头由 Core 在响应收尾阶段统一注入，Feature 层**完全不需要感知**
-# （Feature 只要返回 Response，头一定带上）。注入点见 core/http.py:build_headers()。
+# 这些头由 Core 在响应收尾阶段统一注入，模块层**完全不需要感知**
+# （模块只要返回 Response，头一定带上）。注入点见 core/http.py:build_headers()。
 
 #: CSP 默认指令表（`[security.csp]` 未配置时使用）。
 #:
@@ -440,7 +440,7 @@ def hsts_header_value() -> str:
 def build_security_headers(secure: bool = False):
     """组装**本次响应**要下发的全部安全头（Core 的唯一注入点）。
 
-    Feature 不需要调用它，也不应该自己加头——`core/http.py` 在每个响应收尾时
+    模块不需要调用它，也不应该自己加头——`core/http.py` 在每个响应收尾时
     统一调用（含错误响应与请求解析阶段的早期错误）。
     """
     headers = list(BASE_SECURITY_HEADERS)
@@ -491,8 +491,8 @@ def theme_cookie_header(value: str, secure: bool = False, max_age: int = THEME_M
 
 #: 站内偏好登记表：**唯一**定义"有哪些偏好 Cookie、有效期多久、允许什么值"。
 #:
-#: Feature 通过 `request.set_preference(name, value)` 写入、`request.preference(name)`
-#: 读取，两者都按这里的允许值集合校验。这样 Feature 既不需要知道 Cookie 名字，
+#: 模块通过 `request.set_preference(name, value)` 写入、`request.preference(name)`
+#: 读取，两者都按这里的允许值集合校验。这样模块既不需要知道 Cookie 名字，
 #: 也不可能把任意值写进 Cookie —— Cookie 是客户端可控输入，
 #: 必须经白名单才允许回显到页面属性里（例如 `data-theme`）。
 PREFERENCE_COOKIES = {
@@ -508,6 +508,11 @@ def parse_cookie_header(raw: str) -> dict:
     导致一个损坏的无关 Cookie 让所有人掉线。这里只跳过畸形的那个片段。
 
     这是 Cookie 解析的**唯一实现**（Core 内部与测试都走这里）。
+
+    输入是 `Cookie:` 请求头的**值**（WSGI 下由 `http.collect_headers()` 从
+    `HTTP_COOKIE` 取到）。历史上曾有一个"从请求对象里取头"的重复实现，
+    没有任何调用方，已随旧的协议适配代码一起删除：两份解析器正是行为漂移
+    的温床。
     """
     cookies = {}
     for part in (raw or "").split(";"):
@@ -519,18 +524,4 @@ def parse_cookie_header(raw: str) -> dict:
             # 空名 / 带引号的值（浏览器不会这样发）/ 名字里再出现 "=" 都跳过
             continue
         cookies[name.strip()] = value.strip()
-    return cookies
-
-
-def parse_cookies(scope) -> dict:
-    """从 ASGI scope 的 Cookie 请求头解析为 {name: value}。
-
-    与 `parse_cookie_header` 的区别只在于"输入是 scope 还是头部字符串"；
-    多个 `cookie` 头会**合并**（后出现的同名值覆盖先出现的）。
-    """
-    cookies = {}
-    for header in scope.get("headers", []):
-        if header[0] != b"cookie":
-            continue
-        cookies.update(parse_cookie_header(header[1].decode("latin-1")))
     return cookies

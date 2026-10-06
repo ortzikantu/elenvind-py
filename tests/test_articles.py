@@ -5,15 +5,15 @@ from datetime import datetime, timezone
 
 from tests.support import ElenvindTestCase
 
-from elenvind.features.blog import logic as blog
-from elenvind.features.blog.content import (
+from elenvind.core.content import (
     ContentError,
     normalize_metadata,
     parse_document,
     sort_key,
     validate_slug,
 )
-from elenvind.features.pages import logic as pages
+from elenvind.modules.blog import logic as blog
+from elenvind.modules.pages import logic as pages
 
 
 class ContentFormatTests(unittest.TestCase):

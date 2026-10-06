@@ -1,22 +1,29 @@
 """Core HTTP 边界：Request 解析、Response 构造、Cookie 与安全响应头。
 
-**这是全应用唯一的 HTTP 边界**。Feature 只消费 Request、只返回 Response
+**这是全应用唯一的 HTTP 边界**。模块只消费 Request、只返回 Response
 （或用 `render_template` 让 Core 包一层），不得：
-- 自己解析 ASGI scope；
+- 自己解析 WSGI environ；
 - 自己检查 Content-Length / Content-Type / Body 上限；
 - 自己拼 Set-Cookie / Location / 安全响应头。
 
 设计要点（保持简单，不引入中间件框架）：
-- `Request.from_asgi()` 一次性把 scope + body 解析成不可变语义的请求对象；
-  畸形请求抛 `BadRequest` 家族异常，由调度器统一翻译成状态码。
+- `Request.from_wsgi()` 一次性把 WSGI environ + 请求体解析成不可变语义的
+  请求对象；畸形请求抛 `BadRequest` 家族异常，由调度器统一翻译成状态码。
 - 表单只支持 `application/x-www-form-urlencoded`；不支持的类型抛
   `UnsupportedMediaType`，绝不猜测。
 - 请求体上限、方法白名单、截断检测都在这里，只实现一次。
+- 出口只有 `send_response()` / `send_early_error()`：状态行、安全头、Cookie
+  都从那里出去（`wsgi_headers()` 负责把内部 bytes 头转成 WSGI 要求的 str）。
+
+WSGI 约定（PEP 3333）：请求头来自 `environ` 的 `HTTP_*` / `CONTENT_TYPE` /
+`CONTENT_LENGTH`；请求体从 `environ["wsgi.input"]` 按声明的 Content-Length
+读取；响应头必须是 native `str` 且可用 latin-1 编码。
 """
 from __future__ import annotations
 
 import json
 import logging
+from http.client import responses as HTTP_REASONS
 from urllib.parse import parse_qs
 
 from .context import current_request
@@ -33,7 +40,7 @@ from .security import (
     is_valid_csrf_token,
     pick_cookie,
 )
-from .utils import escape_html, get_client_ip
+from .utils import escape_html, get_client_ip, get_request_scheme, peer_address
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +52,10 @@ _FORM_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 #: 默认请求体上限（1 MB）
 DEFAULT_MAX_BODY_SIZE = 1024 * 1024
-#: 单个请求最多接收多少个 ASGI body 分片（防"永真 more_body"死循环）
-MAX_BODY_CHUNKS = 1024
+#: 单次从 `wsgi.input` 读取的字节数（单次读取上限，**不是**请求体上限）。
+#: WSGI 允许输入流一次只给一部分数据（短读），因此必须循环读到声明的长度；
+#: 这个值只影响循环次数，不影响能接受的最大请求体。
+_BODY_READ_SIZE = 65536
 
 
 # ======================= 异常：由调度器翻译成状态码 =======================
@@ -101,18 +110,18 @@ class CsrfError(Forbidden):
 # ======================= Request =======================
 
 class Request:
-    """一次 HTTP 请求的解析结果。由 Core 构造，Feature 只读消费。"""
+    """一次 HTTP 请求的解析结果。由 Core 构造，模块只读消费。"""
 
-    __slots__ = ("scope", "method", "path", "query", "headers", "cookies",
+    __slots__ = ("environ", "method", "path", "query", "headers", "cookies",
                  "raw_body", "_form", "content_type", "content_length",
                  "client_ip", "secure", "user", "session_token", "lang",
                  "_csrf", "_csrf_dirty", "_preferences",
                  "_session_cookie_dirty", "_session_cookie_clear_pending")
 
-    def __init__(self, *, scope, method, path, query, headers, cookies, raw_body,
+    def __init__(self, *, environ, method, path, query, headers, cookies, raw_body,
                  form, content_type, content_length, client_ip, secure, lang,
                  session_token=None):
-        self.scope = scope
+        self.environ = environ
         self.method = method
         self.path = path
         self.query = query                # {key: [values]}
@@ -138,25 +147,30 @@ class Request:
 
     # ---------- 构造 ----------
     @classmethod
-    async def from_asgi(cls, scope, receive, *, lang="en"):
-        """从 ASGI scope/receive 构造 Request；畸形请求抛 HttpError。"""
-        method = str(scope.get("method", "GET")).upper()
+    def from_wsgi(cls, environ, *, lang="en"):
+        """从 WSGI environ（+ `wsgi.input`）构造 Request；畸形请求抛 HttpError。
+
+        这是请求解析的**唯一入口**：方法白名单、请求头归一化、Cookie 解析、
+        查询串解析、scheme/客户端 IP 判定、请求体读取与大小/截断校验，
+        全部只在这里发生一次。
+        """
+        method = str(environ.get("REQUEST_METHOD") or "GET").upper()
         if method not in ALLOWED_METHODS:
             raise MethodNotAllowed(f"method {method} not allowed")
 
-        headers = _collect_headers(scope)
+        headers = collect_headers(environ)
         cookies = _parse_cookie_header(headers.get("cookie", ""))
         session_token = pick_cookie(cookies, SESSION_COOKIE)
-        query = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"),
+        query = parse_qs(str(environ.get("QUERY_STRING") or ""),
                          keep_blank_values=True)
-        secure = scope.get("scheme") == "https"
+        secure = get_request_scheme(environ, headers) == "https"
 
         raw_body = b""
         form = {}
         content_type = headers.get("content-type", "")
         content_length = None
         if method in _FORM_METHODS:
-            raw_body, content_length = await _read_body(scope, receive, headers)
+            raw_body, content_length = _read_body(environ, headers)
             if raw_body:
                 mime = content_type.split(";")[0].strip().lower()
                 if mime and mime != FORM_CONTENT_TYPE:
@@ -164,10 +178,11 @@ class Request:
                         f"unsupported content-type: {mime}")
                 form = _parse_form(raw_body)
 
-        return cls(scope=scope, method=method, path=str(scope.get("path", "/")),
+        return cls(environ=environ, method=method, path=_request_path(environ),
                    query=query, headers=headers, cookies=cookies, raw_body=raw_body,
                    form=form, content_type=content_type,
-                   content_length=content_length, client_ip=get_client_ip(scope),
+                   content_length=content_length,
+                   client_ip=get_client_ip(headers, peer_address(environ)),
                    secure=secure, lang=lang, session_token=session_token)
 
     # ---------- 便捷访问 ----------
@@ -238,7 +253,7 @@ class Request:
         elif self._session_cookie_clear_pending:
             # 服务端已经作废了会话：必须让浏览器也丢掉它。
             # 用 clear_cookie_headers（同时清理可能的 __Host- 前缀变体），
-            # 由 Core 统一做，Feature 不需要知道 Cookie 名字。
+            # 由 Core 统一做，模块不需要知道 Cookie 名字。
             headers.extend(clear_cookie_headers(secure=self.secure))
         csrf_header = self.csrf_cookie_header()
         if csrf_header:
@@ -249,8 +264,8 @@ class Request:
     def invalidate_session_cookie(self):
         """作废本次请求的会话：清服务端会话 + 让浏览器 Cookie 立即过期。
 
-        这也是 Feature 侧"我只想让这个会话失效"的**唯一**入口 ——
-        Feature 不拼 Cookie、不 import SESSION_COOKIE。
+        这也是模块侧"我只想让这个会话失效"的**唯一**入口 ——
+        模块不拼 Cookie、不 import SESSION_COOKIE。
         """
         from .session import delete_session
 
@@ -265,7 +280,7 @@ class Request:
     def set_preference(self, name: str, value: str) -> None:
         """设置一个站内偏好（白名单内），由 Core 在响应收尾时下发 Cookie。
 
-        Feature 通过它写入偏好，**不需要知道 Cookie 名字、有效期或属性**。
+        模块通过它写入偏好，**不需要知道 Cookie 名字、有效期或属性**。
         为什么偏好不放 Response 上：偏好不属于某一次响应，而属于"这个浏览器"；
         统一由 `pending_cookies()` 下发，能让所有响应路径（重定向、错误页）
         行为一致。
@@ -299,14 +314,21 @@ class Request:
         return headers
 
 
-async def _read_body(scope, receive, headers):
-    """按 Content-Length 严格读取请求体。
+def _read_body(environ, headers):
+    """按 Content-Length 严格读取请求体（同步，WSGI 输入流）。
 
-    错误语义（在 Core 里只实现一次，Feature 不需要关心）：
+    错误语义（在 Core 里只实现一次，模块不需要关心）：
     - 缺 Content-Length（含 chunked）→ 411
     - 长度非数字 / 负数              → 400
-    - 声明或实收超过上限            → 413
+    - 声明超过上限                  → 413（不读 body）
     - 实收少于声明（截断/断开）      → 400
+
+    为什么是"循环读"而不是一次 `read(declared)`：PEP 3333 明确允许
+    `wsgi.input` **短读**（一次只给一部分），一次 read 拿到的长度不可信。
+    循环条件由**声明长度**兜底：每次迭代要么至少吃掉一个字节，
+    要么立刻抛"截断" —— 既不会少读，也不可能空转（旧的异步适配层需要
+    `MAX_BODY_CHUNKS` 计数器来防"永真 more_body"死循环，WSGI 下这个失败模式
+    根本不存在）。
     """
     raw_length = headers.get("content-length")
     if raw_length is None:
@@ -321,43 +343,83 @@ async def _read_body(scope, receive, headers):
     if declared > limit:
         raise PayloadTooLarge("declared body too large")
 
+    if declared == 0:
+        return b"", 0
+
+    stream = environ.get("wsgi.input")
+    if stream is None or not hasattr(stream, "read"):
+        raise BadRequest("request body stream is unavailable")
+
     body = bytearray()
-    chunks = 0
     while len(body) < declared:
-        message = await receive()
-        message_type = message.get("type")
-        if message_type == "http.disconnect":
-            raise BadRequest("client disconnected")
-        if message_type != "http.request":
-            raise BadRequest("unexpected ASGI message")
-        # 计数器必须对**每一个**分片递增，包括空分片。
-        #
-        # 回归：旧代码把递增写在 `if chunk:` 里面，于是"空 body + more_body 永真"
-        # 既推进不了 len(body)、也不增加计数 -> 无界循环，
-        # 而 MAX_BODY_CHUNKS 这道防线**永远不可达**（注释却声称它防的就是这个）。
-        # 实测：喂 20 万个空分片仍在循环，直到客户端断开才由别的分支结束。
-        chunks += 1
-        if chunks > MAX_BODY_CHUNKS:
-            raise PayloadTooLarge("too many body chunks")
-        chunk = message.get("body", b"")
-        if chunk:
-            body.extend(chunk)
-            if len(body) > limit:
-                raise PayloadTooLarge("body too large")
-        if not message.get("more_body", False) and len(body) < declared:
+        want = min(declared - len(body), _BODY_READ_SIZE)
+        try:
+            chunk = stream.read(want)
+        except OSError:
+            raise BadRequest("request body could not be read") from None
+        if not chunk:
+            # 输入流提前结束：客户端断开或截断。绝不能把"少一点"当成合法表单。
             raise BadRequest("truncated body")
+        body.extend(chunk)
     return bytes(body), declared
 
 
-def _collect_headers(scope) -> dict:
-    """请求头归一化为 {lower_name: value}（同名取最后一个）。"""
+def _request_path(environ) -> str:
+    """请求路径：`SCRIPT_NAME + PATH_INFO`（PEP 3333 的完整路径）。
+
+    gunicorn 默认 `SCRIPT_NAME=""`、`PATH_INFO` 就是完整路径；若部署方要求
+    应用挂在某个前缀下（`SCRIPT_NAME` 非空），拼接后才与路由表一致。
+    两者都缺失时回落 `"/"`（而不是空串，路由表以 `/` 为根）。
+    """
+    script = str(environ.get("SCRIPT_NAME") or "")
+    path = str(environ.get("PATH_INFO") or "")
+    full = script + path
+    return full or "/"
+
+
+def status_line(status: int) -> str:
+    """WSGI 状态行（`"404 Not Found"`）：必须有原因短语。
+
+    `http.client.responses` 是标准库里的权威表；未知状态码只发数字
+    （WSGI 允许只有数字的状态行，不编造原因短语）。
+    """
+    code = int(status)
+    reason = HTTP_REASONS.get(code, "")
+    return f"{code} {reason}".rstrip()
+
+
+def wsgi_headers(headers):
+    """把内部 `(bytes, bytes)` 响应头转成 WSGI 要求的 native `str`。
+
+    内部统一用 bytes（latin-1）组装，是为了让所有头（含 Cookie）走同一条
+    拼装路径；这里只做一次解码，**不改变任何字节内容**。
+    """
+    return [(name.decode("latin-1"), value.decode("latin-1"))
+            for name, value in headers]
+
+
+def collect_headers(environ) -> dict:
+    """请求头归一化为 {lower_name: value}。
+
+    - `HTTP_*` → 去掉前缀、下划线换连字符（`HTTP_X_FORWARDED_FOR` →
+      `x-forwarded-for`）；
+    - `CONTENT_TYPE` / `CONTENT_LENGTH` 是 WSGI 的**独立**键（不带 `HTTP_`
+      前缀），必须单独取，否则表单校验拿不到它们。
+
+    同名重复头：WSGI 服务器通常会合并成一个值（gunicorn 用 `,` 连接），
+    因此这里天然是"最后一次赋值生效"；应用不多做猜测。
+    """
     headers = {}
-    for name, value in scope.get("headers", []):
-        try:
-            key = name.decode("latin-1").lower()
-            headers[key] = value.decode("latin-1")
-        except (AttributeError, UnicodeDecodeError):
+    for key, value in environ.items():
+        if key.startswith("HTTP_"):
+            name = key[5:].replace("_", "-").lower()
+        elif key in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+            name = key.replace("_", "-").lower()
+        else:
             continue
+        if value is None:
+            continue
+        headers[name] = str(value)
     return headers
 
 
@@ -366,8 +428,9 @@ def _parse_cookie_header(raw: str) -> dict:
 
     实现委托 `core.security.parse_cookie_header` —— Cookie 解析只有那一处。
     （曾经 http 与 security 各有一份几乎相同的解析器，其中一份是死代码；
-    `_collect_headers` 只保留最后一个 `cookie` 头，而 security 那份会合并
-    多个头，两者行为**已经不同**，迟早有人按"另一份"的语义改坏其中一处。）
+    两份对"多个 cookie 头"的处理**已经不同**，迟早有人按"另一份"的语义
+    改坏其中一处。现在只剩这一条路径：`collect_headers()` 收集到的那个
+    `cookie` 值直接交给唯一的解析器。）
     """
     from .security import parse_cookie_header
 
@@ -399,7 +462,7 @@ def max_body_size() -> int:
 # ======================= Response =======================
 
 class Response:
-    """HTTP 响应。Feature 只关心 status / body / headers；Cookie 用专门 API。"""
+    """HTTP 响应。模块只关心 status / body / headers；Cookie 用专门 API。"""
 
     __slots__ = ("status", "body", "content_type", "headers", "cookies",
                  "cache_control")
@@ -449,7 +512,7 @@ def text(body, *, status=200, content_type="text/plain; charset=utf-8",
 
 
 def json_response(payload, *, status=200, headers=None, cache_control=None) -> Response:
-    """JSON 响应（本题不需要 API，但保持边界完整，避免 Feature 自己拼 json）。"""
+    """JSON 响应（本题不需要 API，但保持边界完整，避免模块自己拼 json）。"""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     return Response(body, status=status, content_type="application/json; charset=utf-8",
                     headers=headers, cache_control=cache_control)
@@ -505,7 +568,7 @@ def _has_url_control_chars(value: str) -> bool:
 def safe_next_path(raw, default: str = "/") -> str:
     """把"回跳地址"规范化为**站内路径**；不合法一律返回 `default`。
 
-    这是全项目唯一的回跳地址校验（Feature 不得自己实现一份）。
+    这是全项目唯一的回跳地址校验（模块不得自己实现一份）。
     拒绝：
       - 非字符串 / 空串；
       - 任何控制字符（含 TAB —— 见 `_has_url_control_chars` 的说明）；
@@ -545,9 +608,9 @@ def default_cache_control(request: Request, response: Response) -> str:
 
 
 def build_headers(request: Request, response: Response, *, head_only=False):
-    """把 Response 组装成完整的 ASGI 响应头（安全头 + Cookie 统一在此加）。
+    """把 Response 组装成完整的响应头（bytes；安全头 + Cookie 统一在此加）。
 
-    **这是安全响应头的唯一注入点**：Feature 返回的 Response 都会经过这里，
+    **这是安全响应头的唯一注入点**：模块返回的 Response 都会经过这里，
     因此它们不需要（也不应该）自己加任何安全头。CSP / Permissions-Policy /
     HSTS 的具体取值来自配置，见 `core/security.build_security_headers()`。
     """
@@ -582,28 +645,61 @@ def _set_cookie_header(name, value, *, max_age, http_only, secure):
     return _make_cookie(name, value, secure, int(max_age), http_only=http_only)
 
 
-async def send_response(send, request: Request, response: Response, *, head_only=False):
-    """统一出口：任何响应都经过这里（因此安全头不可能被 Feature 漏掉）。
+def send_response(start_response, request: Request, response: Response, *,
+                  head_only=False):
+    """统一出口：任何响应都经过这里（因此安全头不可能被模块漏掉）。
+
+    同步版（WSGI）：调用 `start_response` 发出状态行与全部响应头，
+    **返回响应体字节**，由调用方（`core.app.App`）包成可迭代对象交给服务器。
 
     注意执行顺序：先确保 CSRF 令牌已就绪，再组装 headers。
     模板里的 `{{ csrf_input() }}` 是在**渲染时**才生成令牌的，
     如果先组装 headers 再渲染，就会出现"页面里有令牌、响应却没有 Cookie"
     的不一致（下一个 POST 必然 403）。因此这里显式提前生成。
+
+    HEAD 请求返回空 body，但保留 GET 应有的 `Content-Length`
+    （RFC 9110 允许；服务器也不会把 body 发出去）。
     """
     if not head_only:
         request.csrf_token()
     headers = build_headers(request, response, head_only=head_only)
-    await send({
-        "type": "http.response.start",
-        "status": response.status,
-        "headers": headers,
-    })
-    await send({"type": "http.response.body",
-                "body": b"" if head_only else response.body})
+    start_response(status_line(response.status), wsgi_headers(headers))
+    return b"" if head_only else response.body
+
+
+def send_early_error(start_response, environ, error: HttpError):
+    """在请求对象还不可用时发送错误（安全头仍然照发）。
+
+    请求对象还没构造出来（例如 Host 头非法、请求体超限），因此这里只能
+    自己从 environ 取 scheme 判断是否 HTTPS。安全头仍走
+    `build_security_headers()` 这**同一个**入口，保证早期错误响应与正常
+    响应的头完全一致（验收要求 404/500 也带这些头）。
+
+    返回响应体字节（与 `send_response` 一致，由 `App` 包成 iterable）。
+    """
+    status = getattr(error, "status", 400)
+    body = str(error.message or "Bad Request").encode("utf-8")
+    headers = [
+        (b"content-type", b"text/plain; charset=utf-8"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    secure = get_request_scheme(environ, collect_headers(environ)) == "https"
+    headers.extend(build_security_headers(secure=secure))
+    headers.append((b"cache-control", b"no-store"))
+    if status in (400, 411, 413, 415):
+        # 请求体可能没被完整消费。
+        #
+        # 注：PEP 3333 把 `Connection` 归为逐跳头，服务器可能自行决定是否
+        # 发出它（gunicorn 会忽略应用给的这个头，并在 sync worker 下总是
+        # 关闭连接）。保留它是因为"应用认为这次请求应当结束连接"这个意图
+        # 必须留在响应里，而不是靠服务器的默认行为。
+        headers.append((b"connection", b"close"))
+    start_response(status_line(status), wsgi_headers(headers))
+    return body
 
 
 def error_response(status: int, message: str = "") -> Response:
-    """统一错误响应（纯文本；页面级错误页由 Feature 渲染带布局的 HTML）。"""
+    """统一错误响应（纯文本；页面级错误页由模块渲染带布局的 HTML）。"""
     reasons = {400: "Bad Request", 403: "Forbidden", 404: "Not Found",
                405: "Method Not Allowed", 411: "Length Required",
                413: "Payload Too Large", 415: "Unsupported Media Type",
@@ -621,8 +717,11 @@ __all__ = [
     "HttpError", "BadRequest", "LengthRequired", "PayloadTooLarge",
     "UnsupportedMediaType", "MethodNotAllowed", "Forbidden", "NotFound", "CsrfError",
     "Request", "Response", "html", "text", "json_response", "redirect",
-    "BASE_SECURITY_HEADERS", "build_security_headers",
-    "build_headers", "send_response", "error_response", "max_body_size",
+    # 注意：安全头的**定义**在 core.security（BASE_SECURITY_HEADERS 也在那里），
+    # 本模块只负责把它们装到响应上，因此不再从这里 re-export。
+    "build_security_headers",
+    "build_headers", "send_response", "send_early_error", "error_response",
+    "max_body_size", "collect_headers", "status_line", "wsgi_headers",
     "escape_html", "current_request", "cookie_name", "SESSION_COOKIE",
     "CSRF_MAX_AGE",
 ]

@@ -1,6 +1,6 @@
-{# 评论区：数据（含权限判断与展示文本）由 Feature 准备成 comment_rows，
+{# 评论区：数据（含权限判断与展示文本）由模块准备成 comment_rows，
    模板只负责排版。author / reply_to 是纯文本（Jinja 自动转义），
-   content 是 Feature 产出的 Markup（已转义并保留换行）。 #}
+   content 是模块产出的 Markup（已转义并保留换行）。 #}
 <section class="comments" id="comments">
   <h2>{{ t('comment_comments', total=comment_total) }}</h2>
 

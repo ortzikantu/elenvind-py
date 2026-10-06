@@ -1,11 +1,15 @@
-"""日志配置：控制台 + 轮转文件，根 logger 与 uvicorn logger 共用同一批 handler。
+"""日志配置：控制台 + 轮转文件，根 logger 与 gunicorn logger 共用同一批 handler。
 
 要点：
 - 日志文件路径相对**项目根目录**解析（config.ROOT），与其它路径配置保持一致，
   不随启动时的 cwd 变化。
 - 重复调用 setup_logging() 会先关闭并移除旧 handler，不会出现重复输出或句柄泄漏。
-- uvicorn 的 logger 设 propagate=False 并使用同一批 handler，避免同一条日志打两遍。
-- 关闭时由 shutdown_logging() 统一 flush + close（lifespan shutdown 阶段调用）。
+- gunicorn 的 logger 设 propagate=False 并使用同一批 handler，避免同一条日志打两遍
+  （gunicorn 的 error/access logger 默认自带 handler，且 propagate=True）。
+- 关闭时由 shutdown_logging() 统一 flush + close（进程退出阶段调用，
+  见 `elenvind/wsgi.py` 的 atexit）。
+- 多 worker 下每个 worker 各开一份 RotatingFileHandler：并发轮转在极端情况下可能
+  丢一行日志（gunicorn 自身也是这个行为），但绝不会写坏文件；日志不是数据。
 """
 import logging
 import logging.handlers
@@ -15,7 +19,12 @@ from pathlib import Path
 from .config import ROOT, resolve_path
 
 _LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-_UVICORN_LOGGERS = ("uvicorn", "uvicorn.access", "uvicorn.error")
+#: gunicorn 自己的 logger（error=启动/worker 生命周期，access=访问日志）
+_GUNICORN_LOGGERS = ("gunicorn", "gunicorn.error", "gunicorn.access")
+
+#: `level = "debug"` 时会把真正的信息埋掉的第三方噪音源
+#: （python-markdown 的 logger 名就是大写 `MARKDOWN`：每加载一个扩展打一条 DEBUG）。
+_NOISY_LOGGERS = ("MARKDOWN", "markdown", "markdown.extensions", "jinja2")
 
 _LEVELS = {
     "debug": logging.DEBUG,
@@ -41,9 +50,23 @@ def _remove_handlers(logger):
             pass
 
 
+def _quiet_noisy_loggers(level: int) -> None:
+    """第三方库压到 INFO 以下不再输出 DEBUG。
+
+    配 `level = "debug"` 是为了看**应用自己**的细节（写事务、锁、业务分支），
+    而 python-markdown 每加载一个扩展就打一条 DEBUG，Jinja2 也一样 ——
+    不压住的话真正的信息会被埋掉。只压这些已知噪音源：应用自己的
+    `elenvind.*` 与 `gunicorn.*`（启动/worker 生命周期）仍跟随配置级别。
+    """
+    if level > logging.INFO:
+        return
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.INFO)
+
+
 def setup_logging(level: str = "info", log_file: str = "logs/app.log",
                   max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5):
-    """配置根日志和 uvicorn 日志，输出到控制台与轮转文件。"""
+    """配置根日志和 gunicorn 日志，输出到控制台与轮转文件。"""
     log_path = resolve_log_path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -68,17 +91,19 @@ def setup_logging(level: str = "info", log_file: str = "logs/app.log",
     for handler in handlers:
         root_logger.addHandler(handler)
 
-    for logger_name in _UVICORN_LOGGERS:
-        uvicorn_logger = logging.getLogger(logger_name)
-        uvicorn_logger.setLevel(log_level)
-        uvicorn_logger.propagate = False
-        _remove_handlers(uvicorn_logger)
+    _quiet_noisy_loggers(log_level)
+
+    for logger_name in _GUNICORN_LOGGERS:
+        gunicorn_logger = logging.getLogger(logger_name)
+        gunicorn_logger.setLevel(log_level)
+        gunicorn_logger.propagate = False
+        _remove_handlers(gunicorn_logger)
         for handler in handlers:
-            uvicorn_logger.addHandler(handler)
+            gunicorn_logger.addHandler(handler)
 
 
 def shutdown_logging():
-    """关闭全部日志 handler（lifespan shutdown 时调用，确保日志落盘）。"""
-    for logger_name in (None,) + _UVICORN_LOGGERS:
+    """关闭全部日志 handler（进程退出时调用，确保日志落盘）。"""
+    for logger_name in (None,) + _GUNICORN_LOGGERS:
         logger = logging.getLogger() if logger_name is None else logging.getLogger(logger_name)
         _remove_handlers(logger)

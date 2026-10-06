@@ -185,7 +185,7 @@ class ReflectedXssTests(ElenvindTestCase):
         """
         from elenvind.core.db_comment import create_comment
         from elenvind.core.templating import render_template
-        from elenvind.features.blog import logic as blog
+        from elenvind.modules.blog import logic as blog
 
         user_id, _ = self.create_user()
         self.write_article("post", "body")
@@ -236,19 +236,46 @@ class CrlfInjectionTests(ElenvindTestCase):
                 self.assertNotIn("\n", location)
 
     def test_cookie_header_parsing_ignores_malformed_pairs(self):
-        from elenvind.core.security import parse_cookies
+        """一个畸形片段不该让整条 Cookie 头失效（同名取最后一个）。
 
-        scope = {"headers": [(b"cookie", b"session=abc; =broken; csrf=xyz; session=def")]}
-        cookies = parse_cookies(scope)
+        走 WSGI 的真实入口：`HTTP_COOKIE` 是**一个**字符串，解析的唯一实现是
+        `core.security.parse_cookie_header`（被 `http.collect_headers` 调用）。
+        """
+        from elenvind.core.security import parse_cookie_header
+
+        raw = "session=abc; =broken; csrf=xyz; session=def"
+        cookies = parse_cookie_header(raw)
         self.assertEqual(cookies.get("session"), "def")   # 同名取最后一个
         self.assertEqual(cookies.get("csrf"), "xyz")
 
-    def test_multiple_cookie_headers_are_merged(self):
-        from elenvind.core.security import parse_cookies
+    def test_malformed_cookie_does_not_log_everyone_out(self):
+        """端到端：畸形 Cookie 片段 + 合法会话 Cookie 仍然能认出会话。
 
-        scope = {"headers": [(b"cookie", b"session=abc"), (b"cookie", b"csrf=xyz")]}
-        cookies = parse_cookies(scope)
-        self.assertEqual(cookies, {"session": "abc", "csrf": "xyz"})
+        回归背景：`http.cookies.SimpleCookie` 遇到 `=broken` 会把整条头丢掉，
+        于是"一个损坏的无关 Cookie 让所有人掉线"。
+        """
+        user_id, password = self.create_user(email="cookie@example.com")
+        session, _csrf = self.login_ok("cookie@example.com", password)
+        response = self.app.request(
+            "GET", "/user",
+            extra_headers=[("cookie", f"=broken; session={session}")])
+        self.assertEqual(response.status, 200)
+        self.assertIn("cookie@example.com", response.text)
+
+    def test_cookie_header_is_a_single_wsgi_value(self):
+        """WSGI 只有 `HTTP_COOKIE` 一个键：服务器负责合并重复的 Cookie 头。
+
+        旧实现自己遍历请求头列表并"逐个合并"，那是协议适配层的职责；
+        现在应用只消费 `collect_headers()` 给出的那一个值（gunicorn 会把
+        重复头用 `,` 连起来），因此这里断言的是这条唯一契约。
+        """
+        from elenvind.core.http import collect_headers
+
+        headers = collect_headers({
+            "HTTP_COOKIE": "session=abc, csrf=xyz",
+            "HTTP_HOST": "example.com",
+        })
+        self.assertEqual(headers["cookie"], "session=abc, csrf=xyz")
 
 
 class CacheLeakTests(ElenvindTestCase):
@@ -274,7 +301,7 @@ class ServerErrorPageTests(ElenvindTestCase):
     """500 必须走自定义错误页，且**绝不**泄露 traceback / 异常类型。
 
     三层兜底都要拦住：
-    1. Feature 提供 server_error -> 带布局的错误页；
+    1. 模块提供 server_error -> 带布局的错误页；
     2. 没提供 / 渲染失败 -> 纯文本 "Internal Server Error"；
     3. 请求对象都没有（畸形请求）-> 纯文本。
     """
@@ -338,8 +365,6 @@ class ServerErrorPageTests(ElenvindTestCase):
     def test_falls_back_to_plain_text_without_handler(self):
         """没提供 server_error 时回落纯文本，且同样不泄露。"""
         from elenvind.core.app import App
-        from tests.support import run_async
-        import logging
 
         mini = App()
 
@@ -398,42 +423,27 @@ class ServerErrorPageTests(ElenvindTestCase):
         self.assertIn("error_message", template)
 
     def test_server_error_handler_is_wired(self):
-        """回归：error_handlers() 提供了 server_error，就必须真的接到 App 上。
+        """回归：system 模块提供的 500 渲染函数必须真的接到 App 上。
 
         曾经它被定义但从未装配 —— 500 一直走裸文本。
+        （装配点从旧的 `registry` 收敛到唯一的组合入口 `elenvind/app.py`。）
         """
         from elenvind.app import app
-        from elenvind.features import registry
+        from elenvind.modules.system import routes as system_routes
         self.assertIsNotNone(app.server_error)
-        self.assertIs(app.server_error, registry.error_handlers()["server_error"])
+        self.assertIs(app.server_error, system_routes.server_error)
 
     @staticmethod
     def _drive(mini, path):
-        from tests.support import run_async
+        from tests.support import build_environ, call_wsgi
         import logging
 
-        sent = []
-
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        async def send(message):
-            sent.append(message)
-
-        scope = {"type": "http", "method": "GET", "path": path, "scheme": "https",
-                 "headers": [], "query_string": b"",
-                 "client": ("127.0.0.1", 1)}
         logging.disable(logging.CRITICAL)
         try:
-            run_async(mini(scope, receive, send))
+            response = call_wsgi(mini, build_environ("GET", path))
         finally:
             logging.disable(logging.NOTSET)
-        start = [m for m in sent if m["type"] == "http.response.start"][0]
-        body = b"".join(m.get("body", b"") for m in sent
-                        if m["type"] == "http.response.body")
-        content_type = {k.decode(): v.decode()
-                        for k, v in start["headers"]}.get("content-type", "")
-        return start["status"], body, content_type
+        return response.status, response.body, response.content_type
 
 
 class ErrorHandlingTests(ElenvindTestCase):

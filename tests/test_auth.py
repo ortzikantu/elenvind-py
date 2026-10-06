@@ -76,7 +76,7 @@ class LoginTests(ElenvindTestCase):
         self.assertIn("Too many failed attempts for this account", response.text)
 
     def test_login_rate_limit_by_ip(self):
-        from elenvind.features.auth import routes as auth_routes
+        from elenvind.modules.auth import routes as auth_routes
         limits = dict(auth_routes.DEFAULT_LOGIN_LIMITS)
         limits["max_ip_failures"] = 3
         self._config["login_limits"] = limits
@@ -86,7 +86,7 @@ class LoginTests(ElenvindTestCase):
         self.assertIn("Too many failed attempts from this address", response.text)
 
     def test_login_rate_limit_global(self):
-        from elenvind.features.auth import routes as auth_routes
+        from elenvind.modules.auth import routes as auth_routes
         limits = dict(auth_routes.DEFAULT_LOGIN_LIMITS)
         limits["max_global_failures"] = 2
         self._config["login_limits"] = limits
@@ -429,7 +429,7 @@ class RegistrationTests(ElenvindTestCase):
         self.assertEqual(count, 1)
 
     def test_duplicate_registration_after_integrity_error_is_friendly(self):
-        import elenvind.features.auth.routes as auth_routes
+        import elenvind.modules.auth.routes as auth_routes
 
         token = self.fetch_csrf()
         # 让 SELECT 查重"看不到"已存在用户，强制走 INSERT 路径触发 IntegrityError

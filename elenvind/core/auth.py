@@ -69,7 +69,7 @@ def normalize_auth(value):
         return None
     return AUTHENTICATED if value == REQUIRED else value
 
-#: 认证结果原因（供 Feature 映射成提示文案，不直接暴露给用户）
+#: 认证结果原因（供模块映射成提示文案，不直接暴露给用户）
 OK = "ok"
 BAD_CREDENTIALS = "bad_credentials"
 NEEDS_REHASH = "needs_rehash"

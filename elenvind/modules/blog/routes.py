@@ -1,4 +1,4 @@
-"""Blog Feature 的 HTTP 路由（只做业务，安全全部交给 Core）。
+"""Blog 模块的 HTTP 路由（只做业务，安全全部交给 Core）。
 
 路由声明即安全：
     @router.route("/article/<slug>", methods=["GET"])
@@ -105,6 +105,8 @@ def register(router, *, render_not_found):
                                user["id"], request.client_ip, slug, reply_to)
                 return _article_error(request, slug, message, status=400)
             return _article_error(request, slug, message, status=400)
+        logger.info("Comment created: slug=%s user_id=%s parent_id=%s ip=%s",
+                    slug, user["id"], reply_to, request.client_ip)
         return redirect(f"/article/{slug}#comments")
 
     @router.route("/article/<slug>/comment/delete/<comment_id>", methods=["POST"],
@@ -113,6 +115,9 @@ def register(router, *, render_not_found):
         comment = _authorized_comment(request, slug, comment_id, admin_only=False)
         if not comment["is_deleted"]:
             logic.remove_comment(comment["id"])
+            # 审核动作留痕（软删除可恢复，因此这是审计记录而不是"删除公告"）
+            logger.info("Comment soft-deleted: id=%s slug=%s by user_id=%s",
+                        comment["id"], slug, request.user["id"])
         return redirect(f"/article/{slug}#comments")
 
     @router.route("/article/<slug>/comment/restore/<comment_id>", methods=["POST"],
@@ -121,6 +126,8 @@ def register(router, *, render_not_found):
         comment = _authorized_comment(request, slug, comment_id, admin_only=True)
         if comment["is_deleted"]:
             logic.restore_comment_by_id(comment["id"])
+            logger.info("Comment restored: id=%s slug=%s by admin user_id=%s",
+                        comment["id"], slug, request.user["id"])
         return redirect(f"/article/{slug}#comments")
 
     return router

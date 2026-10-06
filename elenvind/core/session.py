@@ -1,7 +1,7 @@
 """Core Session：服务端会话的唯一 API。
 
-    Feature ──► current_user(request) / login_user() / logout_user()
-    Core    ──► Core 管理 Cookie、轮换、失效；Feature 不碰 session cookie。
+    模块 ──► current_user(request) / login_user() / logout_user()
+    Core    ──► Core 管理 Cookie、轮换、失效；模块不碰 session cookie。
 
 安全语义（集中且唯一）：
 - 会话是 32 字节随机 token，只存服务端表里，客户端只拿 Cookie；
@@ -59,7 +59,7 @@ def session_cookie_max_age() -> int:
 def load_user(request):
     """把会话里的用户挂到 request 上（每次请求调用一次）。
 
-    返回用户行对象或 None。Feature 用 `current_user(request)` 取。
+    返回用户行对象或 None。模块用 `current_user(request)` 取。
     """
     token = request.session_token
     if not token:
@@ -77,7 +77,7 @@ def load_user(request):
 def current_user(request=None):
     """当前登录用户；无请求上下文或未登录返回 None。
 
-    这是 Feature 获取用户的**唯一**方式：不允许自己读会话 Cookie。
+    这是模块获取用户的**唯一**方式：不允许自己读会话 Cookie。
 
     注意：用户对象是 `sqlite3.Row`，**不支持 getattr**（`getattr(row, "x")` 恒为
     None），必须用下标访问。
@@ -120,7 +120,7 @@ def logout_user(request):
 
     Cookie 的清除由 Core 统一完成（`request.invalidate_session_cookie()`
     会把 token 置空并标记"需要清除 Cookie"，`Request.pending_cookies()` 负责
-    下发清除指令）。**Feature 不需要、也不应该自己去 delete_cookie()** ——
+    下发清除指令）。**模块不需要、也不应该自己去 delete_cookie()** ——
     它既不该知道 Cookie 名字，也不该知道 `__Host-` 前缀这类策略。
     """
     if request is not None:

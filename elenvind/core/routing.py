@@ -6,7 +6,7 @@
     def settings(request):
         return render_template("settings.html", {...})
 
-未声明的安全能力由 Core **默认施加**，Feature 不写也不会漏：
+未声明的安全能力由 Core **默认施加**，模块不写也不会漏：
 
 | 能力 | 由谁施加 | 触发条件 |
 |---|---|---|
@@ -15,7 +15,7 @@
 | 权限 | 调度器 | `permission="admin"` |
 | 安全响应头 | `send_response` | 所有响应 |
 | Cookie 属性 | `http._set_cookie_header` | 所有 Set-Cookie |
-| 请求体上限 / Content-Type / framing | `Request.from_asgi` | 所有请求 |
+| 请求体上限 / Content-Type / framing | `Request.from_wsgi` | 所有请求 |
 
 设计取舍（刻意不做的事）：没有中间件栈、没有依赖注入、没有插件、
 没有 blueprints。路由表就是一个 list[(path, methods, handler, spec)]，
@@ -46,7 +46,7 @@ def _login_redirect(request):
     """未登录访问受保护页面时的友好处理：跳登录页并记住原目标。
 
     用户体验优先：直接 403 会让人一头雾水；跳登录页并带回跳地址才是预期行为。
-    `next` 只接受**站内路径**（防开放重定向），登录后由 auth Feature 消费。
+    `next` 只接受**站内路径**（防开放重定向），登录后由 auth 模块消费。
     """
     from urllib.parse import quote
 
@@ -77,7 +77,7 @@ def _static_first(route):
 
     注意**不**在这里给多段通配（`<path:x>`）排末位：那属于"兜底之间"的次序，
     由注册顺序表达更直观、也更容易推理
-    （见 `features/registry.py`：静态资源注册在自定义页面之前）。
+    （见 `elenvind/app.py` 的装配顺序：静态资源注册在自定义页面之前）。
     """
     dynamic = sum(1 for part in route._parts if part.startswith("<"))
     return (dynamic, len(route._parts))
@@ -236,7 +236,7 @@ class Router:
            405 语义；
         2. 同组内**静态段多的优先**——固定路径胜过动态段；
         3. 同组且同样"具体"的，**保持注册顺序**——这样"静态文件 vs 页面兜底"
-           这类先后关系由 `features/registry.py` 的注册顺序直接表达。
+           这类先后关系由 `elenvind/app.py`（装配层）的注册顺序直接表达。
 
         `allowed_methods` 非空表示"路径存在但方法不允许" -> 405 + Allow。
 
@@ -267,11 +267,13 @@ class Router:
         return (), tuple(allowed)
 
     # ---------- 调度 ----------
-    async def dispatch(self, request, *, not_found=None, forbidden=None):
+    def dispatch(self, request, *, not_found=None, forbidden=None):
         """执行一个请求：匹配 -> 逐个尝试候选路由 -> 安全闸门 -> handler。
 
-        `not_found` / `forbidden` 是可选的自定义处理函数（Feature 用它们渲染
+        `not_found` / `forbidden` 是可选的自定义处理函数（模块用它们渲染
         带布局的错误页）；未提供时回落到 Core 的纯文本响应。
+
+        同步：handler 是普通函数（同步业务），不需要 await。
         """
         candidates, allowed = self.match(request.method, request.path)
 
@@ -286,14 +288,14 @@ class Router:
 
         for route, params in candidates:
             try:
-                return await self._run(route, params, request, forbidden)
+                return self._run(route, params, request, forbidden)
             except RouteMiss:
                 # 该路由"路径匹配但资源不存在"（例如静态文件缺失）：
                 # 继续交给下一个候选，让自定义页面兜底有机会接手。
                 continue
         return not_found(request) if not_found else error_response(404)
 
-    async def _run(self, route, params, request, forbidden):
+    def _run(self, route, params, request, forbidden):
         """跑单个路由：安全闸门 + handler。抛出 `RouteMiss` 表示继续找下一个。"""
         try:
             # --- 默认 CSRF 保护：非安全方法一律校验 ---

@@ -1,8 +1,10 @@
-"""Pages Feature：自定义页面（custom_pages/*.md）。
+"""Pages 模块：自定义页面（custom_pages/*.md）。
 
 页面是**纯 Markdown 正文**（无文档头），文件名即路由：`about.md` -> `/about`。
 路径安全：slug 先过白名单校验；页面内容是扫描目录得到的，URL 只做字典查表，
 从不参与文件路径拼接。
+
+依赖：只依赖 `core/`（含共享的内容格式原语 `core.content`）。
 """
 from __future__ import annotations
 
@@ -10,8 +12,8 @@ import logging
 from pathlib import Path
 
 from ...core.config import ROOT, config, resolve_path
+from ...core.content import ContentError, validate_slug
 from ...core.markdown import render_markdown
-from ..blog.content import ContentError, validate_slug
 
 logger = logging.getLogger(__name__)
 

@@ -48,7 +48,7 @@ registration_enabled = true
 session_absolute_days = 30         # 默认 30 天
 session_idle_days = 15             # 默认 15 天不活跃即失效
 
-# 安全响应头（由 Core 在响应收尾阶段统一注入，Feature 层不感知）见文件末尾的
+# 安全响应头（由 Core 在响应收尾阶段统一注入，模块层不感知）见文件末尾的
 # [security] 表。TOML 的 [table] 会"吃掉"它之后的所有顶层键，因此本文件把
 # 所有表都排在这些顶层键之后。
 
@@ -82,9 +82,15 @@ use_builtin_css = true
     # 请改回 "127.0.0.1"，否则 6789 端口会直接暴露在公网。
     host = "0.0.0.0"
     port = 6789
-    # 受信代理列表（用于解析 X-Forwarded-For 客户端 IP）：仅当直连对端在此
-    # 列表中时才信任转发头，防伪造绕过登录限流。nginx 反代场景保持回环默认即可；
-    # 若代理与本站不在同一台机器，请改为代理的实际地址。
+    # Gunicorn worker 进程数（`python run.py` 会读它；也可用 --workers 覆盖）。
+    # 2 是出厂值，个人站足够。所有写事务经过 Core 的 write_tx()（flock 跨进程
+    # 排他 + BEGIN IMMEDIATE）：多 worker 是安全的，但**写是串行的**，加 worker
+    # 只对读有帮助。
+    workers = 2
+    # 受信代理列表（唯一来源）：仅当直连对端在此列表中时，才采信
+    # X-Forwarded-For（客户端 IP）与 X-Forwarded-Proto（https 判定），
+    # 防伪造绕过登录限流、骗到 Secure Cookie/HSTS。nginx 反代场景保持回环
+    # 默认即可；若代理与本站不在同一台机器，请改为代理的实际地址。
     trusted_proxies = ["127.0.0.1", "::1"]
     # 是否给会话/CSRF Cookie 加 __Host- 前缀（要求全程 HTTPS + Path=/ + 无 Domain）。
     # 仅在站点确定只能通过 HTTPS 访问时开启，否则浏览器会拒收这些 Cookie。
@@ -162,7 +168,7 @@ use_builtin_css = true
   [[params.projects]]
     name = "Elenvind"
     url = "https://codeberg.org/yourname/elenvind"
-    description = "本站运行的基石，仅用 Python 标准库、SQLite 与 uvicorn 构建的博客。"
+    description = "本站运行的基石，仅用 Python 标准库、SQLite 与 Gunicorn（WSGI）构建的博客。"
 
 ###################################################################################################
 
@@ -173,7 +179,7 @@ use_builtin_css = true
     backup_count = 5
 
 ###################################################################################################
-# 安全响应头（由 Core 在响应收尾阶段统一注入，Feature 层不感知）
+# 安全响应头（由 Core 在响应收尾阶段统一注入，模块层不感知）
 #
 # 这些头**默认已经生效**，本节只需按需调整；整节删掉也能正常启动。
 # 注意：这里只覆盖"被动安全头"，CSRF / 会话 / Host 防护等主动安全不受影响。

@@ -30,7 +30,7 @@
 - 路由层还有一道预检，但它在事务**之外**，属于 TOCTOU（并发时两个请求可能同时
   看到"还没到顶"），因此只作为"给出更友好文案"的快捷路径，不作数；
 - 层级计算只有一处实现：`core.db_comment.comment_depth`（渲染侧
-  `features/blog/logic.comment_depth` 是它的包装），因此两边不会算出不同结果。
+  `modules/blog/logic.comment_depth` 是它的包装），因此两边不会算出不同结果。
 
 **没有"不限制层级"这个选项**：合法区间是 `1–10000`（`core/config.py` 的
 `_check_int(cfg.get("max_comment_depth", 32), ..., 1, 10000)`），设成 `0` 或负数
@@ -71,28 +71,29 @@
 |---|---|---|
 | `host` | `"127.0.0.1"` | 监听地址。默认只监听回环（配合 Nginx 本机回源）。`config.example.toml` 里写的是 `"0.0.0.0"`（面向"直接对外提供服务"的场景），**若用那份模板，请按需改回 `"127.0.0.1"`**。 |
 | `port` | `6789` | 监听端口（1–65535，越界启动失败）。 |
-| `trusted_proxies` | `["127.0.0.1","::1"]` | **安全相关**：只有直连对端属于该列表时，`X-Forwarded-For` 才会被采信为客户端 IP（登录/评论限流按此计数）。`X-Real-IP` 一律不采信。切勿加入公网地址。 |
+| `workers` | `2` | Gunicorn worker 进程数（1–64）。`python run.py` 读它；也可用 `gunicorn --workers N` / `python run.py --workers N` 覆盖。多 worker 是设计的一部分：所有写事务经过 Core 的 `write_tx()`（`flock` 跨进程排他 + `BEGIN IMMEDIATE`），因此**不需要**为了 SQLite 退回 `--workers 1`，也不要指望用增加 worker 数来提升写入吞吐（写是串行的）。 |
+| `trusted_proxies` | `["127.0.0.1","::1"]` | **安全相关**：只有直连对端属于该列表时，`X-Forwarded-For`（客户端 IP）与 `X-Forwarded-Proto`（https 判定）才会被采信。后者决定 `Secure` Cookie 与 HSTS 是否下发。`X-Real-IP` 一律不采信。切勿加入公网地址。 |
 | `cookie_prefix` | `false` | 是否给会话/CSRF Cookie 加 `__Host-` 前缀。要求全程 HTTPS + `Path=/` + 无 Domain；仅在站点确定只能通过 HTTPS 访问时开启。开启后读取侧仍兼容旧的无前缀 Cookie，切换不会把所有人踢下线。另外它还会让 `[security].hsts_enabled` 缺失时视为启用。 |
 
-### 代理信任边界（务必理解，涉及两个层次）
+### 代理信任边界（务必理解）
 
-应用对"代理"的信任分两处，默认值一致、可分别调整：
+**只有一个信任来源：`trusted_proxies`。** 它同时控制两件事：
 
-1. **HTTP scheme（`https` 判定）**由 uvicorn 负责。`run.py` 以
-   `proxy_headers=True` + `forwarded_allow_ips="127.0.0.1"` 启动，
-   即**只有回环地址**的 `X-Forwarded-Proto` 会被采信，据此决定
+1. **客户端 IP**：`X-Forwarded-For` 的第一个地址（登录/评论限流按此计数）；
+2. **HTTP scheme（`https` 判定）**：`X-Forwarded-Proto` 的第一个值，据此决定
    `Secure` Cookie 与 HSTS 是否下发。
-2. **客户端 IP** 由应用负责，规则见 `trusted_proxies`（本表上一行）。
 
-两者必须都能对得上，安全边界才完整：
+两者都在应用内判定，因此不存在"HTTP 服务器一份列表、应用又一份列表"的漂移
+（`run.py` 只是把这份列表**原样**交给 Gunicorn 的 `forwarded_allow_ips`，
+让两层看到同一个值）：
 
-- 代理在**本机回环**（默认拓扑）：两级都默认生效，无需额外配置。
-- 代理在**其它地址**：除了把该地址写进 `trusted_proxies`，
-  还必须用 `uvicorn --forwarded-allow-ips="<代理地址>"` 直接启动
-  （不要再用 `run.py` 的内置默认值），否则 `X-Forwarded-Proto` 不被采信，
-  HTTPS 下 `Secure` Cookie 不会下发。
+- 代理在**本机回环**（默认拓扑）：默认生效，无需额外配置。
+- 代理在**其它地址**：把该地址写进 `trusted_proxies` 即可。若直接用 Gunicorn
+  CLI 启动而不是 `python run.py`，请同时传
+  `--forwarded-allow-ips="<代理地址>"`（Gunicorn 自身也会按它判断
+  `X-Forwarded-Proto`；两层取值一致最不容易出错）。
 - **防火墙必须封闭应用端口**：若应用端口可被公网直连，攻击者可以直接伪造
-  `X-Forwarded-Proto: https`（uvicorn 会当成真实 scheme）以及绕过全部代理假定。
+  `X-Forwarded-Proto: https` 以及绕过全部代理假定。
   这是本应用最重要的部署前置条件。
 
 ## `[pagination]` 分页
@@ -204,7 +205,7 @@ CSS/JS/SVG/字体等常见类型有显式映射（避免被回成 `text/plain` �
 | `intro` | 首页 about 区介绍段落，原样转义输出；整行删除则该段落消失。 |
 
 > 没有 `params.author`：文章作者来自每篇 `.md` 文件 front matter 里的
-> `authors = [...]`（见 `docs/development/features.md` 第 6 节），
+> `authors = [...]`（见 `docs/development/modules.md` 第 6 节），
 > 不设全局作者配置，避免出现"配置里写着作者但页面不读"的死配置。
 
 ### `[[params.nav]]` 顶栏/页脚导航（可多条）
@@ -240,7 +241,7 @@ CSS/JS/SVG/字体等常见类型有显式映射（避免被回成 `text/plain` �
 
 ## `[security]` 安全响应头
 
-这些头由 **Core 在响应收尾阶段统一注入**，Feature 层完全不感知；
+这些头由 **Core 在响应收尾阶段统一注入**，模块层完全不感知；
 整节删掉也能正常启动（走代码内默认值）。它只覆盖**被动**安全头，
 CSRF / 会话 / `trusted_proxies` 等主动安全不受本节影响。
 
@@ -390,16 +391,27 @@ session_idle_days = 0        # ⚠️ 回到"会话永久有效"
 | `max_bytes` | `10485760` | 单文件轮转阈值（10 MB）。 |
 | `backup_count` | `5` | 保留的历史日志份数。 |
 
+`info`（默认）下每个请求都会留一行访问日志（方法、路径、状态码、耗时、字节数、
+客户端 IP、登录用户 id、worker pid），以及启动细节、认证/评论审计事件与限流
+WARNING；`debug` 额外打印每一笔写事务（耗时 + 改动行数）与锁获取明细
+（第三方库的 DEBUG 会被自动压到 `info`，因此 debug 里只有应用自己的细节）。
+完整清单、字段含义与"刻意不记什么"见
+[运维手册 · 一、进程与日志](OPS_GUIDE.md#一进程与日志)。
+
+> 访问日志与写事务明细都由 Core 统一记录，业务模块**不需要**自己写。
+> 嫌访问日志啰嗦就把 `level` 调到 `warning`：审计与安全 WARNING 仍会保留。
+
 ## 启动校验（错误配置不会跑到页面才炸）
 
 启动时会一次性校验：`locale` / `title` / `site_url` / `admin_user_id` /
 `registration_enabled` / `max_length` / `max_comment_depth` /
 `max_comments_per_article` / `session_absolute_days` / `session_idle_days` /
 `max_body_size` / `database` / 内容目录 /
-`[server]`（host、port、trusted_proxies、cookie_prefix）/ `[security]` /
+`[server]`（host、port、workers、trusted_proxies、cookie_prefix）/ `[security]` /
 `[static]` URL / `[pagination]` / 三个限流段落 / `[logging]`。
-任一项非法都会打印原因并以非零码退出（lifespan 阶段则为
-`lifespan.startup.failed`，uvicorn 不会启动一个半初始化的应用）。
+任一项非法都会打印原因并以非零码退出；`run.py` 在接管端口前先校验一次，
+而 `elenvind.wsgi` 在导入时也会再校验一次 —— 任一环节失败都拒绝启动，
+不会出现"跑着一个半初始化的应用"。
 
 ## 常见修改示例
 

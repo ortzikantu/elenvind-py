@@ -1,13 +1,16 @@
-"""测试公共设施：ASGI 调用夹具、临时数据库、响应解析。
+"""测试公共设施：WSGI 调用夹具、临时数据库、响应解析。
 
 设计原则：
 - 不依赖任何第三方测试包，只用标准库 unittest。
 - 每个测试用例使用独立的临时数据库与临时内容目录，绝不触碰项目根的真实数据。
-- 通过直接调用 ASGI 可调用对象（elenvind.app.app）来跑"端到端"请求，
-  与 uvicorn 传入的 scope/receive/send 语义一致，因此无需安装 uvicorn 也能覆盖
-  HTTP 层、路由、CSRF、会话与渲染的完整链路。
+- 通过直接调用 WSGI 可调用对象（elenvind.app.app）来跑"端到端"请求：
+  自己拼 environ、自己收 `start_response`，与 gunicorn 传给应用的语义一致，
+  因此无需启动 HTTP 服务器也能覆盖 HTTP 层、路由、CSRF、会话与渲染的完整链路。
+
+不做的事：这里**不**模拟 gunicorn 的逐跳头过滤、连接复用等行为 ——
+那些属于服务器，不属于应用；夹具只验证"应用交给 WSGI 服务器的东西"。
 """
-import asyncio
+import io
 import os
 import shutil
 import sys
@@ -35,8 +38,8 @@ from elenvind.core import config as config_module          # noqa: E402
 from elenvind.core import db_base                          # noqa: E402
 from elenvind.core import lifespan as lifespan_module      # noqa: E402
 from elenvind.core import console as console_module        # noqa: E402
-from elenvind.features.blog import logic as blog_logic     # noqa: E402
-from elenvind.features.pages import logic as pages_logic   # noqa: E402
+from elenvind.modules.blog import logic as blog_logic     # noqa: E402
+from elenvind.modules.pages import logic as pages_logic   # noqa: E402
 
 # 静音启动横幅/彩色日志：测试输出只保留 unittest 的结果
 _NOOP = lambda *args, **kwargs: None
@@ -45,9 +48,34 @@ for _name in ("success", "error", "warning", "info", "banner"):
     setattr(console_module, _name, _NOOP)
 
 
-def run_async(coro):
-    """在同步测试里跑一个协程（每个测试独立事件循环，互不干扰）。"""
-    return asyncio.run(coro)
+class StreamInput:
+    """可控的 `wsgi.input` 替身。
+
+    PEP 3333 允许输入流**短读**（一次只给一部分），也允许它给不出任何数据
+    （客户端断开）。这两种行为在真实服务器上都出现过，因此这里可以精确模拟：
+
+    - `data`：可读的字节总量；读到末尾后 `read()` 返回 `b""`（EOF）；
+    - `max_per_read`：单次 `read()` 最多返回多少字节（模拟短读）；
+    - `always_empty`：永远返回 `b""`（"声明了长度却一个字节都不给"）。
+    """
+
+    def __init__(self, data=b"", *, max_per_read=None, always_empty=False):
+        self.data = data
+        self.offset = 0
+        self.max_per_read = max_per_read
+        self.always_empty = always_empty
+
+    def read(self, size=-1):
+        if self.always_empty:
+            return b""
+        if size is None or size < 0:
+            size = len(self.data) - self.offset
+        if self.max_per_read is not None:
+            size = min(size, self.max_per_read)
+        chunk = self.data[self.offset:self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
 
 
 def _remove_tmpdir(tmpdir, *, attempts=5):
@@ -108,8 +136,75 @@ def _remove_tmpdir(tmpdir, *, attempts=5):
         pass
 
 
+def build_environ(method, path, *, query_string="", headers=(), body=b"",
+                  host="example.com", scheme="https", peer=("127.0.0.1", 44321),
+                  stream=None):
+    """按 PEP 3333 造一个 environ（gunicorn 的填法）。
+
+    - 请求头：`CONTENT_TYPE` / `CONTENT_LENGTH` 走独立键，其余 `HTTP_*`；
+    - `wsgi.input`：默认是 `body` 的 BytesIO，可用 `stream` 替换
+      （见 `StreamInput`，用于短读/截断/空读等边界）。
+    """
+    raw_query = (query_string.decode("latin-1")
+                 if isinstance(query_string, (bytes, bytearray))
+                 else str(query_string))
+    environ = {
+        "REQUEST_METHOD": method,
+        "SCRIPT_NAME": "",
+        "PATH_INFO": path,
+        "QUERY_STRING": raw_query,
+        "SERVER_NAME": host,
+        "SERVER_PORT": "443" if scheme == "https" else "80",
+        "SERVER_PROTOCOL": "HTTP/1.1",
+        "REMOTE_ADDR": peer[0] if peer else "",
+        "wsgi.version": (1, 0),
+        "wsgi.url_scheme": scheme,
+        "wsgi.input": stream if stream is not None else io.BytesIO(body),
+        "wsgi.errors": io.StringIO(),
+        "wsgi.multithread": False,
+        "wsgi.multiprocess": True,
+        "wsgi.run_once": False,
+    }
+    for name, value in headers:
+        key = str(name).upper().replace("-", "_")
+        if key in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+            environ[key] = str(value)
+        else:
+            environ["HTTP_" + key] = str(value)
+    return environ
+
+
+def call_wsgi(app, environ) -> "Response":
+    """调用一个 WSGI callable，返回解析好的 `Response`。
+
+    自己收 `start_response`：因此这里验证的正是"应用交给 WSGI 服务器的东西"。
+    """
+    captured = {}
+
+    def start_response(status, response_headers, exc_info=None):
+        if "status" in captured and exc_info is None:
+            raise AssertionError("start_response called twice")
+        captured["status"] = status
+        captured["headers"] = list(response_headers)
+        return lambda data: None
+
+    result = app(environ, start_response)
+    try:
+        raw_body = b"".join(result)
+    finally:
+        close = getattr(result, "close", None)
+        if close is not None:
+            close()
+
+    status_text = str(captured.get("status", "500 Internal Server Error"))
+    status = int(status_text.split(" ", 1)[0])
+    resp_headers = [(str(key).encode("latin-1"), str(value).encode("latin-1"))
+                    for key, value in captured.get("headers", [])]
+    return Response(status, resp_headers, raw_body)
+
+
 class Response:
-    """ASGI 响应的解析结果。"""
+    """WSGI 响应的解析结果。"""
 
     def __init__(self, status, headers, body):
         self.status = status
@@ -139,7 +234,7 @@ class Response:
 
 
 class AppHarness:
-    """把 elenvind.app.app 当作真实 ASGI 应用来调用。"""
+    """把 elenvind.app.app 当作真实 WSGI 应用来调用。"""
 
     #: 默认直连对端：模拟"应用前面有一台受信代理"（127.0.0.1 在默认白名单内）
     DEFAULT_PEER = ("127.0.0.1", 44321)
@@ -151,31 +246,19 @@ class AppHarness:
         self.started = False
         self.jar = {}          # use_jar=True 时的浏览器式 Cookie 罐
 
-    # ---------- lifespan ----------
+    # ---------- 启动 ----------
     def startup(self):
-        """跑一次完整的 lifespan 启动流程（配置/日志/i18n/建库/缓存）。
+        """跑一次完整的启动流程（配置/日志/i18n/建库/缓存）。
 
-        启动失败时把失败原因作为断言抛出，避免测试报出与真实原因无关的错误。
+        启动钩子与生产路径同源（装配层的 `STARTUP_HOOKS`），因此测试覆盖的
+        就是真实的启动序列；启动失败时异常直接向上抛（不会出现"夹具断言失败
+        掩盖配置错误"的情况）。
         """
-        from elenvind.app import app
+        from elenvind.app import STARTUP_HOOKS
+        from elenvind.core.lifespan import startup
 
-        messages = [{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}]
-        sent = []
-
-        async def receive():
-            if messages:
-                return messages.pop(0)
-            return {"type": "lifespan.shutdown"}
-
-        async def send(message):
-            sent.append(message)
-
-        run_async(app({"type": "lifespan"}, receive, send))
+        startup(STARTUP_HOOKS)
         self.started = True
-        first = sent[0] if sent else {}
-        if first.get("type") != "lifespan.startup.complete":
-            raise AssertionError(f"lifespan startup failed: {first}")
-        return first
 
     # ---------- HTTP ----------
     # ---------- 便捷操作 ----------
@@ -193,58 +276,21 @@ class AppHarness:
         return jar
 
     def raw_request(self, method, path, query_string=b"", headers=(),
-                    body=b"", chunks=None, client=None):
-        """最底层调用：headers/body/chunks 完全由调用方给定。
+                    body=b"", client=None, stream=None):
+        """最底层调用：environ 完全由调用方给定，与 gunicorn 的填法一致。
 
-        chunks 给出时按分片发送（用于测试分片 body、提前结束、断开等场景）。
+        - `headers`：[(name, value)]，写进 environ 时按 WSGI 约定转换
+          （`CONTENT_TYPE` / `CONTENT_LENGTH` 走独立键，其余走 `HTTP_*`）；
+        - `stream`：替换 `wsgi.input`（见 `StreamInput`），用于短读 / 截断 /
+          "一个字节都不给"等边界；默认按 `body` 造一个 BytesIO。
         """
         from elenvind.app import app
 
-        scope = {
-            "type": "http",
-            "asgi": {"version": "3.0", "spec_version": "2.3"},
-            "http_version": "1.1",
-            "method": method,
-            "scheme": self.scheme,
-            "path": path,
-            "raw_path": path.encode("latin-1"),
-            "query_string": query_string,
-            "root_path": "",
-            "headers": [(k.lower().encode("latin-1"), v.encode("latin-1"))
-                        for k, v in headers],
-            "client": client if client is not None else self.client,
-            "server": (self.host, 443),
-        }
-
-        if chunks is None:
-            messages = [{"type": "http.request", "body": body, "more_body": False}]
-        else:
-            messages = list(chunks)
-
-        sent = []
-        received_body = [False]
-
-        async def receive():
-            if messages:
-                return messages.pop(0)
-            # 客户端不再发数据：模拟断开，避免被测代码无限等待
-            return {"type": "http.disconnect"}
-
-        async def send(message):
-            sent.append(message)
-
-        run_async(app(scope, receive, send))
-
-        status = 500
-        resp_headers = []
-        resp_body = b""
-        for message in sent:
-            if message["type"] == "http.response.start":
-                status = message["status"]
-                resp_headers = list(message.get("headers", []))
-            elif message["type"] == "http.response.body":
-                resp_body += message.get("body", b"")
-        return Response(status, resp_headers, resp_body)
+        peer = client if client is not None else self.client
+        environ = build_environ(method, path, query_string=query_string,
+                                headers=headers, body=body, host=self.host,
+                                scheme=self.scheme, peer=peer, stream=stream)
+        return call_wsgi(app, environ)
 
     def request(self, method, path, *, query=None, form=None, cookies=None,
                 headers=None, content_type="application/x-www-form-urlencoded",
@@ -351,7 +397,6 @@ class ElenvindTestCase(unittest.TestCase):
         # 前一个用例刚清理过会让后一个用例的清理被节流跳过（顺序耦合）。
         from elenvind.core.db_prune import reset_state as reset_prune_state
         reset_prune_state()
-        lifespan_module.clear_startup_hooks()
         from elenvind.core.templating import reset_environment
         reset_environment()
         from elenvind.core.db_user import _invalidate_user_count

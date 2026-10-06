@@ -13,7 +13,10 @@
 
 这里给出统一策略：**时间片**清理。只有当距上次清理超过 `interval_seconds`
 时才真的执行 DELETE；调用点在写事务**之外**，因此不占写锁。
-判定只看内存里的时间戳（无 IO），绝大多次调用是"看一眼就跳过"。
+
+调用位置是硬约束：`prune()` 自己就是一个写事务（走 `write_tx()`，取同一把
+flock），所以**绝不能**在另一个 `write_tx()` 块内调用它 —— 那会触发重入守卫
+（否则就是自死锁）。
 """
 from __future__ import annotations
 
@@ -55,17 +58,20 @@ def prune(table: str, column: str, days: int,
 
     调用方必须在**写事务之外**调用它（例如写入提交之后），
     这样 DELETE 不会延长原事务的写锁持有时间。
+
+    它自己是一个写事务（`write_tx()` → flock + BEGIN IMMEDIATE），因此
+    **在另一个 write_tx() 块内调用会立刻触发重入守卫**。清理失败只记日志、
+    不向上抛：这是"顺手的维护工作"，不该让业务写入失败（既有的容错语义）。
     """
     if not due(table, interval_seconds):
         return 0
-    from .db_base import connect
+    from .db_base import write_tx
 
     try:
-        with connect() as conn:
+        with write_tx() as conn:
             cursor = conn.execute(
                 f"DELETE FROM {table} WHERE {column} < ?",       # noqa: S608 - 表名/列名是代码内字面量
                 (time.time() - days * 86400,))
-            conn.commit()
             removed = cursor.rowcount or 0
     except Exception:                                             # noqa: BLE001
         logger.exception("Opportunistic prune of %s failed (ignored)", table)

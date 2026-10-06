@@ -8,12 +8,13 @@
   避免 NAT / 公司出口共享同一 IP 的普通用户被他人连累而长时间误锁。
 - 流水只在窗口期内生效，超过 30 天的记录由启动时的清理任务删除。
 
-资源约定：所有函数统一用 `with connect() as conn`，
-任何返回/异常路径都会提交/回滚并关闭连接（Windows 上可据此验证无句柄泄漏）。
+资源约定：**读**统一用 `with connect() as conn`；**写**统一用
+`with write_tx() as conn`（跨进程 flock + BEGIN IMMEDIATE + 提交/回滚/关闭）。
+两者在任何返回/异常路径上都会释放连接（Windows 上可据此验证无句柄泄漏）。
 """
 import time
 
-from .db_base import connect
+from .db_base import connect, write_tx
 from .db_prune import prune
 
 #: 登录流水保留期（天）。启动清理与运行期机会式清理共用。
@@ -26,13 +27,15 @@ def record_login_attempt(email: str, ip: str, success: bool):
     提交后做一次机会式清理（每小时最多一次，见 `core.db_prune`）：
     登录失败是攻击者最容易制造的行增长来源，只靠启动清理在长跑进程上
     会让表无限膨胀。
+
+    `prune()` 必须在 `write_tx()` 块**之外**调用：它自己也要写（取同一把
+    flock），嵌套会立刻触发重入守卫（否则就是自死锁）。
     """
-    with connect() as conn:
+    with write_tx() as conn:
         conn.execute(
             "INSERT INTO login_attempts (email, ip, attempted_at, success) VALUES (?, ?, ?, ?)",
             (email, ip, time.time(), 1 if success else 0)
         )
-        conn.commit()
     prune("login_attempts", "attempted_at", RETENTION_DAYS)
 
 
@@ -73,14 +76,12 @@ def count_global_recent_failures(window_seconds: int = 900) -> int:
 
 def clear_login_attempts(email: str):
     """用户登录成功后清空其失败流水（大小写不敏感），避免旧失败继续锁号。"""
-    with connect() as conn:
+    with write_tx() as conn:
         conn.execute("DELETE FROM login_attempts WHERE email = ? COLLATE NOCASE", (email,))
-        conn.commit()
 
 
 def cleanup_old_login_attempts(days: int = RETENTION_DAYS):
     """启动时删除指定天数之前的流水，控制表体积。"""
-    with connect() as conn:
+    with write_tx() as conn:
         cutoff = time.time() - days * 86400
         conn.execute("DELETE FROM login_attempts WHERE attempted_at < ?", (cutoff,))
-        conn.commit()

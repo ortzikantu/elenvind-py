@@ -1,6 +1,6 @@
 """Core 模板渲染：Jinja2 的唯一入口。
 
-    Feature ──► render_template("blog/article.html", {...}) ──► Jinja2
+    模块 ──► render_template("blog/article.html", {...}) ──► Jinja2
 
 规则（Core Contract 的一部分，由 tests/test_core_contract.py 静态守卫）：
 - 业务代码**不得**自行创建 Jinja `Environment` / `FileSystemLoader`，

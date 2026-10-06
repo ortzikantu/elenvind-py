@@ -173,6 +173,10 @@ def validate_config(cfg=None):
     host = server.get("host", "127.0.0.1")
     _require(isinstance(host, str) and host.strip() != "", "server.host must be a non-empty string")
     _check_int(server.get("port", 6789), "server.port", 1, 65535)
+    # Gunicorn worker 进程数。默认 2：多 worker 是设计的一部分
+    # （Core 的 write_tx() 用 flock + BEGIN IMMEDIATE 串行化跨进程写），
+    # 上限 64 只是防手滑写个天文数字把机器打满。
+    _check_int(server.get("workers", 2), "server.workers", 1, 64)
     trusted = server.get("trusted_proxies", ["127.0.0.1", "::1"])
     if isinstance(trusted, str):
         trusted = [item.strip() for item in trusted.split(",") if item.strip()]

@@ -1,16 +1,25 @@
-"""冒烟驱动：用真实 uvicorn + 真实 config.toml 起一次服务并走完整流程。
+"""冒烟驱动：用真实 Gunicorn（多 worker）+ 真实 config.toml 起一次服务并走完整流程。
 
-不是测试套件的一部分（测试套件不依赖 uvicorn），只在需要"真实冷启动"验证时手工运行：
+不是测试套件的一部分（测试套件不需要 HTTP 服务器），只在需要"真实冷启动"
+验证时手工运行：
 
-    python smoke_driver.py        # 需要当前环境已安装 uvicorn
+    python smoke_driver.py        # 需要当前环境已安装 gunicorn
 
 在仓库根目录运行。副作用隔离：数据库与它生成的临时内容落在
 `.smoketmp/<随机名>/` 下，结束（含异常）时删除，不触碰仓库里的真实数据。
+
+实现方式：Gunicorn 必须在**主线程**里接管信号，且它的配置是进程级的，
+所以这里起一个真实的 gunicorn 子进程（`-w N`，默认 2 个 worker ——
+多 worker 正是 C0 写协调要覆盖的场景），而不是在测试进程内跑服务器。
+子进程通过一个生成的 shim 模块载入"临时配置 + 临时数据库"，
+shim 路径经 PYTHONPATH 注入，因此不会碰仓库的 `config.toml`。
 """
+import json
 import os
 import shutil
+import socket
+import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,7 +35,38 @@ from elenvind.core.config import ROOT, config, load_config, validate_config, app
 TMP = Path(os.environ.get("ELENVIND_SMOKE_TMP", str(ROOT / ".smoketmp"))) / uuid.uuid4().hex[:10]
 TMP.mkdir(parents=True)
 PORT = int(os.environ.get("SMOKE_PORT", "6791"))
+WORKERS = int(os.environ.get("SMOKE_WORKERS", "2"))
 BASE = f"http://127.0.0.1:{PORT}"
+
+#: 子进程入口 shim：把冒烟用的配置注入到应用里，再交给 Gunicorn。
+#: 单独生成成文件（而不是 `python -c`）是因为内容较长，且要放进 PYTHONPATH。
+SHIM_SOURCE = '''\
+"""冒烟驱动生成的子进程入口（勿手工编辑）。"""
+import json
+import os
+
+from elenvind.core import config as config_module
+from elenvind.core import db_base
+from elenvind.core import lifespan as lifespan_module
+
+with open(os.environ["ELENVIND_SMOKE_CONFIG"], "r", encoding="utf-8") as handle:
+    overrides = json.load(handle)
+
+config_module.load_config()
+config_module.config.update(overrides)
+os.environ["ELENVIND_DB"] = overrides["database"]
+db_base.DB_PATH = overrides["database"]
+config_module.validate_config()
+config_module.apply_runtime_config()
+# 让 startup() 沿用注入的配置（否则它会重读仓库 config.toml 覆盖临时路径）
+lifespan_module.SKIP_CONFIG_LOAD["value"] = True
+
+from elenvind.app import app as _app            # noqa: E402
+
+lifespan_module.startup()
+application = _app
+'''
+
 
 results = []
 
@@ -78,21 +118,28 @@ def csrf_from(html):
 
 
 def prepare_config():
-    from elenvind.core import lifespan as lifespan_module
+    """准备临时配置与内容，返回**要注入子进程 Gunicorn 的覆盖项**。
 
+    驱动进程自己也套用同一份覆盖：这样才能用同一套值做前置断言
+    （文章索引 / 自定义页面 / 会话窗口），并与服务器共享"同一份配置"的语义。
+    """
     load_config()
-    config["database"] = str(TMP / "smoke.db")
-    config["articles_dir"] = str(TMP / "articles")
-    config["custom_pages_dir"] = str(TMP / "custom_pages")
-    config["logging"] = {"level": "critical", "file": str(TMP / "app.log")}
-    config["site_url"] = "https://smoke.example.com"
-    # 固定为英文：避免依赖开发机上 config.toml 的 locale 设置，
-    # 让下面基于文案的断言在任何环境下都稳定。
-    config["locale"] = "en"
-    config["static"] = {"css": "/static/style.css", "favicon": "/static/favicon.ico",
-                        "logo": "/static/logo.png", "hero": "/static/hero.webp"}
-    # 内置样式表默认开启（本 smoke 用外部 CSS；另有专门检查覆盖内置回落）
-    config["use_builtin_css"] = True
+    overrides = {
+        "database": str(TMP / "smoke.db"),
+        "articles_dir": str(TMP / "articles"),
+        "custom_pages_dir": str(TMP / "custom_pages"),
+        "logging": {"level": "critical", "file": str(TMP / "app.log")},
+        "site_url": "https://smoke.example.com",
+        # 固定为英文：避免依赖开发机上 config.toml 的 locale 设置，
+        # 让下面基于文案的断言在任何环境下都稳定。
+        "locale": "en",
+        "static": {"css": "/static/style.css", "favicon": "/static/favicon.ico",
+                   "logo": "/static/logo.png", "hero": "/static/hero.webp"},
+        # 内置样式表默认开启（本 smoke 用外部 CSS；另有专门检查覆盖内置回落）
+        "use_builtin_css": True,
+    }
+    config.update(overrides)
+
     (TMP / "articles").mkdir()
     (TMP / "custom_pages").mkdir()
     (TMP / "articles" / "smoke.md").write_text(
@@ -100,34 +147,107 @@ def prepare_config():
         "# Heading\n\nBody **bold** and `code` and [link](https://example.com).\n",
         encoding="utf-8")
     (TMP / "custom_pages" / "about.md").write_text("About **page**.", encoding="utf-8")
-    os.environ["ELENVIND_DB"] = str(TMP / "smoke.db")
-    db_base.DB_PATH = TMP / "smoke.db"
+    os.environ["ELENVIND_DB"] = overrides["database"]
+    db_base.DB_PATH = Path(overrides["database"])
     validate_config()
     apply_runtime_config()
-    # 让 lifespan 沿用上面注入的配置（否则它会重新读仓库的 config.toml，覆盖测试路径）
-    lifespan_module.SKIP_CONFIG_LOAD["value"] = True
+    return overrides
+
+
+class SmokeServer:
+    """一个真实的 Gunicorn 子进程（默认 2 worker），可带覆盖配置重启。
+
+    为什么是子进程而不是本进程内起服务器：Gunicorn 要在**主线程**接管信号，
+    且它的配置是进程级的全局状态；子进程同时也顺便验证了生产启动路径
+    （`elenvind.wsgi` 风格的 shim + 多 worker）。
+    """
+
+    def __init__(self, overrides):
+        self.base = dict(overrides)
+        self.process = None
+        self.log_path = TMP / "gunicorn.log"
+        (TMP / "_smoke_entry.py").write_text(SHIM_SOURCE, encoding="utf-8")
+
+    # ---------- 生命周期 ----------
+    def start(self, extra=None):
+        merged = dict(self.base)
+        merged.update(extra or {})
+        (TMP / "smoke_config.json").write_text(json.dumps(merged), encoding="utf-8")
+
+        environment = dict(os.environ)
+        environment["ELENVIND_SMOKE_CONFIG"] = str(TMP / "smoke_config.json")
+        environment["ELENVIND_DB"] = merged["database"]
+        paths = [str(ROOT), str(TMP)]
+        if environment.get("PYTHONPATH"):
+            paths.append(environment["PYTHONPATH"])
+        environment["PYTHONPATH"] = os.pathsep.join(paths)
+
+        command = [
+            sys.executable, "-m", "gunicorn",
+            "--bind", f"127.0.0.1:{PORT}",
+            "--workers", str(WORKERS),
+            "--log-level", "warning",
+            # 与 config.toml [server].trusted_proxies 的出厂值一致
+            "--forwarded-allow-ips", "127.0.0.1,::1",
+            "_smoke_entry:application",
+        ]
+        self.log = open(self.log_path, "ab")
+        self.process = subprocess.Popen(command, cwd=str(ROOT), env=environment,
+                                        stdout=self.log, stderr=self.log)
+        return self.process
+
+    def wait_until_ready(self, timeout=25.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                return False
+            with socket.socket() as sock:
+                sock.settimeout(0.25)
+                if sock.connect_ex(("127.0.0.1", PORT)) == 0:
+                    return True
+            time.sleep(0.1)
+        return False
+
+    def stop(self):
+        if self.process is None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=5)
+        self.process = None
+        try:
+            self.log.close()
+        except OSError:
+            pass
+
+    def restart(self, extra=None):
+        """带覆盖配置重启（用于"改配置后行为应当变化"的检查）。"""
+        self.stop()
+        self.start(extra)
+        if not self.wait_until_ready():
+            raise RuntimeError(f"Gunicorn 重启失败；日志见 {self.log_path}")
+
+    def log_tail(self, limit=2000):
+        try:
+            return self.log_path.read_text(encoding="utf-8", errors="replace")[-limit:]
+        except OSError:
+            return ""
 
 
 def main():
-    prepare_config()
-    import uvicorn
-    from elenvind.app import app
-
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=PORT,
-                                           log_level="warning", access_log=False))
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    for _ in range(100):
-        if server.started:
-            break
-        time.sleep(0.1)
-    check("uvicorn 启动", server.started)
+    overrides = prepare_config()
+    server = SmokeServer(overrides)
+    server.start()
+    check(f"Gunicorn 启动（{WORKERS} worker）", server.wait_until_ready(),
+          server.log_tail())
 
     try:
-        run_checks()
+        run_checks(server)
     finally:
-        server.should_exit = True
-        thread.join(timeout=10)
+        server.stop()
         shutil.rmtree(TMP, ignore_errors=True)
 
     failed = [name for name, ok, _ in results if not ok]
@@ -139,12 +259,12 @@ def main():
     return 0
 
 
-def run_checks():
+def run_checks(server):
     opener = build_opener()
 
     # 前置断言：测试文章/页面目录确实生效（否则后面所有页面断言都会误导）
-    from elenvind.features.blog import logic as blog_logic
-    from elenvind.features.pages import logic as pages_logic
+    from elenvind.modules.blog import logic as blog_logic
+    from elenvind.modules.pages import logic as pages_logic
     check("文章索引已装载", [a["slug"] for a in blog_logic.get_articles()] == ["smoke"],
           str([a["slug"] for a in blog_logic.get_articles()]))
     check("自定义页面已装载", pages_logic.get_page("about") is not None)
@@ -211,14 +331,14 @@ def run_checks():
             break
     check("静态服务阻断路径穿越", traversal_blocked)
 
-    # 把配置清空，确认真的回落到缺省资产（且链接是同源相对路径，
-    # 因为 CSP 的 style-src 'self' 只允许同源样式）
-    saved_css = config["static"].get("css")
-    saved_favicon = config["static"].get("favicon")
-    saved_logo = config["static"].get("logo")
-    config["static"]["css"] = ""
-    config["static"]["favicon"] = ""
-    config["static"]["logo"] = ""
+    # 把 [static] 清空后重启，确认真的回落到缺省资产（且链接是同源相对路径，
+    # 因为 CSP 的 style-src 'self' 只允许同源样式）。
+    #
+    # 这里刻意**重启真实的 Gunicorn**（而不是改本进程的内存配置）：
+    # 服务器在另一个进程里，改驱动进程的字典根本影响不到它 —— 旧实现正是
+    # 因为服务器就在本进程内才能这么写；重启顺带又验证了一次多 worker 启动。
+    server.restart({"static": {"css": "", "favicon": "", "logo": "",
+                               "hero": "/static/hero.webp"}})
     try:
         _status, home, _ = fetch(opener, "GET", "/")
         check("配置为空时回落到缺省样式",
@@ -231,9 +351,7 @@ def run_checks():
               '<img src="/imgs/favicon' in home,
               [line for line in home.splitlines() if "header-brand" in line][:2])
     finally:
-        config["static"]["css"] = saved_css
-        config["static"]["favicon"] = saved_favicon
-        config["static"]["logo"] = saved_logo
+        server.restart()
 
     status, body, headers = fetch(opener, "GET", "/theme?mode=dark&next=/about")
     check("主题切换 302", status == 302 and headers.get("location") == "/about", status)

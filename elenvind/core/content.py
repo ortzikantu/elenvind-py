@@ -1,4 +1,12 @@
-"""内容格式：TOML 文档头 + Markdown 正文。
+"""内容格式：TOML 文档头 + Markdown 正文（Core 的共享原语）。
+
+为什么在 Core：文章（`modules/blog`）与自定义页面（`modules/pages`）使用**同一套**
+内容文件格式与 slug 规则。把它放在 Core 让两个业务模块都只依赖 Core，
+而不是让其中一个模块去 import 另一个模块的内部实现。
+
+    modules/blog ─┐
+                  ├─► core.content（格式解析 + slug 校验）
+    modules/pages ┘
 
 刻意**只有一层**：不发明标记语言，正文就是标准 Markdown，
 元数据用标准 TOML。

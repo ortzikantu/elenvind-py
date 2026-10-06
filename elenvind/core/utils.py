@@ -13,30 +13,58 @@ def normalize_email(email):
     """规范化邮箱地址：去除首尾空白并转为小写（用于注册/登录/修改邮箱）"""
     return str(email).strip().lower()
 
-def get_client_ip(scope):
+def peer_address(environ) -> str:
+    """直连对端地址（WSGI 的 `REMOTE_ADDR`）；未知时返回 `"unknown"`。
+
+    这是**应用唯一信任的**对端来源：它由 WSGI 服务器按真实 TCP 连接填入，
+    客户端无法伪造（除非真的从那个地址连过来）。
     """
-    从 ASGI scope 中提取客户端 IP 地址。
+    if not environ:
+        return "unknown"
+    value = environ.get("REMOTE_ADDR")
+    value = str(value).strip() if value else ""
+    return value or "unknown"
+
+
+def get_client_ip(headers, peer: str) -> str:
+    """从请求头 + 直连对端解析客户端 IP 地址。
 
     安全边界：只有直连对端本身是受信代理（默认 127.0.0.1 / ::1，可用
     config.toml [server].trusted_proxies 覆盖）时才读取 X-Forwarded-For 的
     第一个地址；否则一律使用直连 IP。防止应用端口被公网直连时伪造代理头
     绕过登录限流等 IP 维度防护。
     """
-    client = scope.get("client")
-    peer_ip = client[0] if client else "unknown"
-
     # 受信代理列表：默认回环地址；config 可配置（字符串或列表均可）
-    trusted = _trusted_proxies()
-    if peer_ip not in trusted:
-        return peer_ip
+    if peer not in _trusted_proxies():
+        return peer
 
-    for header_name, header_value in scope.get("headers", []):
-        if header_name == b"x-forwarded-for":
-            # 取第一个 IP（通常是最原始的客户端）
-            forwarded = header_value.decode("latin-1").split(",")[0].strip()
-            if forwarded:
-                return forwarded
-    return peer_ip
+    forwarded = str(headers.get("x-forwarded-for", "") or "")
+    # 取第一个地址（通常是最原始的客户端）
+    first = forwarded.split(",")[0].strip()
+    return first or peer
+
+
+def get_request_scheme(environ, headers) -> str:
+    """请求 scheme：`"http"` 或 `"https"`。
+
+    WSGI 服务器只报告**它自己看到的**那条连接：TLS 在 Nginx 终止时，
+    gunicorn 收到的是明文，`wsgi.url_scheme` 永远是 `"http"`。
+    因此当直连对端是受信代理时，采信 `X-Forwarded-Proto` 的第一个值。
+
+    这里与 `get_client_ip()` 共用**同一份** `[server].trusted_proxies`
+    白名单 —— 两份列表不可能漂移。历史上"HTTP 服务器一份、应用一份"的配置
+    正是 HTTPS 下 Secure Cookie 丢失、或公网直连者伪造 scheme 的根源。
+    """
+    scheme = ""
+    if environ:
+        scheme = str(environ.get("wsgi.url_scheme", "") or "").strip().lower()
+    if scheme not in ("http", "https"):
+        scheme = "http"
+    if peer_address(environ) not in _trusted_proxies():
+        return scheme
+    forwarded = str(headers.get("x-forwarded-proto", "") or "")
+    first = forwarded.split(",")[0].strip().lower()
+    return first if first in ("http", "https") else scheme
 
 
 # 受信代理列表缓存：配置只在启动时加载一次，无需每个请求重新解析

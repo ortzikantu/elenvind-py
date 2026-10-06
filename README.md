@@ -15,7 +15,7 @@ A Personal Website Server
 
 Everything in Chinese, because we're classy like that:
 
-- [Feature Development Guide](docs/development/features.md) — how to add a Feature (the intended DX)
+- [Module Development Guide](docs/development/modules.md) — how to add a module (the intended DX)
 - [Configuration Guide](docs/CONFIGURATION.md) — every knob in config.toml
 - [Deployment Guide](docs/DEPLOYMENT.md) — systemd, Nginx, HTTPS, backups
 - [Nginx Config Example](docs/nginx.conf.example) — copy, paste, adjust, ship
@@ -23,9 +23,9 @@ Everything in Chinese, because we're classy like that:
 
 ## Getting started
 
-A standard-library-first SSR web app, with **Uvicorn as the ASGI server**.
-`requirements.txt` pins Uvicorn (plus its `click`/`h11`), Jinja2 and Markdown —
-no ORM, no DI, no plugin system, no framework, no build step.
+A standard-library-first, **synchronous WSGI** SSR web app, with **Gunicorn as the
+WSGI server**. `requirements.txt` pins Gunicorn, Jinja2 and Markdown —
+no ORM, no DI, no plugin system, no framework, no build step, no asyncio.
 
 ```bash
 git clone https://codeberg.org/ortzikantu/elenvind.git elenvind-py
@@ -94,16 +94,27 @@ Your own `logo`, `hero` and social icons can stay on Nginx/CDN via plain URLs. W
 they're empty the element simply isn't rendered, so a fresh clone never shows a
 broken image.
 
-### Architecture: Feature 负责业务，Web Core 负责 Web 安全
+### Architecture: 模块负责业务，Web Core 负责 Web 安全
 
 ```
 elenvind/
-  core/        Web Core —— 请求/响应、安全头、Cookie、会话、认证、授权、CSRF、
-               模板（Jinja2 唯一入口）、Markdown（唯一入口）、数据库连接
-  features/    业务 —— blog / pages / auth / users / admin / seo / system
+  core/        Web Core —— 技术基座：请求/响应、安全头、Cookie、会话、认证、授权、
+               CSRF、模板（Jinja2 唯一入口）、Markdown、内容格式、路由、
+               数据库（connect() 只读 / write_tx() 唯一写入口 / 迁移）
+  modules/     业务模块 —— blog / pages / auth / users / admin / seo / system
+  app.py       组合入口（唯一同时认识 core 与 modules 的地方）：装配与注入
+  wsgi.py      生产入口：startup(STARTUP_HOOKS) + application
   templates/   Jinja2 模板（Python 只准备数据，HTML 全在这里）
-  app.py       装配点：Core App + Feature 注册
 ```
+
+依赖方向**单向**，由 `tests/test_architecture.py` 守卫：
+
+```
+Application (app.py / wsgi.py)  →  modules/  →  core/
+```
+
+Core 不认识任何业务模块；模块只依赖 Core，且**模块之间互不 import**
+（需要协作时由 `app.py` 把数据源注入进去，例如 `/sitemap.xml` 的文章条目）。
 
 新增一个页面只需要声明路由，安全由框架默认施加：
 
@@ -124,18 +135,20 @@ def admin_home(request): ...
 `/user` 与 `GET /logout` 这类"关于你自己"的页面在未登录时渲染友好的提示页，
 而状态变更始终只由 POST + CSRF 触发。
 
-Feature 里**不写** CSRF、不拼 Cookie、不加安全头、不检查请求体大小 ——
-这些都是 Core 的职责，且由 `tests/test_core_contract.py` 静态 + 运行时双重守卫。
-详见 [Feature Development Guide](docs/development/features.md)。
+模块里**不写** CSRF、不拼 Cookie、不加安全头、不检查请求体大小 ——
+这些都是 Core 的职责，且由 `tests/test_core_contract.py`（Core Contract）与
+`tests/test_architecture.py`（分层依赖方向）静态 + 运行时双重守卫。
+详见 [Module Development Guide](docs/development/modules.md)。
 
 ### What it is made of
 
 | Concern | Choice |
 |---|---|
-| Runtime | Python standard library + Uvicorn (ASGI) |
+| Runtime | Python standard library + Gunicorn (WSGI), synchronous business code |
 | Rendering | Jinja2 templates, server-side, Zero-JS |
 | Styling | Default stylesheet served by the app (`/css/style.css`); config can override with your own URL |
 | Database | SQLite (WAL, `PRAGMA foreign_keys=ON`, `user_version` migrations) |
+| Write coordination | Every write goes through Core's `write_tx()`: cross-process `flock` on a separate lock file + `BEGIN IMMEDIATE`. Multi-worker Gunicorn is safe; writes are serialized, reads are not |
 | Content | Markdown body + TOML front matter (`+++` fence), rendered by `core.markdown` |
 | Markup safety | Whitelist HTML sanitiser in `core.markdown` (stdlib `html.parser`) |
 | Sessions | Server-side random tokens in SQLite (not JWT), with absolute + idle expiry |
@@ -143,11 +156,11 @@ Feature 里**不写** CSRF、不拼 Cookie、不加安全头、不检查请求�
 | CSRF | Double-submit cookie, enforced in one dispatcher gate |
 | AuthZ | Declarative `auth="required"` / `permission="admin"` on the route |
 | Cache | In-process file-snapshot caches for articles and custom pages |
-| Security headers | Injected by Core on every response (including 404/500) — features never set them |
+| Security headers | Injected by Core on every response (including 404/500) — modules never set them |
 
 ### Security response headers
 
-Core appends these on the way out, so a feature just returns a `Response` and the
+Core appends these on the way out, so a module just returns a `Response` and the
 headers are there. Nothing to remember, nothing to duplicate.
 
 | Header | Default |
@@ -231,7 +244,7 @@ python -m unittest tests.test_core_contract -v   # one module
 
 Covers the HTTP body parser, CSRF, sessions, auth, comments, the article/page caches,
 SEO, config validation, the Markdown renderer + sanitiser (plus a seeded fuzz harness),
-the **Core Contract** (features cannot bypass or duplicate security), and an
+the **Core Contract** (modules cannot bypass or duplicate security), and an
 end-to-end cold start walkthrough.
 
 No PRs, please.  

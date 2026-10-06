@@ -168,42 +168,45 @@ class LogRedactionTests(ElenvindTestCase):
 
 class ClientIpTrustTests(ElenvindTestCase):
     @staticmethod
-    def _scope(peer, forwarded=None, real_ip=None):
-        headers = []
+    def _headers(forwarded=None, real_ip=None):
+        headers = {}
         if forwarded is not None:
-            headers.append((b"x-forwarded-for", forwarded.encode()))
+            headers["x-forwarded-for"] = forwarded
         if real_ip is not None:
-            headers.append((b"x-real-ip", real_ip.encode()))
-        return {"client": (peer, 5555), "headers": headers}
+            headers["x-real-ip"] = real_ip
+        return headers
 
     def test_forwarded_for_is_used_only_for_trusted_peer(self):
         self._config["server"]["trusted_proxies"] = ["127.0.0.1", "::1"]
-        self.assertEqual(get_client_ip(self._scope("127.0.0.1", "203.0.113.5")), "203.0.113.5")
-        self.assertEqual(get_client_ip(self._scope("::1", "203.0.113.6")), "203.0.113.6")
+        self.assertEqual(get_client_ip(self._headers("203.0.113.5"), "127.0.0.1"),
+                         "203.0.113.5")
+        self.assertEqual(get_client_ip(self._headers("203.0.113.6"), "::1"),
+                         "203.0.113.6")
         # 非可信直连：忽略伪造头
-        self.assertEqual(get_client_ip(self._scope("198.51.100.7", "203.0.113.8")),
+        self.assertEqual(get_client_ip(self._headers("203.0.113.8"), "198.51.100.7"),
                          "198.51.100.7")
 
     def test_first_forwarded_address_wins_within_trusted_peer(self):
         self._config["server"]["trusted_proxies"] = ["127.0.0.1"]
         self.assertEqual(
-            get_client_ip(self._scope("127.0.0.1", "203.0.113.9, 10.0.0.1, 10.0.0.2")),
+            get_client_ip(self._headers("203.0.113.9, 10.0.0.1, 10.0.0.2"), "127.0.0.1"),
             "203.0.113.9")
 
     def test_x_real_ip_is_not_trusted(self):
         """应用只采信 X-Forwarded-For；X-Real-IP 单独存在时不得改变客户端 IP。"""
         self._config["server"]["trusted_proxies"] = ["127.0.0.1"]
-        self.assertEqual(get_client_ip(self._scope("127.0.0.1", None, "203.0.113.10")),
+        self.assertEqual(get_client_ip(self._headers(None, "203.0.113.10"), "127.0.0.1"),
                          "127.0.0.1")
         # 同时存在时仍然取 X-Forwarded-For
         self.assertEqual(
-            get_client_ip(self._scope("127.0.0.1", "203.0.113.11", "203.0.113.12")),
+            get_client_ip(self._headers("203.0.113.11", "203.0.113.12"), "127.0.0.1"),
             "203.0.113.11")
 
     def test_missing_client_and_empty_forwarded_values(self):
         self._config["server"]["trusted_proxies"] = ["127.0.0.1"]
-        self.assertEqual(get_client_ip({"headers": []}), "unknown")
-        self.assertEqual(get_client_ip(self._scope("127.0.0.1", "   ")), "127.0.0.1")
+        # 直连对端未知：不采信任何转发头，返回 "unknown"
+        self.assertEqual(get_client_ip({}, "unknown"), "unknown")
+        self.assertEqual(get_client_ip(self._headers("   "), "127.0.0.1"), "127.0.0.1")
 
     def test_client_ip_actually_used_for_rate_limiting(self):
         """可信代理下，限流按 X-Forwarded-For 的客户端 IP 计数（而不是代理 IP）。"""

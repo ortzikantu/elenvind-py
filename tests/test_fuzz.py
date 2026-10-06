@@ -12,8 +12,8 @@ from html.parser import HTMLParser
 
 from tests.support import PROJECT_ROOT
 
+from elenvind.core.content import ContentError, parse_document
 from elenvind.core.markdown import render_markdown
-from elenvind.features.blog.content import ContentError, parse_document
 
 XSS_PAYLOADS = [
     "<script>alert(1)</script>",

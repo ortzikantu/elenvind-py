@@ -5,9 +5,10 @@
   所以必须有一个请求级的作用域来承载它。
 - `{{ t("key") }}` 同理：界面语言是站点级配置，但模板里逐处传 lang 很啰嗦。
 
-实现选择：`contextvars.ContextVar` 是标准库、对 asyncio 安全（每个任务独立），
-比 threading.local 更适合 ASGI。不引入"全局可变状态"——写入点只有
-`bind_request()` 一处，且必须在请求结束时用 `reset` 还原。
+实现选择：`contextvars.ContextVar` 是标准库，每个线程 / 协程上下文各自独立，
+因此对"同步 WSGI worker（每请求一线程）"与 gthread 线程池都成立。
+不引入"全局可变状态"——写入点只有 `bind_request()` 一处，
+且必须在请求结束时用 `reset` 还原。
 
 没有绑定请求时（启动期渲染、离线渲染、单元测试），
 `current_request()` 返回 None，相关全局降级为空串/默认语言，不抛异常。
@@ -45,13 +46,13 @@ def current_lang() -> str:
 def build_render_context(context: dict) -> dict:
     """给模板上下文补齐 Core 提供的公共变量。
 
-    Feature 只提供业务数据；以下变量由 Core 补齐，Feature 不需要关心：
+    模块只提供业务数据；以下变量由 Core 补齐，模块不需要关心：
     request / user / csrf_token / lang / site_title / description / keywords /
     theme / admin_badge / copyright_name / current_year / user_count /
     nav_items / social_items / project_items。
 
     这些正是 `base.html` 与 partials 需要的"框架级"变量。
-    显式传入的同名键优先（Feature 可覆盖）。
+    显式传入的同名键优先（模块可覆盖）。
     """
     from datetime import datetime
 

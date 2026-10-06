@@ -1,6 +1,6 @@
 """Core Markdown：Markdown 的唯一入口 + 输出净化。
 
-    Feature ──► render_markdown(text) ──► python-markdown ──► 白名单净化 ──► Markup
+    模块 ──► render_markdown(text) ──► python-markdown ──► 白名单净化 ──► Markup
 
 **为什么必须净化（实测结论，不是理论担忧）**：python-markdown 默认
 *原样透传*原始 HTML，并且接受危险协议：

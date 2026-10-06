@@ -6,11 +6,11 @@
 - 校验时只做两者常量时间比对；
 - 跨站 POST 不会携带 SameSite=Lax 的 Cookie，因此攻击者无法同时伪造两个值。
 
-Feature 只需要：
+模块只需要：
 - 在模板里写 `{{ csrf_input() }}`；
 - 不用关心 Cookie、令牌格式、比对方式。
 Core 的调度器会**默认**对所有非安全方法（POST/PUT/PATCH/DELETE）做校验，
-Feature 不需要（也不允许）自己写校验逻辑。
+模块不需要（也不允许）自己写校验逻辑。
 """
 import hmac
 import re

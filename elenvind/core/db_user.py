@@ -2,15 +2,16 @@
 
 读取约定：
 - 邮箱匹配使用 COLLATE NOCASE，登录/查重对大小写不敏感；
-  写入侧（`features/auth/routes.py`、`features/users/routes.py`）负责先
+  写入侧（`modules/auth/routes.py`、`modules/users/routes.py`）负责先
   `normalize_email` 再落库。
 - 所有"取用户"查询都过滤 is_deleted = 0，已注销账号视为不存在。
-- 所有连接统一走 `with connect()`（`db_base` 的上下文管理器负责关闭）。
+- **读走 `connect()`，写走 `write_tx()`**：写事务由 Core 的唯一写入口提供
+  跨进程 flock 与 BEGIN IMMEDIATE（见 db_base.write_tx）。
 """
 import time
 import uuid
 
-from .db_base import connect
+from .db_base import connect, write_tx
 
 
 def _invalidate_user_count():
@@ -23,7 +24,7 @@ def create_user(nickname: str, email: str, password_hash: str) -> int:
     """写入新用户，返回自增 id。
 
     email 列的 UNIQUE 约束是查重的最终权威：并发注册由 SQLite 抛
-    sqlite3.IntegrityError，调用方（`features/auth/routes.py`）据此返回
+    sqlite3.IntegrityError，调用方（`modules/auth/routes.py`）据此返回
     "已存在"提示，而不是 500。这里不做 SELECT 预检查，避免 TOCTOU 竞态。
 
     **邮箱在这里统一规范化**（而不是依赖调用方先转小写）：
@@ -33,16 +34,17 @@ def create_user(nickname: str, email: str, password_hash: str) -> int:
     """
     from .utils import normalize_email
 
-    with connect() as conn:
+    with write_tx() as conn:
         cursor = conn.execute(
             "INSERT INTO user (nickname, email, password, created_at, nickname_changed_at) "
             "VALUES (?, ?, ?, ?, NULL)",
             (nickname, normalize_email(email), password_hash,
              time.strftime("%Y-%m-%dT%H:%M:%S"))
         )
-        conn.commit()
-        _invalidate_user_count()
-        return cursor.lastrowid
+        new_id = cursor.lastrowid
+    # 提交成功之后才让缓存失效（提交失败不该影响缓存语义）
+    _invalidate_user_count()
+    return new_id
 
 
 def get_user_by_email(email: str):
@@ -74,26 +76,6 @@ def get_user_by_id(user_id: int):
         ).fetchone()
 
 
-def update_user_nickname(user_id: int, new_nickname: str):
-    """更新昵称并记录更改时间（供"一年只能改一次"策略计时）。"""
-    with connect() as conn:
-        conn.execute(
-            "UPDATE user SET nickname = ?, nickname_changed_at = ? WHERE id = ?",
-            (new_nickname, time.strftime("%Y-%m-%dT%H:%M:%S"), user_id)
-        )
-        conn.commit()
-
-
-def update_user_email(user_id: int, new_email: str):
-    """更新邮箱（写入侧规范化为小写，见 `create_user` 的说明）。"""
-    from .utils import normalize_email
-
-    with connect() as conn:
-        conn.execute("UPDATE user SET email = ? WHERE id = ?",
-                     (normalize_email(new_email), user_id))
-        conn.commit()
-
-
 def update_user_profile(user_id: int, nickname=None, email=None):
     """**原子地**更新昵称与/或邮箱（一个事务，要么都成功要么都不变）。
 
@@ -119,23 +101,18 @@ def update_user_profile(user_id: int, nickname=None, email=None):
     if not fields:
         return False
     params.append(user_id)
-    with connect() as conn:
-        try:
-            cursor = conn.execute(
-                f"UPDATE user SET {', '.join(fields)} WHERE id = ? AND is_deleted = 0",
-                params)
-            conn.commit()
-            return bool(cursor.rowcount)
-        except Exception:
-            conn.rollback()
-            raise
+    with write_tx() as conn:
+        cursor = conn.execute(
+            f"UPDATE user SET {', '.join(fields)} WHERE id = ? AND is_deleted = 0",
+            params)
+        updated = bool(cursor.rowcount)
+    return updated
 
 
 def update_user_password(user_id: int, new_password_hash: str):
     """覆盖密码哈希（改密与新格式渐进式 rehash 共用）。"""
-    with connect() as conn:
+    with write_tx() as conn:
         conn.execute("UPDATE user SET password = ? WHERE id = ?", (new_password_hash, user_id))
-        conn.commit()
 
 
 def delete_user(user_id: int):
@@ -153,24 +130,20 @@ def delete_user(user_id: int):
 
     已注销账号的评论仍保留在站内（评论区显示占位昵称）。
     """
-    with connect() as conn:
-        try:
-            placeholder_email = f"deleted+{uuid.uuid4().hex}@deleted.invalid"
-            # WHERE 里带 is_deleted = 0：否则重复删号会再次命中同一行，
-            # rowcount 恒为 1，下面那句"already deleted"的报错永远不会触发
-            # （行会被反复改写，占位邮箱也跟着变，属于无意义写入）。
-            cursor = conn.execute(
-                "UPDATE user SET nickname = 'Ghost', email = ?, password = '', is_deleted = 1 "
-                "WHERE id = ? AND is_deleted = 0",
-                (placeholder_email, user_id)
-            )
-            conn.commit()
-            if cursor.rowcount == 0:
-                raise ValueError(f"User {user_id} does not exist or is already deleted")
-            _invalidate_user_count()
-        except Exception:
-            conn.rollback()
-            raise
+    with write_tx() as conn:
+        placeholder_email = f"deleted+{uuid.uuid4().hex}@deleted.invalid"
+        # WHERE 里带 is_deleted = 0：否则重复删号会再次命中同一行，
+        # rowcount 恒为 1，下面那句"already deleted"的报错永远不会触发
+        # （行会被反复改写，占位邮箱也跟着变，属于无意义写入）。
+        cursor = conn.execute(
+            "UPDATE user SET nickname = 'Ghost', email = ?, password = '', is_deleted = 1 "
+            "WHERE id = ? AND is_deleted = 0",
+            (placeholder_email, user_id)
+        )
+        if cursor.rowcount == 0:
+            # 抛出去 → write_tx() 回滚整个事务，调用方拿到 ValueError
+            raise ValueError(f"User {user_id} does not exist or is already deleted")
+    _invalidate_user_count()
 
 
 # 页脚用户数缓存：每个页面渲染都要用，但没必要每个请求都查一次库

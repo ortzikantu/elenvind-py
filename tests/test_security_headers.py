@@ -69,11 +69,11 @@ class SecurityHeaderPresenceTests(ElenvindTestCase):
     def test_500_error_page_carries_headers(self):
         """500 走 App 的异常处理路径，也必须带全套头。
 
-        用独立的 App 实例走完整 ASGI 路径（与 test_core_contract 里
+        用独立的 App 实例走完整 WSGI 路径（与 test_core_contract 里
         "handler 忘记 return" 的写法一致），避免污染共享路由表。
         """
         from elenvind.core.app import App
-        from tests.support import run_async
+        from tests.support import build_environ, call_wsgi
 
         mini = App()
 
@@ -82,23 +82,12 @@ class SecurityHeaderPresenceTests(ElenvindTestCase):
 
         mini.router.route("/boom", methods=["GET"])(boom)
 
-        sent = []
-
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        async def send(message):
-            sent.append(message)
-
-        scope = {"type": "http", "method": "GET", "path": "/boom", "scheme": "https",
-                 "headers": [], "query_string": b"",
-                 "client": ("127.0.0.1", 1)}
         with self.assertLogs("elenvind.core.app", level="ERROR"):
-            run_async(mini(scope, receive, send))
+            response = call_wsgi(mini, build_environ("GET", "/boom"))
 
-        start = [m for m in sent if m["type"] == "http.response.start"][0]
-        self.assertEqual(start["status"], 500)
-        headers = {k.decode().lower(): v.decode() for k, v in start["headers"]}
+        self.assertEqual(response.status, 500)
+        headers = {key.decode().lower(): value.decode()
+                   for key, value in response.headers}
         for header in ALWAYS_ON:
             self.assertIn(header, headers, f"{header} missing on 500 response")
         self.assertEqual(headers["referrer-policy"], "strict-origin-when-cross-origin")

@@ -2,8 +2,9 @@
 
 Elenvind 是"应用服务器 + 可选前置静态托管"的两段式架构：
 
-- **应用**：uvicorn 跑 Python SSR（账号/评论/文章渲染/SEO 文件），默认只监听
-  `[server].host`（代码缺省 `127.0.0.1`），由前置反代对外。
+- **应用**：Gunicorn（WSGI）跑 Python SSR（账号/评论/文章渲染/SEO 文件），
+  默认只监听 `[server].host`（代码缺省 `127.0.0.1`），由前置反代对外。
+  应用本身是**同步**的：没有 asyncio、没有异步数据库驱动、没有后台 writer 进程。
 - **静态**：应用**自带**静态服务 —— `elenvind/static/` 整个目录挂在站点根，
   URL 与磁盘一一对应（`/css/style.css` → `elenvind/static/css/style.css`；
   见《配置指南》的"通用静态服务"）。缺省样式表与图标就是从那里发出的。
@@ -16,7 +17,7 @@ Elenvind 是"应用服务器 + 可选前置静态托管"的两段式架构：
 ```
 浏览器 ──HTTPS──> Nginx(80/443)
                     ├── /css、/imgs、/fonts … → 磁盘静态文件（与 elenvind/static/ 对应）
-                    └── 其余全部路径 ──反代──> 127.0.0.1:6789 (uvicorn/Elenvind)
+                    └── 其余全部路径 ──反代──> 127.0.0.1:6789 (Gunicorn/Elenvind)
 ```
 
 > 注意路径前缀：应用把 `elenvind/static/` **内容**挂在站点根，所以对应关系是
@@ -30,7 +31,7 @@ Elenvind 是"应用服务器 + 可选前置静态托管"的两段式架构：
 | 项目 | 要求 |
 |---|---|
 | Python | **3.11+**（配置解析用标准库 `tomllib`，3.11 才引入） |
-| 依赖 | `uvicorn` + `Jinja2` + `Markdown` + `MarkupSafe`（`uvicorn` 另需 `click` / `h11`）。全部锁在 `requirements.txt` |
+| 依赖 | `gunicorn` + `Jinja2` + `Markdown` + `MarkupSafe`。全部锁在 `requirements.txt` |
 | 数据库 | 无需安装——SQLite（标准库 `sqlite3`），首次启动自动建表并迁移（WAL 模式） |
 | 反向代理 | 可选。Nginx（或等效）负责 HTTPS；静态资源可由应用自己发，也可交给它分流 |
 
@@ -53,7 +54,7 @@ python run.py
 可选环境变量：`ELENVIND_DB` —— 覆盖数据库文件路径（默认项目根 `sqlite.db`），
 多环境隔离或自动化测试时使用，生产一般不需要。
 
-## 三、生产部署（推荐单进程 + systemd + Nginx）
+## 三、生产部署（Gunicorn + systemd + Nginx）
 
 ### 1. 修改配置文件
 
@@ -65,6 +66,7 @@ site_url = "https://example.com"   # robots.txt / sitemap.xml 的绝对地址来
 [server]
     host = "127.0.0.1"     # 只允许本机回源，配合 trusted_proxies 安全边界
     port = 6789
+    workers = 2            # Gunicorn worker 进程数（出厂值 2）
 ```
 
 同步按需填写 `[static]` 与 `params.social.icon` 等 URL（指向 Nginx 静态目录）。
@@ -123,9 +125,26 @@ sudo systemctl enable --now elenvind
 sudo systemctl status elenvind
 ```
 
-> 为什么是单进程？站点规模下多 worker 只会平摊进程内缓存（文章索引/渲染缓存）
-> 并增加 SQLite 写竞争。uvicorn 单 worker 已足够；如需扩容优先考虑读多写少的
-> 静态层，而不是应用层。
+`python run.py` 内部启动的就是 Gunicorn（`[server].workers` 个 worker）。
+如果你更喜欢直接用 Gunicorn CLI，把 `ExecStart` 换成：
+
+```ini
+ExecStart=/opt/elenvind-py/.venv/bin/gunicorn \
+          --workers 2 --bind 127.0.0.1:6789 \
+          --forwarded-allow-ips "127.0.0.1,::1" \
+          elenvind.wsgi:application
+```
+
+> **worker 数**：默认 2。多个 worker 是设计的一部分 —— 所有写事务都经过
+> Core 的 `write_tx()`：先取跨进程 `flock`（锁文件独立于数据库），再
+> `BEGIN IMMEDIATE`，锁覆盖整个事务；因此不需要为了 SQLite 而设置
+> `--workers 1`。反过来也别指望靠加 worker 提升写入吞吐：**写是串行的**，
+> WAL 让读不被写阻塞，读多写少的站点加 worker 才有意义。
+> 文章索引等进程内缓存每个 worker 各一份，属于可接受的重复。
+>
+> 想要"启动只跑一次初始化"（`startup()` / 数据库迁移）可以加 `--preload`：
+> master 导入应用后 fork，worker 继承。不加也安全 —— 初始化是幂等的，
+> 而且多个 worker 同时初始化时会在同一把写锁上排队（已有多进程测试覆盖）。
 
 ### 4. Nginx 反代 + HTTPS
 
@@ -150,8 +169,8 @@ sudo certbot certonly --webroot -w /var/www/elenvind -d example.com
 
 | 应用侧设定 | Nginx 侧配合 |
 |---|---|
-| `trusted_proxies` 默认只信 `127.0.0.1` 的 `X-Forwarded-For` | 反代目标必须写 `http://127.0.0.1:6789` |
-| `run.py` 已启用 `proxy_headers`（仅信 127.0.0.1） | 必须透传 `X-Forwarded-Proto $scheme`，否则 HTTPS 下 Secure Cookie 不生效 |
+| `trusted_proxies` 默认只信回环地址，同时约束 `X-Forwarded-For`（客户端 IP）与 `X-Forwarded-Proto`（https 判定） | 反代目标必须写 `http://127.0.0.1:6789` |
+| 应用自己判定 `https`（受信代理的 `X-Forwarded-Proto`） | 必须透传 `X-Forwarded-Proto $scheme`，否则 HTTPS 下 Secure Cookie / HSTS 不生效 |
 | 应用统一下发安全头（CSP 等） | **不要在 Nginx 重复添加 CSP**（多个 CSP 头取并集会误伤页面） |
 | 请求体上限 1 MB | `client_max_body_size 1m` |
 
@@ -192,3 +211,17 @@ sqlite3 sqlite.db ".backup '/backup/elenvind-$(date +%F).db'"
 ```
 
 建议 cron 每日执行；同时备份 `articles/` 与 `custom_pages/`（内容即文件，直接打包即可）。
+
+备份不需要停服，也**不需要**碰写锁文件：`.backup` 走 SQLite 自己的在线备份 API，
+与应用的写事务由 SQLite 的锁机制协调。
+
+## 七、数据库与锁文件的部署要求（C0）
+
+| 要求 | 说明 |
+|---|---|
+| 本地文件系统 | `sqlite.db` 与 `sqlite.db.write.lock` 必须位于**本地磁盘**。NFS / 网络盘上的 `flock` 语义不可依赖，WAL 依赖的共享内存文件也可能不可用 |
+| 目录权限 | 运行用户（systemd 里的 `User=`）必须对数据库**所在目录**有读写权限：锁文件 `sqlite.db.write.lock` 会与数据库同目录创建，并且**一直保留**（稳定 inode 是互斥保证的一部分，不要删它） |
+| 单机 | 同一套数据库只能被**一台**机器上的进程使用。需要多机部署请换 PostgreSQL，而不是想办法共享 SQLite 文件 |
+| 备份 | 见上一节；锁文件无需备份，也无需清理 |
+| 排障 | 锁等待超过 1 秒会在日志里出现 `Write lock wait …ms`（`logs/app.log`）。如果频繁出现，说明写竞争已经明显，先看是不是有慢写事务或外部脚本在写 |
+| 完整性自检 | `sqlite3 sqlite.db "PRAGMA integrity_check;"` 应返回 `ok`；可放进日常巡检 |

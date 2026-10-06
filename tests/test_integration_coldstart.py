@@ -1,20 +1,20 @@
 """冷启动端到端集成测试（对应验收清单）。
 
 与其它测试不同，本模块**不注入合成配置**：它用仓库真实的 config.toml 走完整
-lifespan 启动流程，只把数据库与内容目录重定向到临时位置，然后依次访问
-验收清单里的每一条路径与动作，确认整条链路可用。
+启动流程（`core.lifespan.startup()`），只把数据库与内容目录重定向到临时位置，
+然后依次访问验收清单里的每一条路径与动作，确认整条链路可用。
 """
 import os
 import unittest
 
-from tests.support import PROJECT_ROOT, AppHarness, run_async  # noqa: F401
+from tests.support import PROJECT_ROOT, AppHarness  # noqa: F401
 
 from elenvind.core import config as config_module
 from elenvind.core import db_base
 from elenvind.core import lifespan as lifespan_module
 from elenvind.core.config import apply_runtime_config, load_config, validate_config
-from elenvind.features.blog import logic as blog_logic
-from elenvind.features.pages import logic as pages_logic
+from elenvind.modules.blog import logic as blog_logic
+from elenvind.modules.pages import logic as pages_logic
 
 
 class ColdStartTests(unittest.TestCase):
@@ -209,25 +209,24 @@ class ColdStartTests(unittest.TestCase):
         self.assertEqual(logout.header("location"), "/")
 
     def test_startup_rejects_invalid_configuration(self):
-        """配置非法时 lifespan 必须明确失败，而不是起一个半初始化的应用。"""
+        """配置非法时 startup() 必须明确失败，而不是起一个半初始化的应用。
+
+        WSGI 没有 lifespan 协议：入口模块导入时直接调用 `startup()`，
+        异常向上抛 => gunicorn 导入失败 => 拒绝启动。因此这里断言的就是
+        "异常会被抛出"，而不是旧实现里的 `lifespan.startup.failed` 消息。
+        """
         import logging
 
-        from elenvind.app import app
-
-        messages = [{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}]
-        sent = []
-
-        async def receive():
-            return messages.pop(0) if messages else {"type": "lifespan.shutdown"}
-
-        async def send(message):
-            sent.append(message)
+        from elenvind.core.config import ConfigError
+        from elenvind.core.lifespan import startup
 
         original = dict(config_module.config)
         original_handlers = logging.getLogger().handlers[:]
         try:
             config_module.config["server"]["port"] = 999999   # 非法端口
-            run_async(app({"type": "lifespan"}, receive, send))
+            with self.assertRaises(ConfigError) as caught:
+                startup()
+            self.assertIn("port", str(caught.exception))
         finally:
             config_module.config.clear()
             config_module.config.update(original)
@@ -236,10 +235,6 @@ class ColdStartTests(unittest.TestCase):
             for handler in original_handlers:
                 logging.getLogger().addHandler(handler)
 
-        self.assertTrue(sent, "lifespan produced no messages")
-        self.assertEqual(sent[0]["type"], "lifespan.startup.failed")
-        self.assertIn("port", sent[0]["message"])
-
     def test_startup_creates_missing_directories(self):
         from elenvind.core.logging_config import resolve_log_path
         log_path = resolve_log_path("logs/cold-test/app.log")
@@ -247,7 +242,7 @@ class ColdStartTests(unittest.TestCase):
 
 
 def fragment_app():
-    """返回被测 ASGI 应用对象（延迟导入，避免模块级循环依赖）。"""
+    """返回被测 WSGI 应用对象（延迟导入，避免模块级循环依赖）。"""
     from elenvind.app import app
     return app
 
@@ -281,7 +276,13 @@ class LoggingTests(unittest.TestCase):
             import shutil
             shutil.rmtree(log_file.parent, ignore_errors=True)
 
-    def test_uvicorn_loggers_do_not_duplicate(self):
+    def test_gunicorn_loggers_do_not_duplicate(self):
+        """gunicorn 的 logger 必须与根 logger 共用同一批 handler，且不重复传播。
+
+        回归（随 WSGI 迁移改写）：gunicorn 自带的 error/access logger 默认
+        `propagate=True` 且自带 handler —— 不管它们的话，同一条 worker
+        启动/访问日志会打两遍（或绕过轮转文件）。
+        """
         import logging
         from elenvind.core.logging_config import setup_logging, shutdown_logging
         from tests.support import PROJECT_ROOT
@@ -289,15 +290,15 @@ class LoggingTests(unittest.TestCase):
         root = PROJECT_ROOT / ".testtmp"
         root.mkdir(parents=True, exist_ok=True)
         try:
-            setup_logging(level="critical", log_file=str(root / "uv-test" / "app.log"))
-            for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+            setup_logging(level="critical", log_file=str(root / "gunicorn-test" / "app.log"))
+            for name in ("gunicorn", "gunicorn.error", "gunicorn.access"):
                 logger = logging.getLogger(name)
                 self.assertEqual(len(logger.handlers), 2)
                 self.assertFalse(logger.propagate)
         finally:
             shutdown_logging()
             import shutil
-            shutil.rmtree(root / "uv-test", ignore_errors=True)
+            shutil.rmtree(root / "gunicorn-test", ignore_errors=True)
 
 
 class ConfigValidationStartupTests(unittest.TestCase):

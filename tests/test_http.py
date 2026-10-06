@@ -2,16 +2,21 @@
 import unittest
 from urllib.parse import urlencode
 
-from tests.support import ElenvindTestCase
+from tests.support import ElenvindTestCase, StreamInput
 
 
 class PostBodyFramingTests(ElenvindTestCase):
-    """_read_post_body 的各类畸形 / 边界输入（规格要求逐项覆盖）。"""
+    """请求体 framing 的各类畸形 / 边界输入（规格要求逐项覆盖）。
 
-    def _post_raw(self, body=b"", headers=None, chunks=None, path="/login"):
+    这些用例全部围绕 **WSGI 的请求体语义**展开：长度来自 `CONTENT_LENGTH`，
+    body 从 `environ["wsgi.input"]` 按声明长度读取，而输入流允许**短读**
+    （一次只给一部分）与提前 EOF（客户端断开/截断）。
+    """
+
+    def _post_raw(self, body=b"", headers=None, stream=None, path="/login"):
         base = [("host", "example.com")]
         base.extend(headers or [])
-        return self.app.raw_request("POST", path, b"", base, body=body, chunks=chunks)
+        return self.app.raw_request("POST", path, b"", base, body=body, stream=stream)
 
     def test_negative_content_length_is_400(self):
         response = self._post_raw(headers=[("content-length", "-1")])
@@ -22,7 +27,7 @@ class PostBodyFramingTests(ElenvindTestCase):
         self.assertEqual(response.status, 400)
 
     def test_missing_content_length_is_411_not_empty_form(self):
-        """缺少 Content-Length（含 chunked）必须明确拒绝，而不是当成空表单。"""
+        """缺少 Content-Length 必须明确拒绝，而不是当成空表单。"""
         response = self._post_raw(
             body=b"csrf_token=x",
             headers=[("content-type", "application/x-www-form-urlencoded")],
@@ -37,12 +42,37 @@ class PostBodyFramingTests(ElenvindTestCase):
         self.assertEqual(response.status, 413)
         self.assertEqual(response.header("connection"), "close")
 
+    def test_oversized_declared_length_is_rejected_without_reading_body(self):
+        """声明超限时必须**先拒绝**，而不是把 2 MB 读进来再判体积。
+
+        用 2 MB 的声明配一个"只有 10 字节"的流：如果实现先读完再判，
+        就会得到 400（截断）而不是 413。
+        """
+        response = self._post_raw(
+            stream=StreamInput(b"a" * 10),
+            headers=[("content-length", str(2 * 1024 * 1024)),
+                     ("content-type", "application/x-www-form-urlencoded")])
+        self.assertEqual(response.status, 413)
+
     def test_truncated_body_is_400(self):
         """声明 1000 字节却只发 10 字节：不能当合法请求处理。"""
-        body = b"a" * 10
         response = self._post_raw(
-            body=body,
+            stream=StreamInput(b"a" * 10),
             headers=[("content-length", "1000"),
+                     ("content-type", "application/x-www-form-urlencoded")],
+        )
+        self.assertEqual(response.status, 400)
+
+    def test_input_stream_that_gives_nothing_is_400_not_a_hang(self):
+        """声明了长度、输入流却一个字节都不给：必须立刻 400（不能空转）。
+
+        这是旧的异步适配层里 `MAX_BODY_CHUNKS` 计数器防的那个失败模式
+        （"空分片 + more_body 永真"）。WSGI 下循环由声明长度兜底：
+        每次读取要么至少推进一个字节，要么读不到 => 直接按截断拒绝。
+        """
+        response = self._post_raw(
+            stream=StreamInput(always_empty=True),
+            headers=[("content-length", "100"),
                      ("content-type", "application/x-www-form-urlencoded")],
         )
         self.assertEqual(response.status, 400)
@@ -81,133 +111,31 @@ class PostBodyFramingTests(ElenvindTestCase):
         self.assertEqual(response.status, 400)
         self.assertIn("CSRF", response.text)
 
-    def test_multiple_body_chunks_are_concatenated(self):
-        token = self.fetch_csrf()
-        body = urlencode({"csrf_token": token, "email": "nobody@example.com",
-                          "password": "whatever"}).encode()
-        first, second = body[:10], body[10:]
-        chunks = [
-            {"type": "http.request", "body": first, "more_body": True},
-            {"type": "http.request", "body": second, "more_body": False},
-        ]
-        response = self._post_raw(chunks=chunks, headers=[
-            ("content-length", str(len(body))),
-            ("content-type", "application/x-www-form-urlencoded"),
-            ("cookie", f"csrf={token}"),
-        ])
-        self.assertEqual(response.status, 200)   # 登录失败页（账号不存在）
-
-    def test_empty_chunks_do_not_loop_forever(self):
-        token = self.fetch_csrf()
-        body = urlencode({"csrf_token": token, "email": "a@b.c", "password": "x"}).encode()
-        chunks = [{"type": "http.request", "body": b"", "more_body": True} for _ in range(5)]
-        chunks.append({"type": "http.request", "body": body, "more_body": False})
-        response = self._post_raw(chunks=chunks, headers=[
-            ("content-length", str(len(body))),
-            ("content-type", "application/x-www-form-urlencoded"),
-            ("cookie", f"csrf={token}"),
-        ])
-        self.assertEqual(response.status, 200)
-
-    def test_endless_empty_chunks_are_bounded(self):
-        """`more_body` 永远为真 + 空分片时必须有上限，不能无限循环。
-
-        回归：这条测试以前发的是 `Content-Length: 100` 配 2000 个空分片，
-        而**空分片根本不被计数**（计数器写在 `if chunk:` 里面），
-        循环靠"分片用完 -> 下一帧 KeyError/异常"结束，永远不会碰到
-        `MAX_BODY_CHUNKS` —— 测试通过，防线却不可达。
-        实测：喂 20 万个空分片时旧实现仍在循环。
-
-        现在：空分片也计数，第 `MAX_BODY_CHUNKS + 1` 个分片必须 413。
-        """
-        from elenvind.core.http import MAX_BODY_CHUNKS
-
-        chunks = [{"type": "http.request", "body": b"", "more_body": True}
-                  for _ in range(MAX_BODY_CHUNKS + 10)]
-        chunks.append({"type": "http.disconnect"})
-        response = self._post_raw(chunks=chunks, headers=[
-            ("content-length", "100"),
-            ("content-type", "application/x-www-form-urlencoded"),
-        ])
-        self.assertEqual(response.status, 413, response.text[:200])
-
-    def test_chunk_count_caps_even_without_content_length(self):
-        """缺 Content-Length -> 411，而且不能先把分片全读进来再判。"""
-        chunks = [{"type": "http.request", "body": b"", "more_body": True}
-                  for _ in range(50)]
-        chunks.append({"type": "http.disconnect"})
-        response = self._post_raw(chunks=chunks, headers=[
-            ("content-type", "application/x-www-form-urlencoded"),
-        ])
-        self.assertEqual(response.status, 411, response.text[:200])
-
-    def test_nonempty_chunks_accumulate_up_to_declared_length(self):
-        """非空分片的正常路径不受影响：凑够声明的长度就结束（不再要求更多分片）。
-
-        每片 4096 字节、声明 1 MB 时，第 256 片恰好凑满 -> 循环正常退出，
-        随后由 CSRF 判定拒绝（400）。这确认新加的计数逻辑没有误伤正常分片。
-        """
-        chunk = b"a" * 4096
-        chunks = [{"type": "http.request", "body": chunk, "more_body": True}
-                  for _ in range(300)]
-        chunks.append({"type": "http.disconnect"})
-        response = self._post_raw(chunks=chunks, headers=[
-            ("content-length", "1048576"),
-            ("content-type", "application/x-www-form-urlencoded"),
-        ])
-        self.assertEqual(response.status, 400, response.text[:200])
-        self.assertIn("CSRF", response.text)
-
-    def test_oversize_without_declared_length_still_413(self):
-        """未声明长度时由分片累计拦下（体积上限这条路径）。"""
-        chunk = b"a" * 4096
-        chunks = [{"type": "http.request", "body": chunk, "more_body": True}
-                  for _ in range(600)]
-        chunks.append({"type": "http.disconnect"})
-        response = self._post_raw(chunks=chunks, headers=[
-            ("content-type", "application/x-www-form-urlencoded"),
-        ])
-        # 缺 Content-Length 时先 411（Core 的既定语义）
-        self.assertEqual(response.status, 411, response.text[:200])
-
-    def test_many_small_chunks_hit_the_chunk_cap_not_the_size_cap(self):
-        """小分片很多时，触发的是分片数上限而非体积上限（两条路径都要覆盖）。"""
-        from elenvind.core.http import MAX_BODY_CHUNKS
-
-        # 每片 1 字节：1024 片只有 1 KB，远达不到 1 MB，所以只能由分片数拦下
-        chunks = [{"type": "http.request", "body": b"a", "more_body": True}
-                  for _ in range(MAX_BODY_CHUNKS + 10)]
-        chunks.append({"type": "http.disconnect"})
-        response = self._post_raw(chunks=chunks, headers=[
-            ("content-length", "1048576"),
-            ("content-type", "application/x-www-form-urlencoded"),
-        ])
-        self.assertEqual(response.status, 413, response.text[:200])
-        self.assertIn("chunk", response.text.lower())
-
-    def test_client_disconnect_is_400(self):
-        chunks = [{"type": "http.disconnect"}]
-        response = self._post_raw(chunks=chunks, headers=[
-            ("content-length", "10"),
-            ("content-type", "application/x-www-form-urlencoded"),
-        ])
-        self.assertEqual(response.status, 400)
-
-    def test_unexpected_asgi_message_is_400(self):
-        chunks = [{"type": "http.response.start"}, {"type": "http.disconnect"}]
-        response = self._post_raw(chunks=chunks, headers=[
-            ("content-length", "10"),
-            ("content-type", "application/x-www-form-urlencoded"),
-        ])
-        self.assertEqual(response.status, 400)
-
     def test_invalid_utf8_body_is_400(self):
+        """请求体不是合法 UTF-8：明确 400，不做替换式容错解析。"""
         body = b"csrf_token=\xff\xfe"
         response = self._post_raw(body=body, headers=[
             ("content-length", str(len(body))),
             ("content-type", "application/x-www-form-urlencoded"),
         ])
         self.assertEqual(response.status, 400)
+
+    def test_short_reads_are_concatenated(self):
+        """WSGI 允许输入流短读：必须循环读到声明的长度，而不是读一次就算。
+
+        输入流每次最多给 3 字节：若实现只读一次，body 会被判成"截断"（400）；
+        正确实现拼接后得到完整表单（走到 CSRF/登录失败页 = 200/400 均可，
+        这里用真实凭据走到登录失败页 200）。
+        """
+        token = self.fetch_csrf()
+        body = urlencode({"csrf_token": token, "email": "nobody@example.com",
+                          "password": "whatever"}).encode()
+        response = self._post_raw(
+            stream=StreamInput(body, max_per_read=3),
+            headers=[("content-length", str(len(body))),
+                     ("content-type", "application/x-www-form-urlencoded"),
+                     ("cookie", f"csrf={token}")])
+        self.assertEqual(response.status, 200)   # 登录失败页（账号不存在）
 
     def test_body_exactly_at_limit_is_allowed(self):
         """上限之内的 body 必须能正常进入业务逻辑（此处以 CSRF 失败为界）。"""
@@ -355,7 +283,7 @@ class MethodAndRoutingTests(ElenvindTestCase):
 
     def test_login_next_rejects_open_redirect(self):
         """登录后的回跳同样必须拒绝 TAB / 反斜杠。"""
-        from elenvind.features.auth.routes import safe_next
+        from elenvind.modules.auth.routes import safe_next
         for value in ("/\t/evil.com", "/\\evil.com", "//evil.com",
                       "https://evil.com", "\\\\evil", "javascript:alert(1)",
                       "/\n/evil.com", "/\u2028/evil.com", "", None, 123):
@@ -363,7 +291,7 @@ class MethodAndRoutingTests(ElenvindTestCase):
                 self.assertEqual(safe_next(value), "")
 
     def test_login_next_keeps_legitimate_paths(self):
-        from elenvind.features.auth.routes import safe_next
+        from elenvind.modules.auth.routes import safe_next
         for value in ("/", "/about", "/article/x?y=1", "/a/b/c",
                       "/user?next=/login", "/中文路径", "/a%20b"):
             with self.subTest(value=value):

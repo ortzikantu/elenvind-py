@@ -3,7 +3,7 @@
 复杂度基准对应规格第十五节：100 / 500 / 1000 / 5000 条评论的树构建，
 必须接近线性（不是 O(n²)），且任何深度都不能触发 Python 递归上限。
 
-树展开现在由 `features.blog.logic.build_comment_rows` 的同一套算法负责
+树展开现在由 `modules.blog.logic.build_comment_rows` 的同一套算法负责
 （children_by_parent + 显式栈）；本模块的性能基准对内存数据复刻该算法，
 因此仍然能守住"线性 + 无递归"这条契约。
 """
@@ -14,7 +14,7 @@ from tests.support import ElenvindTestCase
 
 from elenvind.core.db_base import connect
 from elenvind.core.db_comment import create_comment, get_comment_by_id, get_comments_by_article
-from elenvind.features.blog import logic as blog
+from elenvind.modules.blog import logic as blog
 
 
 def expand_tree(comments):
@@ -107,7 +107,7 @@ class CorruptCommentDataTests(ElenvindTestCase):
 
     def test_reply_depth_is_bounded_when_chain_is_corrupt(self):
         """父链被人为拉长/成环时，层级计算必须是常数级有界的，不能死循环。"""
-        from elenvind.features.blog import logic as _blog_logic
+        from elenvind.modules.blog import logic as _blog_logic
         from elenvind.core.db_comment import get_comment_by_id
 
         self._config["max_comment_depth"] = 3

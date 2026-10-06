@@ -523,7 +523,7 @@ class DefaultStylesheetCoverageTests(unittest.TestCase):
 
     #: 允许未覆盖的例外（附理由，避免守卫变成"改断言就过"）
     ALLOWED_WITHOUT_RULE = {
-        # 评论操作按钮的类名来自 Feature 数据（action.css 取值 delete-link/restore-link），
+        # 评论操作按钮的类名来自模块数据（action.css 取值 delete-link/restore-link），
         # 这里扫到的是模板里的表达式片段，不是真实类名
         "action.css",
         # 逻辑运算符被误当类名（模板已修为 |default 形式，此处兜底）

@@ -1,10 +1,10 @@
-"""Core Contract 测试：框架承诺的"默认安全"必须可验证、且不会被 Feature 绕过。
+"""Core Contract 测试：框架承诺的"默认安全"必须可验证、且不会被模块绕过。
 
-这个模块回答一个问题：**Feature 作者什么都不做时，安全性还成立吗？**
+这个模块回答一个问题：**模块作者什么都不做时，安全性还成立吗？**
 它不复测业务逻辑，只验证框架层的契约：
 
-A. 声明即安全      —— auth / permission / CSRF 由调度器执行，Feature 不写也生效
-B. 无法绕过        —— Feature 不得自己实现 session / cookie / csrf / 密码 /
+A. 声明即安全      —— auth / permission / CSRF 由调度器执行，模块不写也生效
+B. 无法绕过        —— 模块不得自己实现 session / cookie / csrf / 密码 /
                       安全头 / 请求限制（静态守卫 + 运行时验证）
 C. 默认安全        —— 每个响应都带安全头；每个 Cookie 都是 HttpOnly+SameSite
 D. 失效关闭        —— 声明写错时宁可拒绝，也不放行（回归守卫）
@@ -21,12 +21,12 @@ from tests.support import PROJECT_ROOT, ElenvindTestCase
 from elenvind.app import app
 from elenvind.core.context import build_render_context
 
-FEATURES_DIR = PROJECT_ROOT / "elenvind" / "features"
+MODULES_DIR = PROJECT_ROOT / "elenvind" / "modules"
 CORE_DIR = PROJECT_ROOT / "elenvind" / "core"
 
 
-def _feature_sources():
-    for path in sorted(FEATURES_DIR.rglob("*.py")):
+def _module_sources():
+    for path in sorted(MODULES_DIR.rglob("*.py")):
         yield path, path.read_text(encoding="utf-8")
 
 
@@ -151,7 +151,7 @@ class DeclarativeSecurityTests(ElenvindTestCase):
 
     def test_next_cannot_be_used_for_open_redirect(self):
         """登录回跳只允许站内路径，防止被当成开放重定向。"""
-        from elenvind.features.auth.routes import safe_next
+        from elenvind.modules.auth.routes import safe_next
 
         for hostile in ("//evil.example.com", "https://evil.example.com",
                         "http://evil.example.com/x", "\\\\evil", "/\\evil",
@@ -209,7 +209,7 @@ class DeclarativeSecurityTests(ElenvindTestCase):
 
     def _anonymous_request(self):
         from elenvind.core.http import Request
-        request = Request(scope={}, method="GET", path="/", query={}, headers={},
+        request = Request(environ={}, method="GET", path="/", query={}, headers={},
                           cookies={}, raw_body=b"", form={}, content_type="",
                           content_length=None, client_ip="1.2.3.4", secure=False,
                           lang="en")
@@ -313,14 +313,14 @@ class DeclarativeSecurityTests(ElenvindTestCase):
 
 
 class NoDuplicateSecurityTests(unittest.TestCase):
-    """B. Feature 不得**重新实现**框架已经提供的安全能力。
+    """B. 模块不得**重新实现**框架已经提供的安全能力。
 
-    注意区分"使用"与"重造"：Feature 调用 `core.security.hash_password()` 是
+    注意区分"使用"与"重造"：模块调用 `core.security.hash_password()` 是
     正确用法（Core 提供原语）；只有自己拼 Cookie、自己定义校验函数、
     自己造安全头才算违约。
     """
 
-    #: 这些符号一旦在 Feature 里**被定义**或**直接实例化**，就是重造轮子
+    #: 这些符号一旦在模块里**被定义**或**直接实例化**，就是重造轮子
     FORBIDDEN_DEFINITIONS = {
         "hash_password": "密码哈希只能由 core.security 提供",
         "verify_password": "密码校验只能由 core.security 提供",
@@ -340,30 +340,30 @@ class NoDuplicateSecurityTests(unittest.TestCase):
         "render_markdown": "Markdown 渲染只能由 core.markdown 提供",
     }
 
-    #: 这些调用一旦出现在 Feature 里，说明它在自己实现安全机制
+    #: 这些调用一旦出现在模块里，说明它在自己实现安全机制
     FORBIDDEN_CALLS = {
         "SimpleCookie": "Cookie 必须通过 Core API 操作",
         "scrypt": "密码哈希必须走 core.security",
         "compare_digest": "常量时间比对必须走 core.csrf",
     }
 
-    #: Feature 里**不得出现的 Response Cookie 方法**。
+    #: 模块里**不得出现的 Response Cookie 方法**。
     #:
-    #: 回归：契约写着"Feature 不拼 Cookie"，但守卫只禁了**定义** helper，
-    #: 于是 4 处 Feature 直接调用 `response.set_cookie(...)` /
+    #: 回归：契约写着"模块不拼 Cookie"，但守卫只禁了**定义** helper，
+    #: 于是 4 处模块直接调用 `response.set_cookie(...)` /
     #: `response.delete_cookie(SESSION_COOKIE)` 完全合法地绕过了它 ——
-    #: Feature 既知道了 Cookie 名字，又得自己处理 `__Host-` 前缀策略。
+    #: 模块既知道了 Cookie 名字，又得自己处理 `__Host-` 前缀策略。
     #: 正确做法：会话走 `request.invalidate_session_cookie()`，
     #: 偏好走 `request.set_preference()`，由 Core 统一下发。
     FORBIDDEN_COOKIE_METHODS = {
-        "set_cookie": "Feature 不得自己写 Cookie；偏好请用 request.set_preference()",
-        "delete_cookie": "Feature 不得自己删 Cookie；会话请用 request.invalidate_session_cookie()",
+        "set_cookie": "模块不得自己写 Cookie；偏好请用 request.set_preference()",
+        "delete_cookie": "模块不得自己删 Cookie；会话请用 request.invalidate_session_cookie()",
     }
 
-    def test_features_do_not_set_or_delete_cookies(self):
-        """Feature 不得触碰 Response 的 Cookie API。"""
+    def test_modules_do_not_set_or_delete_cookies(self):
+        """模块不得触碰 Response 的 Cookie API。"""
         offenders = []
-        for path, source in _feature_sources():
+        for path, source in _module_sources():
             tree = ast.parse(source)
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
@@ -376,12 +376,12 @@ class NoDuplicateSecurityTests(unittest.TestCase):
                     offenders.append(
                         f"{path.name}:{node.lineno}: .{func.attr}() -> {reason}")
         self.assertEqual(offenders, [],
-                         "Feature 在操作 Cookie：\n" + "\n".join(offenders))
+                         "模块在操作 Cookie：\n" + "\n".join(offenders))
 
-    def test_features_do_not_import_session_cookie_constant(self):
-        """Feature 不得 import 会话 Cookie 名（说明它想自己操作那个 Cookie）。"""
+    def test_modules_do_not_import_session_cookie_constant(self):
+        """模块不得 import 会话 Cookie 名（说明它想自己操作那个 Cookie）。"""
         offenders = []
-        for path, source in _feature_sources():
+        for path, source in _module_sources():
             tree = ast.parse(source)
             for node in ast.walk(tree):
                 if not isinstance(node, ast.ImportFrom):
@@ -390,7 +390,7 @@ class NoDuplicateSecurityTests(unittest.TestCase):
                     if alias.name in ("SESSION_COOKIE", "CSRF_COOKIE"):
                         offenders.append(f"{path.name}:{node.lineno}: {alias.name}")
         self.assertEqual(offenders, [],
-                         "Feature import 了 Core 的 Cookie 常量：\n"
+                         "模块 import 了 Core 的 Cookie 常量：\n"
                          + "\n".join(offenders))
 
     def test_footer_copyright_falls_back_to_site_title(self):
@@ -529,9 +529,9 @@ class NoDuplicateSecurityTests(unittest.TestCase):
                 self.assertEqual(normalize_auth(value), value
                                  if value != "required" else "authenticated")
 
-    def test_features_do_not_reimplement_security(self):
+    def test_modules_do_not_reimplement_security(self):
         offenders = []
-        for path, source in _feature_sources():
+        for path, source in _module_sources():
             tree = ast.parse(source)
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -542,10 +542,10 @@ class NoDuplicateSecurityTests(unittest.TestCase):
                     if isinstance(node.ctx, ast.Load):
                         offenders.append(
                             f"{path.name}: {node.id} -> {self.FORBIDDEN_CALLS[node.id]}")
-        self.assertEqual(offenders, [], "Feature 重新实现了安全能力：\n"
+        self.assertEqual(offenders, [], "模块重新实现了安全能力：\n"
                          + "\n".join(sorted(set(offenders))))
 
-    #: 危险构造：Feature 里出现这些，说明它在自己拼可执行/可注入的标记
+    #: 危险构造：模块里出现这些，说明它在自己拼可执行/可注入的标记
     DANGEROUS_MARKUP = re.compile(
         r"<\s*(script|iframe|object|embed|style|form|input|svg)\b"
         r"|\bon[a-z]+\s*="
@@ -553,15 +553,15 @@ class NoDuplicateSecurityTests(unittest.TestCase):
         re.IGNORECASE,
     )
 
-    def test_features_do_not_build_dangerous_markup(self):
-        """Feature 不得手写可执行/可注入的标记。
+    def test_modules_do_not_build_dangerous_markup(self):
+        """模块不得手写可执行/可注入的标记。
 
         允许出现的是无害的排版片段（`<br>`、`<span class=…>`）与路由模式
         （`/article/<slug>`）、XML（sitemap）等；这里只拦截真正的注入面。
         视图层的 HTML 组装主体已由 Jinja2 模板承担。
         """
         offenders = []
-        for path, source in _feature_sources():
+        for path, source in _module_sources():
             for node in ast.walk(ast.parse(source)):
                 if isinstance(node, ast.JoinedStr):
                     literal = "".join(part.value for part in node.values
@@ -573,37 +573,65 @@ class NoDuplicateSecurityTests(unittest.TestCase):
                     continue
                 if self.DANGEROUS_MARKUP.search(literal):
                     offenders.append(f"{path.name}: {literal.strip()[:60]!r}")
-        self.assertEqual(offenders, [], "Feature 里出现了危险标记拼接：\n"
+        self.assertEqual(offenders, [], "模块里出现了危险标记拼接：\n"
                          + "\n".join(sorted(set(offenders))))
 
-    def test_features_do_not_create_jinja_environment(self):
+    def test_modules_do_not_create_jinja_environment(self):
         banned = ("Environment", "FileSystemLoader", "select_autoescape")
         offenders = []
-        for path, source in _feature_sources():
+        for path, source in _module_sources():
             names = _imported_names(source)
             for name in banned:
                 if name in names:
                     offenders.append(f"{path.name}: {name}")
-        self.assertEqual(offenders, [], f"Feature 自建 Jinja 环境：{offenders}")
+        self.assertEqual(offenders, [], f"模块自建 Jinja 环境：{offenders}")
 
-    def test_features_do_not_import_core_db_connection_directly(self):
-        """Feature 只能用 `connect()`，不能用 get_connection()（会泄漏连接）。"""
+    def test_modules_do_not_import_core_db_connection_directly(self):
+        """模块不得自己开连接或自己管事务：连接/事务 API 只在 Core DB 层用。
+
+        C0 契约（见下方 `DatabaseWriteBoundaryTests`）：模块只能调用
+        Core 的业务数据库 API（`core.db_user` / `core.db_comment` / …），
+        由它们在 `write_tx()` 里完成写事务。模块自己碰
+        `connect()` / `get_connection()` / `write_tx()`（或直接 import sqlite3）
+        都会让协调边界失效。
+
+        判定基于 **AST**（import / Name / Attribute），因此注释与文档里出现
+        这些词不会误报 —— 只认真正会被执行的代码结构。
+        """
+        banned_names = {"get_connection", "connect", "write_tx"}
         offenders = []
-        for path, source in _feature_sources():
-            if "get_connection" in _imported_names(source) or \
-                    re.search(r"\bget_connection\b", source):
-                offenders.append(path.name)
-        self.assertEqual(offenders, [], f"Feature 直接开连接：{offenders}")
+        for path, source in _module_sources():
+            for node in ast.walk(ast.parse(source)):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name.split(".")[0] == "sqlite3":
+                            offenders.append(f"{path.name}:{node.lineno}: import sqlite3")
+                elif isinstance(node, ast.ImportFrom):
+                    root = (node.module or "").split(".")[0]
+                    for alias in node.names:
+                        if root == "sqlite3":
+                            offenders.append(f"{path.name}:{node.lineno}: from sqlite3 import …")
+                        elif alias.name in banned_names:
+                            offenders.append(f"{path.name}:{node.lineno}: import {alias.name}")
+                elif isinstance(node, ast.Name) and node.id in banned_names:
+                    offenders.append(f"{path.name}:{node.lineno}: {node.id}")
+                elif isinstance(node, ast.Attribute) and node.attr in banned_names:
+                    offenders.append(f"{path.name}:{node.lineno}: .{node.attr}")
+        self.assertEqual(offenders, [], f"模块直接开连接/管事务：{offenders}")
 
-    def test_core_does_not_import_features(self):
-        """依赖方向必须单向：Feature -> Core，Core 不认识任何 Feature。"""
+    def test_core_does_not_import_modules(self):
+        """依赖方向必须单向：模块 -> Core，Core 不认识任何业务模块。
+
+        更深的分层守卫（含"模块之间互不 import"、"无循环 import"、
+        "无旧 features 路径残留"）在 `tests/test_architecture.py`。
+        """
         offenders = []
         for path in sorted(CORE_DIR.rglob("*.py")):
             source = path.read_text(encoding="utf-8")
-            if re.search(r"^\s*from\s+\.\.features|^\s*import\s+.*features",
+            if re.search(r"^\s*from\s+\.\.modules|^\s*import\s+.*modules",
                          source, re.M):
                 offenders.append(path.name)
-        self.assertEqual(offenders, [], f"Core 反向依赖 Feature：{offenders}")
+        self.assertEqual(offenders, [], f"Core 反向依赖业务模块：{offenders}")
 
     def test_core_is_the_only_place_that_creates_template_environment(self):
         """Jinja Environment 只能在 core.templating 里创建一次。"""
@@ -618,13 +646,13 @@ class NoDuplicateSecurityTests(unittest.TestCase):
         self.assertEqual(offenders, [], f"重复创建 Jinja 环境：{offenders}")
 
     def test_all_templates_are_inside_the_templates_directory(self):
-        """模板必须集中在 elenvind/templates/，不散落在 Feature 里。"""
+        """模板必须集中在 elenvind/templates/，不散落在模块里。"""
         stray = [str(path.relative_to(PROJECT_ROOT))
-                 for path in FEATURES_DIR.rglob("*.html")]
-        self.assertEqual(stray, [], f"模板散落在 Feature 目录：{stray}")
+                 for path in MODULES_DIR.rglob("*.html")]
+        self.assertEqual(stray, [], f"模板散落在模块目录：{stray}")
 
-    def test_every_template_referenced_by_a_feature_exists(self):
-        """Feature 里 `render_template("x.html")` 引用的模板必须真实存在。
+    def test_every_template_referenced_by_a_module_exists(self):
+        """模块里 `render_template("x.html")` 引用的模板必须真实存在。
 
         回归守卫：曾经路由写 `user/profile.html` 而文件在 `users/profile.html`，
         只有跑到那条路径才会 500；静态检查能在测试前发现。
@@ -633,7 +661,7 @@ class NoDuplicateSecurityTests(unittest.TestCase):
 
         pattern = re.compile(r"""render_template\(\s*["']([^"']+\.html)["']""")
         missing = []
-        for path, source in _feature_sources():
+        for path, source in _module_sources():
             for name in pattern.findall(source):
                 if not (DEFAULT_TEMPLATES_DIR / name).is_file():
                     missing.append(f"{path.name}: {name}")
@@ -671,8 +699,256 @@ class NoDuplicateSecurityTests(unittest.TestCase):
         self.assertEqual(offenders, [], "可疑的 |safe 用法：\n" + "\n".join(offenders))
 
 
+#: 哪些 SQL 动词算"写"（BEGIN/COMMIT 不算：事务边界由 write_tx 自己管）
+_WRITE_SQL = re.compile(r"\b(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b",
+                        re.IGNORECASE)
+#: 执行 SQL 的方法名（无论读写，模块都不该出现）
+_SQL_METHODS = ("execute", "executemany", "executescript")
+
+
+def _sql_calls(tree):
+    """返回所有 `x.execute*(...)` 调用节点。"""
+    calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr in _SQL_METHODS:
+            calls.append(node)
+    return calls
+
+
+def _literal_sql(node):
+    """取出调用第一个参数里的字符串字面量（f-string 的固定片段也算）。"""
+    if not node.args:
+        return ""
+    return "".join(part.value for part in ast.walk(node.args[0])
+                   if isinstance(part, ast.Constant) and isinstance(part.value, str))
+
+
+def _code_of(source, node):
+    """函数的**代码**源码（去掉 docstring）。
+
+    子串检查必须避开文档：`_run_migrations` 的 docstring 里就写着
+    "BEGIN IMMEDIATE"（解释为什么它不再自己开事务），直接整段搜索会被自己
+    的注释骗到 —— 这个坑在本项目的测试里已经踩过一次。
+    """
+    lines = source.splitlines()[node.lineno - 1:node.end_lineno]
+    first = node.body[0] if node.body else None
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) \
+            and isinstance(first.value.value, str):
+        del lines[first.lineno - node.lineno:first.end_lineno - node.lineno + 1]
+    return "\n".join(lines)
+
+
+def _sql_execution_offenders(source):
+    """模块里出现的任何 SQL 执行调用（结构判定，不看 SQL 文本）。"""
+    return [f"line {node.lineno}: .{node.func.attr}()"
+            for node in _sql_calls(ast.parse(source))]
+
+
+def _driver_import_offenders(source):
+    """模块里出现的 sqlite3 import（连驱动都不该认识）。"""
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] == "sqlite3":
+                    offenders.append(f"line {node.lineno}: import sqlite3")
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] == "sqlite3":
+                offenders.append(f"line {node.lineno}: from sqlite3 import …")
+    return offenders
+
+
+def _db_module_write_offenders(name, source):
+    """DB 模块里"执行写 SQL 但没走 write_tx()"的函数。
+
+    判定规则（结构判定，避免"看到 INSERT 字样就报错"的误报）：
+    一个函数里如果出现了执行**写 SQL** 的调用，那么它必须满足其一：
+
+    1. 函数体内出现 `write_tx(`（自己开写事务）；或
+    2. 函数签名里有名为 `conn` 的参数 —— 说明它是"事务体 helper"，
+       由调用方（最终追溯到 write_tx）提供连接与事务。
+
+    读 SQL（SELECT）不在此列；schema 定义字符串、文档、注释也都不算 ——
+    判定只看"实际执行 SQL 的调用结构 + 该调用里的字符串内容"。
+    """
+    tree = ast.parse(source)
+    offenders = []
+    for func in [node for node in ast.walk(tree)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        writes = False
+        uses_write_tx = False
+        for node in ast.walk(func):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id == "write_tx":
+                    uses_write_tx = True
+                if isinstance(node.func, ast.Attribute) \
+                        and node.func.attr in _SQL_METHODS:
+                    if _WRITE_SQL.search(_literal_sql(node)):
+                        writes = True
+        if not writes or uses_write_tx:
+            continue
+        parameters = [arg.arg for arg in func.args.args + func.args.kwonlyargs]
+        if func.args.vararg:
+            parameters.append(func.args.vararg.arg)
+        if "conn" in parameters:
+            continue                    # 事务体 helper：连接由调用方给
+        offenders.append(f"{name}: {func.name}()")
+    return offenders
+
+
+class DatabaseWriteBoundaryTests(unittest.TestCase):
+    """C0 契约：**所有**应用内 SQLite 写事务都经过 Core 的唯一写入口 `write_tx()`。
+
+    三层守卫：
+
+    1. 模块层：不得 import sqlite3 / 开连接 / 执行任何 SQL / 自己管事务；
+    2. Core DB 层：`db_*.py` 里执行写 SQL 的函数，必须自己用 `write_tx()`
+       或是"由调用方传入连接"的事务体 helper；
+    3. 入口层：`init_db()` / `migrate()` 必须走 `write_tx()`，且锁必须先于
+       `BEGIN IMMEDIATE`、在 finally 里释放（顺序错了就等于没锁）。
+
+    另外附带一个**反向控制**：把明显的违规样本喂给守卫，确认它真的会报错
+    （否则"全绿"可能只是守卫失效）。
+    """
+
+    def test_modules_never_execute_sql(self):
+        offenders = []
+        for path, source in _module_sources():
+            for detail in _sql_execution_offenders(source):
+                offenders.append(f"{path.name}: {detail}")
+        self.assertEqual(offenders, [],
+                         "模块直接执行了 SQL（必须走 Core 的业务 DB API）：\n"
+                         + "\n".join(offenders))
+
+    def test_modules_do_not_import_sqlite3(self):
+        offenders = []
+        for path, source in _module_sources():
+            for detail in _driver_import_offenders(source):
+                offenders.append(f"{path.name}: {detail}")
+        self.assertEqual(offenders, [],
+                         "模块不该认识数据库驱动（需要异常类型请从 core 取）：\n"
+                         + "\n".join(offenders))
+
+    def test_db_modules_writes_go_through_write_tx(self):
+        offenders = []
+        for path in sorted(CORE_DIR.glob("db_*.py")):
+            offenders.extend(_db_module_write_offenders(
+                path.name, path.read_text(encoding="utf-8")))
+        self.assertEqual(offenders, [],
+                         "这些函数执行了写 SQL 却没有 write_tx()/conn 事务边界：\n"
+                         + "\n".join(offenders))
+
+    def test_write_entrypoints_and_migrations_use_the_write_guard(self):
+        source = (CORE_DIR / "db_base.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        functions = {node.name: node for node in ast.walk(tree)
+                     if isinstance(node, ast.FunctionDef)}
+        for name in ("init_db", "migrate", "write_tx", "_run_migrations"):
+            self.assertIn(name, functions, f"db_base.py 缺少 {name}()")
+        for name in ("init_db", "migrate"):
+            body = _code_of(source, functions[name])
+            self.assertIn("write_tx(", body,
+                          f"{name}() 必须通过 write_tx() 执行写操作")
+        run_migrations = _code_of(source, functions["_run_migrations"])
+        self.assertNotIn("BEGIN IMMEDIATE", run_migrations,
+                         "_run_migrations() 不该自己开事务：BEGIN IMMEDIATE 由 write_tx() 统一负责")
+        self.assertNotIn("commit()", run_migrations,
+                         "_run_migrations() 不该自己提交：由 write_tx() 统一负责")
+
+    def test_write_tx_lock_order_and_release(self):
+        """锁必须覆盖整个事务，且顺序正确：flock → BEGIN IMMEDIATE → commit/rollback。
+
+        用 **AST 语句顺序**比较（不是子串位置）：函数 docstring 里也会出现
+        `BEGIN IMMEDIATE` 之类的字样，子串比较会被文档骗到。
+        """
+        source = (CORE_DIR / "db_base.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        functions = {node.name: node for node in ast.walk(tree)
+                     if isinstance(node, ast.FunctionDef)}
+        write = functions["write_tx"]
+
+        def find(predicate):
+            for child in ast.walk(write):
+                if predicate(child):
+                    return child
+            return None
+
+        lock_with = find(lambda n: isinstance(n, ast.With) and any(
+            getattr(getattr(item.context_expr, "func", None), "id", "")
+            == "_write_file_lock" for item in n.items))
+        self.assertIsNotNone(lock_with, "write_tx 必须先取跨进程锁（_write_file_lock）")
+
+        begin = find(lambda n: isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "execute"
+                     and "BEGIN IMMEDIATE" in _literal_sql(n))
+        self.assertIsNotNone(begin, "write_tx 必须显式 BEGIN IMMEDIATE")
+
+        yielded = find(lambda n: isinstance(n, ast.Expr)
+                       and isinstance(n.value, ast.Yield))
+        self.assertIsNotNone(yielded, "write_tx 必须把连接 yield 给业务代码")
+
+        commit = find(lambda n: isinstance(n, ast.Call)
+                      and isinstance(n.func, ast.Attribute)
+                      and n.func.attr == "commit")
+        rollback = find(lambda n: isinstance(n, ast.Call)
+                        and isinstance(n.func, ast.Attribute)
+                        and n.func.attr == "rollback")
+        close = find(lambda n: isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "close")
+
+        self.assertLess(lock_with.lineno, begin.lineno, "必须先取锁再开事务")
+        self.assertLess(begin.lineno, yielded.lineno, "必须先把事务开起来再交给业务代码")
+        self.assertLess(yielded.lineno, commit.lineno, "必须等业务跑完才提交")
+        self.assertTrue(lock_with.lineno <= begin.lineno <= lock_with.end_lineno,
+                        "BEGIN IMMEDIATE 必须落在持锁区间内（不能在锁外开事务）")
+        for name, node in (("commit", commit), ("rollback", rollback), ("close", close)):
+            self.assertIsNotNone(node, f"write_tx 缺少 {name}()")
+
+        lock_source = ast.get_source_segment(source, functions["_write_file_lock"]) or ""
+        self.assertIn("fcntl.flock", lock_source)
+        self.assertIn("LOCK_EX", lock_source)
+        self.assertIn("LOCK_UN", lock_source)
+        self.assertNotIn("LOCK_NB", lock_source, "必须是阻塞式等待，不做非阻塞轮询")
+        self.assertIn("_WRITE_LOCK_SUFFIX", source)
+
+    def test_guard_detects_violations(self):
+        """反向控制：故意构造的违规样本必须被判为违规。
+
+        没有这一条，"守卫全绿"也可能只是守卫失效（比如扫描路径写错、
+        正则写错）—— 这正是本项目历史上踩过的坑。
+        """
+        with self.subTest(case="module executes SQL directly"):
+            snippet = "def f(request, conn):\n" \
+                      "    conn.execute('UPDATE user SET nickname = ?', ('x',))\n"
+            self.assertTrue(_sql_execution_offenders(snippet))
+        with self.subTest(case="module imports the driver"):
+            self.assertTrue(_driver_import_offenders("import sqlite3\n"))
+            self.assertTrue(_driver_import_offenders("from sqlite3 import IntegrityError\n"))
+
+        # DB 模块层：执行写 SQL 却没走 write_tx、也没有 conn 参数 → 必须报错
+        with self.subTest(case="db module write without write_tx"):
+            bad = "def broken(article_slug):\n" \
+                  "    with connect() as conn:\n" \
+                  "        conn.execute('DELETE FROM comment WHERE id = ?', (1,))\n"
+            self.assertEqual(_db_module_write_offenders("db_x.py", bad),
+                             ["db_x.py: broken()"])
+        with self.subTest(case="db module write via write_tx is allowed"):
+            good = bad.replace("connect()", "write_tx()")
+            self.assertEqual(_db_module_write_offenders("db_x.py", good), [])
+        with self.subTest(case="transaction-body helper is allowed"):
+            helper = "def helper(conn, x):\n" \
+                     "    conn.execute('DELETE FROM comment WHERE id = ?', (x,))\n"
+            self.assertEqual(_db_module_write_offenders("db_x.py", helper), [])
+        with self.subTest(case="read-only SQL is not a violation"):
+            reader = "def read(conn):\n    conn.execute('SELECT 1')\n"
+            self.assertEqual(_db_module_write_offenders("db_x.py", reader), [])
+
+
 class DefaultSecurityTests(ElenvindTestCase):
-    """C. 默认安全：不依赖 Feature 记得做什么。"""
+    """C. 默认安全：不依赖模块记得做什么。"""
 
     REQUIRED_HEADERS = ("x-content-type-options", "x-frame-options",
                         "referrer-policy", "content-security-policy",
@@ -834,7 +1110,7 @@ class FailClosedTests(ElenvindTestCase):
         """构造一个带会话的 Request（复用真实请求路径）。"""
         from elenvind.core.http import Request
         from elenvind.core.session import load_user
-        request = Request(scope={}, method="GET", path="/", query={}, headers={},
+        request = Request(environ={}, method="GET", path="/", query={}, headers={},
                           cookies={"session": session_token}, raw_body=b"", form={},
                           content_type="", content_length=None,
                           client_ip="127.0.0.1", secure=True, lang="en",
@@ -878,33 +1154,21 @@ class FailClosedTests(ElenvindTestCase):
     def test_handler_returning_none_is_an_error_not_a_blank_page(self):
         """handler 忘记 return 时必须显式失败（500 + 日志），而不是静默空响应。
 
-        走完整 ASGI 路径：RuntimeError 不属于 HttpError，会穿透调度器，
+        走完整 WSGI 路径：RuntimeError 不属于 HttpError，会穿透调度器，
         由 App 统一转成 500。
         """
         from elenvind.core.app import App
-        from tests.support import run_async
+        from tests.support import build_environ, call_wsgi
 
         mini = App()
         mini.router.route("/boom", methods=["GET"])(lambda request: None)
 
-        sent = []
-
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        async def send(message):
-            sent.append(message)
-
-        scope = {"type": "http", "method": "GET", "path": "/boom", "scheme": "https",
-                 "headers": [], "query_string": b"", "client": ("127.0.0.1", 1)}
+        environ = build_environ("GET", "/boom")
         with self.assertLogs("elenvind.core.app", level="ERROR"):
-            run_async(mini(scope, receive, send))
+            response = call_wsgi(mini, environ)
 
-        status = next(m["status"] for m in sent if m["type"] == "http.response.start")
-        body = b"".join(m.get("body", b"") for m in sent
-                        if m["type"] == "http.response.body")
-        self.assertEqual(status, 500)
-        self.assertNotIn(b"returned None", body)      # 细节不外泄
+        self.assertEqual(response.status, 500)
+        self.assertNotIn(b"returned None", response.body)      # 细节不外泄
 
 
 class RequestBoundaryTests(ElenvindTestCase):

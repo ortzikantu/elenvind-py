@@ -1,7 +1,7 @@
 """评论系统测试：树组装（O(n)、无递归）、孤儿评论、层级上限、限流、增删恢复权限。
 
-架构说明（与旧测试的差别）：评论区现在是"Feature 准备数据 + Jinja2 模板排版"。
-因此渲染类测试调用 `features.blog.logic.build_comment_rows()` 拿到行数据，
+架构说明（与旧测试的差别）：评论区现在是"模块准备数据 + Jinja2 模板排版"。
+因此渲染类测试调用 `modules.blog.logic.build_comment_rows()` 拿到行数据，
 再用真实模板渲染，而不是调用已经不存在的 `render_comments()`。
 """
 import time
@@ -17,8 +17,8 @@ from elenvind.core.db_comment import (
 )
 from elenvind.core.db_comment_rate import try_post_comment
 from elenvind.core.templating import render_template
-from elenvind.features.blog import logic
-from elenvind.features.blog import logic as blog
+from elenvind.modules.blog import logic
+from elenvind.modules.blog import logic as blog
 
 
 def render_comments(slug, user, *, reply_to=None, max_length=1000, csrf_token=None):
@@ -807,14 +807,14 @@ class CommentContentRenderingTests(unittest.TestCase):
     """
 
     def render(self, content, *, is_deleted=0, admin=False):
-        from elenvind.features.blog.logic import _comment_content
+        from elenvind.modules.blog.logic import _comment_content
         return str(_comment_content({"content": content, "is_deleted": is_deleted},
                                     admin))
 
     def test_returns_markup_not_str(self):
         """必须是 Markup，否则模板会把它再转义一遍（页面上看到标签字面量）。"""
         from markupsafe import Markup
-        from elenvind.features.blog.logic import _comment_content
+        from elenvind.modules.blog.logic import _comment_content
         result = _comment_content({"content": "x", "is_deleted": 0}, False)
         self.assertIsInstance(result, Markup)
 
@@ -863,7 +863,7 @@ class CommentContentRenderingTests(unittest.TestCase):
         self.assertIn('<span class="comment-content"></span>', out)
 
     def test_normalize_newlines_helper_is_idempotent(self):
-        from elenvind.features.blog.logic import _normalize_newlines
+        from elenvind.modules.blog.logic import _normalize_newlines
         for value in ("a\r\nb", "a\rb", "a\nb", "a\r\n\r\nb", ""):
             with self.subTest(value=value):
                 once = _normalize_newlines(value)
@@ -905,11 +905,36 @@ class CommentRateTransactionGuardTests(unittest.TestCase):
                          "发布事务里不应再有 DELETE（会拉长写锁持有时间）")
 
     def test_prune_happens_outside_the_write_transaction(self):
-        """机会式清理必须在 `conn.commit()` **之后**调用。"""
-        body = self._function_body("try_post_comment")
-        self.assertIn("prune(", body, "发布后没有机会式清理，长跑进程会无界增长")
-        self.assertLess(body.index("conn.commit()"), body.index("prune("),
-                        "prune 在提交之前调用 —— 会延长写锁持有时间")
+        """机会式清理必须在写事务**之外**调用（提交之后、锁已释放）。
+
+        旧写法断言 "`conn.commit()` 在 `prune(` 之前"；C0 之后提交由
+        `write_tx()` 统一负责，函数里不再有 `conn.commit()`。等价且更强的判定
+        是结构性的：`prune(` 调用**不能落在 `with write_tx()` 的语句体里** ——
+        否则它会在写事务内部再取一次 flock（重入守卫会报错，否则就是自死锁）。
+        """
+        import ast
+
+        tree = ast.parse(self.source)
+        function = next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "try_post_comment")
+        guarded_ranges = []
+        for node in ast.walk(function):
+            if isinstance(node, ast.With) and any(
+                    isinstance(item.context_expr, ast.Call)
+                    and getattr(item.context_expr.func, "id", "") == "write_tx"
+                    for item in node.items):
+                guarded_ranges.append((node.lineno, node.end_lineno))
+        self.assertTrue(guarded_ranges, "try_post_comment 里找不到 write_tx() 块")
+
+        prune_lines = [node.lineno for node in ast.walk(function)
+                       if isinstance(node, ast.Call)
+                       and getattr(node.func, "id", "") == "prune"]
+        self.assertTrue(prune_lines, "发布后没有机会式清理，长跑进程会无界增长")
+        for line in prune_lines:
+            for start, end in guarded_ranges:
+                self.assertFalse(start <= line <= end,
+                                 "prune 在 write_tx() 块内调用 —— 会嵌套取锁/延长写锁")
 
     def test_startup_cleanup_still_deletes(self):
         body = self._function_body("cleanup_old_comment_attempts")
@@ -939,7 +964,7 @@ class SingleRawHtmlInjectionPointTests(unittest.TestCase):
     def test_warning_comment_present(self):
         import pathlib
         from tests.support import PROJECT_ROOT
-        source = (PROJECT_ROOT / "elenvind" / "features" / "blog"
+        source = (PROJECT_ROOT / "elenvind" / "modules" / "blog"
                   / "logic.py").read_text(encoding="utf-8")
         self.assertIn("此处是全项目唯一的原始 HTML 注入点，改动前务必确认转义顺序",
                       source)
@@ -956,7 +981,7 @@ class SingleRawHtmlInjectionPointTests(unittest.TestCase):
         import pathlib
         import re
         from tests.support import PROJECT_ROOT
-        source = (PROJECT_ROOT / "elenvind" / "features" / "blog"
+        source = (PROJECT_ROOT / "elenvind" / "modules" / "blog"
                   / "logic.py").read_text(encoding="utf-8")
         # 去掉注释与文档字符串后统计 Markup( 的调用
         code = re.sub(r'""".*?"""', "", source, flags=re.S)
@@ -1050,7 +1075,7 @@ class ReplyDepthWriteSideTests(ElenvindTestCase):
     def test_depth_check_reuses_core_walk(self):
         """深度计算只有一处实现：core.db_comment.comment_depth。"""
         from elenvind.core.db_comment import comment_depth as core_depth
-        from elenvind.features.blog import logic
+        from elenvind.modules.blog import logic
         ids = self._chain(3)
         row = get_comment_by_id(ids[-1])
         self.assertEqual(logic.comment_depth(row),
@@ -1082,7 +1107,7 @@ class ReplyDepthWriteSideTests(ElenvindTestCase):
         self.assertLessEqual(deepest, 3)
 
     def test_too_deep_has_user_facing_message(self):
-        from elenvind.features.blog import logic
+        from elenvind.modules.blog import logic
         ids = self._chain(3)
         outcome, message = logic.post_comment("post", self.user_id, "1.2.3.4",
                                               "hi", ids[-1])
@@ -1196,7 +1221,7 @@ class ReplyDepthHttpTests(ElenvindTestCase):
 
 def logic_depth(comment):
     """测试内取层级（走生产实现）。"""
-    from elenvind.features.blog import logic
+    from elenvind.modules.blog import logic
     return logic.comment_depth(comment)
 
 

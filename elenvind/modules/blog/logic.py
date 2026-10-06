@@ -1,4 +1,4 @@
-"""Blog Feature：文章索引、正文渲染缓存、文章页与评论。
+"""Blog 模块：文章索引、正文渲染缓存、文章页与评论。
 
 职责边界（只做业务）：
 - 扫描配置目录、解析文档头、调用 `core.markdown.render_markdown` 渲染正文；
@@ -6,6 +6,10 @@
 - 返回 Core 的 Response。
 
 **不做**：session / csrf / cookie / 安全头 / 请求校验 —— 全部由 Core 负责。
+
+依赖：只依赖 `core/`（配置、内容格式、Markdown、数据库模块、安全原语）。
+对本项目其它业务模块**零依赖**；需要给别的模块提供数据时，暴露这里的公开函数
+（如 `sitemap_articles()`），由装配层（`elenvind/app.py`）注入。
 
 缓存策略（与 Pages 一致）：
 - 索引缓存：缓存"元数据列表 + 目录文件状态快照"，按 (mtime, size) 比对；
@@ -23,6 +27,12 @@ from pathlib import Path
 from markupsafe import Markup
 
 from ...core.config import ROOT, config, resolve_path
+from ...core.content import (
+    ContentError,
+    normalize_metadata,
+    parse_document,
+    sort_key,
+)
 from ...core.db_comment import (
     get_comment_by_id,
     get_comments_by_article,
@@ -39,12 +49,6 @@ from ...core.db_comment_rate import try_post_comment
 from ...core.markdown import render_markdown
 from ...core.security import is_admin, is_admin_id
 from ...core.utils import escape_html, format_date
-from .content import (
-    ContentError,
-    normalize_metadata,
-    parse_document,
-    sort_key,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -208,10 +212,21 @@ def load_articles():
     _rescan()
 
 
+def sitemap_articles():
+    """`/sitemap.xml` 的公开数据源：`[(slug, 最后修改时间或 None), ...]`。
+
+    由装配层（`elenvind/app.py`）注入给 seo 模块 —— seo 只负责把数据组装成
+    XML，不 import 本模块的内部实现（模块之间互不 import）。
+    返回的日期交给 `core.utils.format_date()` 格式化，与页面显示同一套规则。
+    """
+    return [(article["slug"], article.get("lastmod") or article.get("date"))
+            for article in get_articles()]
+
+
 # ======================= 模板数据组装 =======================
 
 def article_list_context(page: int):
-    """首页文章列表上下文（分页数据在 Feature 里算好）。"""
+    """首页文章列表上下文（分页数据在模块里算好）。"""
     per_page = config.get("pagination", {}).get("per_page", 10)
     if not isinstance(per_page, int) or isinstance(per_page, bool) or per_page <= 0:
         per_page = 10
@@ -283,7 +298,7 @@ def _max_comments_per_article() -> int:
 
 
 def build_comment_rows(slug: str, user, *, max_length: int):
-    """把评论行组装成模板可直接渲染的结构（权限判断在 Feature 里完成）。
+    """把评论行组装成模板可直接渲染的结构（权限判断在模块里完成）。
 
     树展开委托 `core.db_comment.flatten_comment_tree` —— 那里是唯一定义，
     带防环与"不可达评论补根"处理（否则坏数据里的环会让评论从页面上消失）。
@@ -374,7 +389,7 @@ def comment_depth(comment) -> int:
 
     实现在 `core.db_comment.comment_depth`——那是**层级计算的唯一定义**，
     写入侧的 `try_post_comment` 也调用它（在事务内校验深度），
-    因此渲染与写入不可能算出不同的层级。这里只是按 Feature 的习惯
+    因此渲染与写入不可能算出不同的层级。这里只是按模块的习惯
     补上配置里的 max_depth 并转发，保持既有调用点与测试不变。
 
     防环（访问集合）与 limit 兜底都在那个实现里，未改动。

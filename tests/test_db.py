@@ -687,16 +687,62 @@ class MigrationTransactionTests(ElenvindTestCase):
         self.assertEqual(version, SCHEMA_VERSION)
         self.assertEqual(count, 3)
 
-    def test_begin_immediate_is_issued_before_ddl(self):
-        """结构性守卫：迁移必须在执行迁移函数**之前**开启事务。"""
+    def test_migration_runs_inside_the_write_transaction(self):
+        """结构性守卫：迁移必须在执行迁移函数**之前**已经开启事务。
+
+        C0 之后事务由 `write_tx()` 统一提供（`flock` → `BEGIN IMMEDIATE` → yield），
+        `_run_migrations()` 因此不再自己 BEGIN/COMMIT —— 它只接收 write_tx
+        给出的连接。这里用 **AST** 判定（函数的 docstring 里就写着
+        "BEGIN IMMEDIATE"，字符串搜索会被自己的注释骗到）：
+
+        1. `_run_migrations` 里没有 BEGIN/COMMIT/ROLLBACK 调用；
+        2. `write_tx` 在 `yield` 之前就执行了 BEGIN IMMEDIATE。
+
+        运行时的等价保证由 `test_failed_migration_rolls_back_ddl_too`（DDL 也回滚）
+        与 `tests/test_c0_concurrency.py`（多进程并发初始化）覆盖。
+        """
+        import ast
         import inspect
+        import textwrap
         from elenvind.core import db_base as module
 
-        source = inspect.getsource(module._run_migrations)
-        begin = source.index("BEGIN IMMEDIATE")
-        call = source.index("migration(conn)")
-        self.assertLess(begin, call,
-                        "BEGIN IMMEDIATE 必须出现在 migration() 调用之前，"
+        def all_calls(source):
+            tree = ast.parse(textwrap.dedent(source))
+            return [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+
+        def attribute_calls(source):
+            return [call for call in all_calls(source)
+                    if isinstance(call.func, ast.Attribute)]
+
+        def is_begin_immediate(call):
+            return (call.func.attr == "execute" and any(
+                isinstance(arg, ast.Constant) and "BEGIN IMMEDIATE" in str(arg.value)
+                for arg in call.args))
+
+        migrations = all_calls(inspect.getsource(module._run_migrations))
+        self.assertEqual(
+            [call.func.attr for call in migrations
+             if isinstance(call.func, ast.Attribute) and is_begin_immediate(call)],
+            [], "事务必须由 write_tx() 统一开启")
+        self.assertEqual(
+            [call.func.attr for call in migrations
+             if isinstance(call.func, ast.Attribute)
+             and call.func.attr in ("commit", "rollback")],
+            [], "提交/回滚必须由 write_tx() 统一负责")
+        helper_calls = {call.func.id for call in migrations
+                        if isinstance(call.func, ast.Name)}
+        self.assertTrue({"_read_version", "_leftover_rebuild_tables"} <= helper_calls,
+                        "守卫自身失效：_run_migrations 的源码没有被正确解析")
+
+        write_source = inspect.getsource(module.write_tx)
+        begins = [call.lineno for call in attribute_calls(write_source)
+                  if is_begin_immediate(call)]
+        yields = [node.lineno for node in ast.walk(ast.parse(textwrap.dedent(write_source)))
+                  if isinstance(node, ast.Expr) and isinstance(node.value, ast.Yield)]
+        self.assertTrue(begins, "write_tx 必须显式 BEGIN IMMEDIATE")
+        self.assertTrue(yields, "write_tx 必须把连接 yield 出去")
+        self.assertLess(min(begins), min(yields),
+                        "BEGIN IMMEDIATE 必须出现在 yield 之前，"
                         "否则 DDL 仍会被立即提交")
 
 
@@ -967,7 +1013,7 @@ class BodyCacheBoundTests(ElenvindTestCase):
     """正文缓存必须有界（重命名/重写文章会留下永不命中的死键）。"""
 
     def test_cache_does_not_grow_without_bound(self):
-        from elenvind.features.blog import logic as blog_logic
+        from elenvind.modules.blog import logic as blog_logic
         from elenvind.core.config import config as live_config
 
         limit = blog_logic.BODY_CACHE_MAX_ENTRIES
@@ -997,7 +1043,7 @@ class BodyCacheBoundTests(ElenvindTestCase):
 
     def test_rescan_evicts_dead_keys(self):
         """文章被删/改名后，重扫应当把它的缓存条目清掉。"""
-        from elenvind.features.blog import logic as blog_logic
+        from elenvind.modules.blog import logic as blog_logic
 
         directory = self.tmpdir / "dead"
         directory.mkdir(exist_ok=True)

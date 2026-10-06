@@ -1,18 +1,20 @@
-"""Users Feature：个人中心（资料查看/修改、改密、删号）。
+"""Users 模块：个人中心（资料查看/修改、改密、删号）。
 
 认证由 Core 完成（`auth="required"`）；密码与会话操作由 Core 提供：
 - 改密 -> `core.db_user.update_user_password` + `core.security.hash_password`，
   随后 `core.session.invalidate_user_sessions()` 强制全端重登（Core 语义）；
 - 删号 -> 逻辑删除 + 清理全部会话。
-本 Feature 不写任何 session cookie / CSRF / 密码逻辑。
+本模块不写任何 session cookie / CSRF / 密码逻辑。
 """
 from __future__ import annotations
 
 import logging
-import sqlite3
 from datetime import datetime
 
 from ...core.context import current_lang
+# 捕获"邮箱被他人抢先占用"要用的异常类型：由 Core 重新导出，
+# 模块不需要（也不该）import sqlite3 —— 见 Core Contract 守卫。
+from ...core.db_base import IntegrityError
 from ...core.db_user import (
     delete_user,
     get_user_by_email,
@@ -78,25 +80,34 @@ def register(router):
                 # 成功时给出明确反馈，而不是渲染一个"看起来没反应"的表单
                 message = t(lang, "user_ok_profile")
                 kind = "success"
+                logger.info("Profile updated: user_id=%s", user["id"])
         elif action == "change_password":
             result = _change_password(request, user, lang)
             if result is None:
                 # Core 语义：改密后该账号全部会话失效，强制重新登录。
                 # 传入 request 让 Core 同时清除浏览器 Cookie ——
-                # Feature 不 delete_cookie、不 import SESSION_COOKIE。
+                # 模块不 delete_cookie、不 import SESSION_COOKIE。
                 invalidate_user_sessions(user["id"], request=request)
+                logger.info("Password changed: user_id=%s ip=%s",
+                            user["id"], request.client_ip)
                 return redirect("/login")
             message = result
         elif action == "delete_account":
             password_confirm = request.form.get("password_confirm", "")
             if not verify_password(password_confirm, user["password"]):
                 message = t(lang, "user_err_password_incorrect")
+                logger.warning("Account deletion rejected (wrong password): "
+                               "user_id=%s ip=%s", user["id"], request.client_ip)
             else:
                 delete_user(user["id"])
                 invalidate_user_sessions(user["id"], request=request)
+                logger.info("Account deleted: user_id=%s ip=%s",
+                            user["id"], request.client_ip)
                 return redirect("/")
         else:
             message = t(lang, "user_err_unknown_action")
+            logger.warning("Unknown profile action: user_id=%s action=%s",
+                           user["id"], action)
 
         return html(_render_profile(request, user, message, kind))
 
@@ -156,7 +167,7 @@ def _update_profile(request, user, lang):
             nickname=new_nickname if nickname_changed else None,
             email=new_email if email_changed else None,
         )
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         # 并发下邮箱被他人抢先占用：UNIQUE 约束是最终权威
         return t(lang, "user_err_email_used"), user
 
@@ -188,6 +199,9 @@ def _change_password(request, user, lang):
     new_password = request.form.get("new_password", "")
     confirm_password = request.form.get("confirm_password", "")
     if not verify_password(old_password, user["password"]):
+        # 安全信号：拿着有效会话却给不出当前密码（会话被劫持/误操作都要能看见）
+        logger.warning("Password change rejected (wrong current password): "
+                       "user_id=%s ip=%s", user["id"], request.client_ip)
         return t(lang, "user_err_old_password")
     if new_password != confirm_password:
         return t(lang, "auth_err_password_mismatch")

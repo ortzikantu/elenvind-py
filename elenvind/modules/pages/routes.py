@@ -1,4 +1,4 @@
-"""Pages Feature 路由：/theme 与自定义页面兜底。
+"""Pages 模块路由：/theme 与自定义页面兜底。
 
 `/theme` 用 GET 写"站内偏好"Cookie。这是**刻意**的宽松设计，边界写在下面：
 
@@ -27,7 +27,7 @@ def register(router, *, render_not_found):
         - `next` 是用户可控输入，必须过 Core 的 `safe_next_path()`。
           这里曾经自己写了一份更弱的校验（不拒绝反斜杠、只拒绝 CR/LF），
           而反斜杠与 TAB 都会被浏览器归一化/剥离成 `//host`（跨站跳转）。
-        - Cookie 由 Core 下发：Feature 只说"把 theme 偏好设为 dark"，
+        - Cookie 由 Core 下发：模块只说"把 theme 偏好设为 dark"，
           不知道 Cookie 名字、有效期与属性（见 `PREFERENCE_COOKIES`）。
         """
         target = safe_next_path(request.arg("next", "/"), default="/")

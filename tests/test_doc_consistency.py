@@ -20,7 +20,7 @@ from tests.support import PROJECT_ROOT, ElenvindTestCase
 
 ROOT = Path(PROJECT_ROOT)
 DOCS = ("README.md", "docs/CONFIGURATION.md", "docs/DEPLOYMENT.md",
-        "docs/OPS_GUIDE.md", "docs/development/features.md",
+        "docs/OPS_GUIDE.md", "docs/development/modules.md",
         "docs/nginx.conf.example", "config.example.toml")
 
 

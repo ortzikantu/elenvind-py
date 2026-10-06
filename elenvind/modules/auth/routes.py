@@ -1,4 +1,4 @@
-"""Auth Feature：登录、注册、登出。
+"""Auth 模块：登录、注册、登出。
 
 密码 / 会话 / CSRF / Cookie 全部由 Core 负责：
 - 校验密码 -> `core.auth.verify_credentials`（含透明 rehash）
@@ -8,12 +8,14 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
 from urllib.parse import quote
 
 from ...core.auth import verify_credentials
 from ...core.config import config
 from ...core.context import current_lang
+# 捕获"邮箱已存在"要用的异常类型：由 Core 重新导出，模块不需要（也不该）
+# import sqlite3 —— 见 Core Contract 守卫。
+from ...core.db_base import IntegrityError
 from ...core.db_register import try_register_attempt
 from ...core.db_user import create_user, get_user_by_email
 from ...core.http import html, redirect, safe_next_path
@@ -87,7 +89,7 @@ def register(router):
 
     曾经这里收 `render_forbidden=` 参数，但它**从未被使用**：
     认证闸门的 403 是 Core 的 `router.dispatch(forbidden=...)` 处理的，
-    Feature 只需要声明 `auth=` / `permission=`。一个收下却永远不用的参数
+    模块只需要声明 `auth=` / `permission=`。一个收下却永远不用的参数
     会让读者以为"权限被拒时会走这里"，从而在错误的地方排查问题。
     """
     @router.route("/login", methods=["GET", "POST"])
@@ -102,7 +104,7 @@ def register(router):
             message = _try_login(request, email, password, lang)
             if message is None:
                 # 会话 Cookie 与 CSRF Cookie 由 Core 的 send_response 统一下发
-                # （Feature 不拼 Cookie 名，因此 __Host- 前缀之类的策略自动生效）
+                # （模块不拼 Cookie 名，因此 __Host- 前缀之类的策略自动生效）
                 return redirect(next_path or "/")
         return html(render_template("auth/login.html", {
             "message": message, "message_kind": "error",
@@ -141,8 +143,9 @@ def register(router):
     @router.route("/logout", methods=["POST"], auth="required")
     def logout(request):
         # 只调 Core：它负责删服务端会话**并**让浏览器 Cookie 立即过期。
-        # Feature 不 delete_cookie、不 import SESSION_COOKIE（否则既知道 Cookie
+        # 模块不 delete_cookie、不 import SESSION_COOKIE（否则既知道 Cookie
         # 名字、又得自己处理 __Host- 前缀，两套策略迟早漂移）。
+        logger.info("Logout: user_id=%s ip=%s", request.user["id"], request.client_ip)
         logout_user(request)
         return redirect("/")
 
@@ -153,7 +156,7 @@ def safe_next(raw) -> str:
     """把回跳地址规范化成**站内路径**；不合法一律返回空串。
 
     实现收敛到 Core 的 `core.http.safe_next_path`（全项目唯一一处）。
-    **不要**在 Feature 里再写一份：历史上存在四份严格程度不同的实现，
+    **不要**在模块里再写一份：历史上存在四份严格程度不同的实现，
     其中 `/theme` 那份不拒绝反斜杠，而四份都只拒绝 CR/LF、**都不拒绝 TAB**，
     于是 `/\t/evil.com` 经浏览器解析（URL 标准会先剥离 TAB）变成
     `//evil.com` —— 登录后跨站跳转。
@@ -180,10 +183,14 @@ def _try_login(request, email, password, lang):
     if len(email) > EMAIL_MAX or not email or len(password) > PASSWORD_MAX:
         return _message(lang, "auth_err_creds")
     if count_global_recent_failures(limits["global_window_seconds"]) >= limits["max_global_failures"]:
+        # 三个闸门都记 WARNING：它们是"有人在爆破"的唯一信号来源
+        logger.warning("Login blocked (global failure limit): ip=%s", ip)
         return _message(lang, "auth_err_global")
     if count_email_failures(email, limits["email_window_seconds"]) >= limits["max_email_failures"]:
+        logger.warning("Login blocked (email failure limit): ip=%s", ip)
         return _message(lang, "auth_err_email_lock")
     if count_ip_failures(ip, limits["ip_window_seconds"]) >= limits["max_ip_failures"]:
+        logger.warning("Login blocked (ip failure limit): ip=%s", ip)
         return _message(lang, "auth_err_ip_lock")
 
     user, ok, _rehashed = verify_credentials(email, password)
@@ -191,12 +198,15 @@ def _try_login(request, email, password, lang):
         clear_login_attempts(email)
         record_login_attempt(email, ip, success=True)
         login_user(request, user["id"])       # Core：轮换会话 + 写 Cookie
+        logger.info("Login succeeded: user_id=%s ip=%s", user["id"], ip)
         return None
 
     # 账号不存在时也做一次等量哈希校验，弱化计时侧信道（Core 之外只此一处）
     if get_user_by_email(email) is None:
         dummy_verify(password)
     record_login_attempt(email, ip, success=False)
+    # 刻意不记邮箱（PII）：失败计数已经进 login_attempts 表，日志只需要 IP + 结果
+    logger.info("Login failed: ip=%s", ip)
     return _message(lang, "auth_err_creds")
 
 
@@ -229,10 +239,16 @@ def _try_register(request, lang):
         return _message(lang, "auth_err_register_rate")
 
     if get_user_by_email(email):
+        logger.info("Registration rejected (email already registered): ip=%s",
+                    request.client_ip)
         return _message(lang, "auth_err_register_failed")
     try:
-        create_user(nickname, email, hash_password(password))
-    except sqlite3.IntegrityError:
+        new_user_id = create_user(nickname, email, hash_password(password))
+    except IntegrityError:
         # 并发注册撞上同一邮箱：UNIQUE 约束给出最终判定，返回友好提示而不是 500
+        logger.info("Registration rejected (email already registered): ip=%s",
+                    request.client_ip)
         return _message(lang, "auth_err_register_failed")
+    logger.info("Registration succeeded: user_id=%s ip=%s",
+                new_user_id, request.client_ip)
     return None

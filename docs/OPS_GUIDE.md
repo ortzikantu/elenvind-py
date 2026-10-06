@@ -23,16 +23,47 @@ journalctl -u elenvind -n 100 --no-pager      # 看 systemd 侧输出
 
 - 位置：`logs/app.log`（`[logging].file` 可改），同时输出到控制台；
 - 轮转：单文件 10 MB、保留 5 份（`max_bytes` / `backup_count` 可调）；
-- 级别：默认 `info`；排查问题时临时调 `debug` 可看到文章索引扫描等细节，记得改回；
-- 值得关注的日志：文章/自定义页面解析失败（`error` 级、含文件名）、
-  评论限流命中（`warning` 级、含 user_id/ip/slug）、未捕获异常（`exception` 级完整堆栈）。
+- 级别：默认 `info`；`debug` 会额外打印**每一笔写事务**与锁获取明细（见下表），
+  排查完记得调回 `info`（debug 的日志量随流量线性增长）。第三方库
+  （python-markdown / Jinja2）的 DEBUG 会被自动压到 `info`，所以 debug 日志里
+  只有**应用自己**的细节，不会被扩展加载之类的噪音刷屏。
+
+**日志都包含什么**（级别 → 内容）：
+
+| 级别 | 内容 | 例子 |
+|---|---|---|
+| INFO | **每个请求一行访问日志**（Core 统一记） | `Request handled: GET /article/post -> 200 in 3.4 ms (5120 bytes, ip=203.0.113.5, user=3, pid=2481)` |
+| INFO | 启动细节：日志文件、库路径、schema 版本、journal_mode、锁文件、耗时与 pid | `Database: /opt/elenvind-py/sqlite.db (schema v4, journal_mode=WAL, write lock /opt/elenvind-py/sqlite.db.write.lock)`、`Startup complete in 142 ms (pid=2481, 2 startup hook(s), locale=zh)` |
+| INFO | 认证审计：登录成功/失败、注册成功/被拒、改密、删号、注销 | `Login succeeded: user_id=3 ip=203.0.113.5`、`Logout: user_id=3 ip=…` |
+| INFO | 评论审计：发表、软删除、恢复 | `Comment created: slug=post user_id=3 parent_id=None ip=…` |
+| DEBUG | 每笔写事务：耗时、改动行数、库路径 | `Write transaction committed: 2.1 ms, 1 row(s) changed (path=/opt/elenvind-py/sqlite.db)` |
+| DEBUG | 锁获取明细（无竞争时） | `Write lock acquired in 0.31 ms (path=…)` |
+| WARNING | 锁等待 ≥ 1s / 写事务 ≥ 1s | `Write lock wait 1101 ms (path=…)`、`Write transaction slow: 1523 ms, 1 row(s) changed (path=…)` |
+| WARNING | 限流命中与安全信号：登录闸门（全局/邮箱/IP）、注册限流、评论限流、改密时当前密码错误、删号密码错误、未知表单动作、静态资源越界 | `Login blocked (email failure limit): ip=…` |
+| ERROR | 文章/页面解析失败（点名文件）、未捕获异常（完整堆栈）、i18n 文件缺失 | — |
+
+**刻意不记**（安全红线，有测试守着 `tests/test_logging_proxy.py` +
+`tests/test_runtime_logging.py`）：查询串、请求体、Cookie、`Set-Cookie`、
+密码与密码哈希、会话/CSRF 令牌、Referer、User-Agent、邮箱地址（PII）。
+访问日志只记 `PATH_INFO`，且控制字符会被转义（防止客户端用 `%0a` 伪造日志行）。
+
+相关命令：
+
+```bash
+tail -f logs/app.log                      # 实时看访问与审计
+grep "Request handled" logs/app.log | tail -50
+grep -E "WARNING|ERROR" logs/app.log | tail
+grep "Write transaction slow" logs/app.log        # 慢写排查（C0 写竞争）
+grep "Login blocked" logs/app.log                 # 爆破排查
+grep "pid=2481" logs/app.log                      # 只跟某一个 worker 看
+```
 
 ## 二、内容管理（热更新，无需重启）
 
 ### 文章
 
 - 目录：`articles/`，每篇一个 `.md` 文件（文件名即 URL slug），
-  正文是标准 Markdown，文档头字段见 `docs/development/features.md`；
+  正文是标准 Markdown，文档头字段见 `docs/development/modules.md`；
 - **增、删、改即时生效**：索引按目录文件状态（mtime/size）自动重扫，
   正文按文件状态缓存，改完保存即可，无需重启；
 - 首页按 front matter 的 `date` 倒序排列（缺 date 视为最早）；
@@ -102,9 +133,24 @@ journalctl -u elenvind -n 100 --no-pager      # 看 systemd 侧输出
 - schema 版本记录在 `PRAGMA user_version`（当前版本见 `db_base.SCHEMA_VERSION`）。
   启动时若版本落后，会自动执行迁移（含重建表）并更新版本号，**幂等、可重复执行**，
   旧库无需手工处理；升级前仍建议备份；
-- 迁移在**单个事务**内完成（显式 `BEGIN IMMEDIATE`），失败整体回滚、
-  版本号不变；若发现上次中断留下的 `*_legacy` 备份表，**拒绝启动**并打印表名
+- 迁移在**单个事务**内完成并且处于 C0 写协调边界内（跨进程 `flock` + 显式
+  `BEGIN IMMEDIATE`），失败整体回滚、版本号不变；因此**多个 Gunicorn worker 同时
+  启动也不会并发迁移**（后到的 worker 在锁上排队，进来时版本已是最新，直接跳过）；
+  若发现上次中断留下的 `*_legacy` 备份表，**拒绝启动**并打印表名
   （而不是带着半迁移的数据继续跑，那会表现为"评论全部消失"）；
+- 写协调（C0）要点，排障时最常需要知道的三件事：
+  1. **锁文件**与数据库同目录：`sqlite.db` → `sqlite.db.write.lock`。它是稳定文件，
+     **不要删除**（删掉重建会让不同进程锁住不同 inode，互斥失效）；
+  2. 所有写事务都必须经过 Core 的 `write_tx()`：一次只有一个进程在写
+     （`flock` 只保证排他互斥，**不保证先来先得**）；
+  3. 锁等待超过 1 秒会在日志里出现 `Write lock wait …ms`。频繁出现说明写竞争明显，
+     先查慢写事务或外部脚本，而不是去加 worker（**写是串行的**，加 worker 只对读有帮助）；
+- 完整性自检（可放进日常巡检）：
+
+```bash
+sqlite3 sqlite.db "PRAGMA integrity_check;"     # 期望输出：ok
+```
+
 - 备份（WAL 下勿直接拷贝）：
 
 ```bash
@@ -117,6 +163,10 @@ sqlite3 sqlite.db ".backup 'backup-2026-01-01.db'"
   （`scrypt$ln=15,r=8,p=1$盐$摘要`；历史 `盐$摘要` 为 PBKDF2-SHA256 10 万次），
   填错会导致该账号无法登录。改算法/参数由代码负责，旧哈希会在用户下次成功登录时
   自动重新哈希（渐进式升级，不需要强制全员改密）。
+- **什么时候该换数据库**：C0 只解决"同一台机器上多进程写 SQLite"的协调问题。
+  如果出现下面任一情况，正确答案是迁移到 PostgreSQL，而不是继续给 SQLite 加锁：
+  需要**多台机器**同时提供服务；写竞争导致的锁等待成为常态（日志里持续出现
+  `Write lock wait`）；需要长时间运行的复杂写事务；需要远程/网络存储数据库文件。
 
 ## 四之二、测试
 
@@ -131,19 +181,21 @@ python -m unittest tests.test_http -v              # 单个模块
 测试使用临时数据库与临时内容目录（`.testtmp/`，已在 .gitignore 中），
 **不会触碰生产数据库与文章目录**。升级代码后建议先跑一遍。
 
-需要一次"真实 uvicorn 冷启动"验证时（例如换机器、换 Python 版本后），
+需要一次"真实 Gunicorn 冷启动"验证时（例如换机器、换 Python 版本后），
 可以跑冒烟驱动（在**项目根目录**，不在 `scripts/` 下）：
 
 ```bash
-python smoke_driver.py    # 需要环境里已安装 uvicorn
+python smoke_driver.py    # 需要环境里已安装 gunicorn
 ```
 
-它会在临时目录（`.smoketmp/`）里起一个真实服务并走完整流程：首页 / 文章 /
-Markdown / 自定义页面 / 内置样式表 / 登录 / 注册 / 注销 / 改密 / 发表评论 /
-回复评论 / 软删除 / 恢复 / SEO / 主题 / 404 / 405，以及请求体边界
-（411 / 413 / 415）与 Host 头投毒，共 61 项断言。
+它会在临时目录（`.smoketmp/`）里起一个**真实的 Gunicorn（默认 2 个 worker）**
+并走完整流程：首页 / 文章 / Markdown / 自定义页面 / 内置样式表 / 登录 / 注册 /
+注销 / 改密 / 发表评论 / 回复评论 / 软删除 / 恢复 / SEO / 主题 / 404 / 405，
+以及请求体边界（411 / 413 / 415）与 Host 头投毒，共 61 项断言。
 
-端口默认自动挑选空闲端口；要固定端口可设 `SMOKE_PORT`。
+端口默认自动挑选空闲端口；要固定端口可设 `SMOKE_PORT`，要改 worker 数可设
+`SMOKE_WORKERS`。多 worker 下所有状态都在 SQLite 里，因此"这个 worker 发的
+评论、那个 worker 渲染出来"必须成立。
 
 从任何工作目录运行都可以（脚本自己切到项目根），结束后清理临时目录，
 不影响仓库里的真实数据。
@@ -195,10 +247,11 @@ sqlite3 sqlite.db "DELETE FROM login_attempts WHERE ip = '1.2.3.4';"          # 
 
 1. 应用端口未被公网直连（`host=127.0.0.1` 或防火墙）；确认 `trusted_proxies` 只含真实代理；
    **这是本应用最重要的前置条件**：端口一旦公网可达，客户端可直接伪造
-   `X-Forwarded-Proto: https`（uvicorn 会采信），并绕过全部代理假定。
+   `X-Forwarded-Proto: https`（受信代理下应用才会采信它），并绕过全部代理假定。
 2. 全站 HTTPS 可达，登录 Cookie 带 `Secure`；
-3. 若代理不在本机：`trusted_proxies` 与 uvicorn 的 `--forwarded-allow-ips`
-   必须同时指向该代理，否则 HTTPS 下 Cookie 不会带 `Secure`（见《配置文件使用指南》代理信任边界）；
+3. 若代理不在本机：把该地址写进 `trusted_proxies`；直接用 Gunicorn CLI 启动时
+   还要同时传 `--forwarded-allow-ips="<代理地址>"`，否则 HTTPS 下 Cookie 不会带
+   `Secure`（见《配置文件使用指南》代理信任边界）；
 4. 定期 `git pull` 跟进安全修复，升级前备份数据库；
 5. 偶尔翻阅 `login_attempts` 里的失败流水是否有异常来源 IP；
 
@@ -211,12 +264,13 @@ sqlite3 sqlite.db "DELETE FROM login_attempts WHERE ip = '1.2.3.4';"          # 
 | 3 | `Secure` Cookie | 开发者工具里 `session`/`csrf` 带 `Secure`（经 HTTPS 访问时） |
 | 4 | `__Host-` Cookie | 若 `cookie_prefix = true`：`Set-Cookie` 名为 `__Host-session`/`__Host-csrf`，且站点**只能**通过 HTTPS 访问 |
 | 5 | `trusted_proxies` | 只包含真实代理地址（默认回环）；不含任何公网地址 |
-| 6 | 代理与 uvicorn | 代理不在本机时，`run.py` 的 `forwarded_allow_ips` 需改为该代理地址 |
+| 6 | 代理转发头 | 代理不在本机时，把该地址写进 `[server].trusted_proxies`（Gunicorn CLI 启动时同时传 `--forwarded-allow-ips`） |
 | 7 | 应用端口 | 防火墙/安全组封闭，公网无法直连 `host:port` |
 | 8 | 数据库备份 | 已配置 `sqlite3 … ".backup …"` 定时任务（WAL 下勿直接拷贝文件） |
-| 9 | 数据库权限 | `sqlite.db` 仅服务账号可读写，目录不可被他人写入 |
+| 9 | 数据库权限 | `sqlite.db` 与锁文件 `sqlite.db.write.lock` 仅服务账号可读写，**目录**不可被他人写入（锁文件与数据库同目录，必须可创建文件） |
 | 10 | 日志权限 | `logs/` 仅服务账号可读写；确认日志内不含密码/token（应用已保证） |
 | 11 | 注册策略 | 需要私有站点时设 `registration_enabled = false`，或保持注册并依赖 IP 限流 |
 | 12 | 管理员账号 | 第一个注册的账号 id 记为 `admin_user_id`，或显式设定；确认导航出现管理员徽章 |
 | 13 | 静态资源 | `[static]` 与 `params.social.icon` 的 URL 在浏览器可 200 打开（无裂图） |
-| 14 | 自检命令 | `python -m unittest discover -s tests -t .` 全绿；`python smoke_driver.py` 全绿 |
+| 14 | 文件系统 | 数据库与锁文件都在**本地文件系统**，且同一套数据库只被一台机器使用 |
+| 15 | 自检命令 | `python -m unittest discover -s tests -t .` 全绿；`python smoke_driver.py` 全绿；`sqlite3 sqlite.db "PRAGMA integrity_check;"` 输出 `ok` |

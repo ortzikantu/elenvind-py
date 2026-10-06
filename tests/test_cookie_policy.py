@@ -112,7 +112,7 @@ class PublicResponseCookieTests(ElenvindTestCase):
 
 
 class ThemePreferenceCookieTests(ElenvindTestCase):
-    """P1-4：偏好 Cookie 由 Core 按白名单下发（Feature 只说"设成 dark"）。"""
+    """P1-4：偏好 Cookie 由 Core 按白名单下发（模块只说"设成 dark"）。"""
 
     def test_valid_modes_are_written(self):
         for mode in ("dark", "light"):

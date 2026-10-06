@@ -409,7 +409,7 @@ class ConfigBehaviorTests(ElenvindTestCase):
         self.assertIn("content from custom dir", page)
 
     def test_articles_dir_change_switches_content_source(self):
-        from elenvind.features.blog import logic as blog
+        from elenvind.modules.blog import logic as blog
 
         self.write_article("default-post", "default body",
                            {"title": "Default", "date": "2026-01-01"})
@@ -475,24 +475,21 @@ class ConfigBehaviorTests(ElenvindTestCase):
     def test_trusted_proxies_control_client_ip(self):
         from elenvind.core.utils import get_client_ip
 
-        def scope(peer, forwarded=None):
-            headers = []
-            if forwarded:
-                headers.append((b"x-forwarded-for", forwarded.encode()))
-            return {"client": (peer, 1234), "headers": headers}
+        def headers(forwarded=None):
+            return {"x-forwarded-for": forwarded} if forwarded else {}
 
         self._config["server"]["trusted_proxies"] = ["127.0.0.1", "::1"]
-        self.assertEqual(get_client_ip(scope("127.0.0.1", "1.2.3.4")), "1.2.3.4")
-        self.assertEqual(get_client_ip(scope("203.0.113.9", "1.2.3.4")), "203.0.113.9")
+        self.assertEqual(get_client_ip(headers("1.2.3.4"), "127.0.0.1"), "1.2.3.4")
+        self.assertEqual(get_client_ip(headers("1.2.3.4"), "203.0.113.9"), "203.0.113.9")
 
         # 把代理换成另一个地址：新的可信对端生效，旧的恢复为"不可信"
         self._config["server"]["trusted_proxies"] = ["10.0.0.5"]
-        self.assertEqual(get_client_ip(scope("10.0.0.5", "9.9.9.9")), "9.9.9.9")
-        self.assertEqual(get_client_ip(scope("127.0.0.1", "9.9.9.9")), "127.0.0.1")
+        self.assertEqual(get_client_ip(headers("9.9.9.9"), "10.0.0.5"), "9.9.9.9")
+        self.assertEqual(get_client_ip(headers("9.9.9.9"), "127.0.0.1"), "127.0.0.1")
 
         # 空列表 = 谁都不信
         self._config["server"]["trusted_proxies"] = []
-        self.assertEqual(get_client_ip(scope("127.0.0.1", "9.9.9.9")), "127.0.0.1")
+        self.assertEqual(get_client_ip(headers("9.9.9.9"), "127.0.0.1"), "127.0.0.1")
 
 
 class DatabasePathConfigTests(unittest.TestCase):
@@ -587,7 +584,7 @@ class DeadConfigurationGuardTests(unittest.TestCase):
         return keys
 
     def _runtime_source(self):
-        """整个 elenvind 包（含 core/ 与 features/）的源码，用于死配置扫描。"""
+        """整个 elenvind 包（含 core/ 与 modules/）的源码，用于死配置扫描。"""
         parts = []
         for path in sorted((PROJECT_ROOT / "elenvind").rglob("*.py")):
             parts.append(path.read_text(encoding="utf-8"))

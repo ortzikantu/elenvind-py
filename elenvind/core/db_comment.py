@@ -5,16 +5,17 @@
   页面展示层负责把已删评论对普通访客打码、对管理员划线显示。
   **没有物理删除入口**：评论一旦产生就永久保留（这也是审计前提）。
 - `parent_id` 实现楼中楼回复；一次取回整篇文章评论后在内存里组树（树算法见
-  features/blog/logic.py 的 build_comment_rows），避免 N+1 次查询。
+  modules/blog/logic.py 的 build_comment_rows），避免 N+1 次查询。
   数据库层 `parent_id` 是 ON DELETE SET NULL，因此即便父行在库外被删除，
   子评论也会自动升级为顶层而不是消失。
 - **本模块所有返回评论行的查询都带 `nickname` / `user_deleted`**（JOIN user），
   保证"单条"与"整篇"两种取法的行形状一致；调用方可以放心按同一套键读取。
 - 评论的“写入 + 限流判定”在 db_comment_rate.try_post_comment 中原子完成。
+- **读走 `connect()`，写走 `write_tx()`**（跨进程 flock + BEGIN IMMEDIATE）。
 """
 from datetime import datetime
 
-from .db_base import connect
+from .db_base import connect, write_tx
 
 
 def get_comments_by_article(article_slug: str):
@@ -56,21 +57,19 @@ def get_comment_by_id(comment_id: int):
 
 
 def soft_delete_comment(comment_id: int):
-    with connect() as conn:
+    with write_tx() as conn:
         conn.execute("UPDATE comment SET is_deleted = 1 WHERE id = ?", (comment_id,))
-        conn.commit()
 
 
 def restore_comment(comment_id: int):
-    with connect() as conn:
+    with write_tx() as conn:
         conn.execute("UPDATE comment SET is_deleted = 0 WHERE id = ?", (comment_id,))
-        conn.commit()
 
 
 def comment_depth(comment, *, max_depth: int, conn=None) -> int:
     """沿 parent_id 回溯计算评论层级（顶层 = 1）。
 
-    这是**层级计算的唯一定义**：渲染侧（features/blog/logic.comment_depth）
+    这是**层级计算的唯一定义**：渲染侧（modules/blog/logic.comment_depth）
     与写入侧校验（db_comment_rate.try_post_comment）都走这里，
     避免"两处各算一遍、迟早算出不同结果"。
 
@@ -117,7 +116,7 @@ def _walk_depth(conn, parent_id, depth, seen, limit) -> int:
 def flatten_comment_tree(comments):
     """把评论行展开成 [(row, depth)]，深度优先、父在子前、每条恰好一次。
 
-    这是评论树展开的**唯一定义**：渲染侧（`features/blog/logic.build_comment_rows`）
+    这是评论树展开的**唯一定义**：渲染侧（`modules/blog/logic.build_comment_rows`）
     与测试都调用它，不允许再有一份副本。
 
     为什么必须防环与"救回不可达评论"：`parent_id` 只是普通外键，写入侧虽然有
@@ -178,11 +177,11 @@ def create_comment(article_slug: str, user_id: int, content: str, parent_id: int
     本函数保留给脚本与测试使用，**不校验深度**——它是"底层写入原语"，
     绕开它写出的超深链由渲染侧的 `comment_depth` limit 兜底。
     """
-    with connect() as conn:
+    with write_tx() as conn:
         cursor = conn.execute(
             "INSERT INTO comment (article_slug, user_id, content, created_at, parent_id, is_deleted) "
             "VALUES (?, ?, ?, ?, ?, 0)",
             (article_slug, user_id, content, datetime.now().isoformat(), parent_id)
         )
-        conn.commit()
-        return cursor.lastrowid
+        new_id = cursor.lastrowid
+    return new_id
