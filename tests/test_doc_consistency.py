@@ -19,8 +19,10 @@ from pathlib import Path
 from tests.support import PROJECT_ROOT, ElenvindTestCase
 
 ROOT = Path(PROJECT_ROOT)
-DOCS = ("README.md", "docs/CONFIGURATION.md", "docs/DEPLOYMENT.md",
-        "docs/OPS_GUIDE.md", "docs/development/modules.md",
+DOCS = ("README.md", "CONTRIBUTING.md", "docs/README.md", "docs/CONFIGURATION.md",
+        "docs/DEPLOYMENT.md", "docs/OPS_GUIDE.md", "docs/ARCHITECTURE.md",
+        "docs/SECURITY.md", "docs/development/modules.md",
+        "docs/development/database.md", "docs/development/testing.md",
         "docs/nginx.conf.example", "config.example.toml")
 
 
@@ -283,3 +285,42 @@ class MediaSrcQuotingTests(ElenvindTestCase):
                     continue
                 if re.search(r'(media-src|style-src|img-src)\s*=\s*"\s*self\s*"', line):
                     self.fail(f"{name}:{lineno} 用了未加引号的 self：{stripped}")
+
+
+class DocumentationIndexTests(ElenvindTestCase):
+    """文档索引必须列出所有文档，且所有文档都在索引里可达。
+
+    为什么需要：`docs/` 是新读者的入口。新增一篇文档却忘了挂到索引上，
+    等价于它不存在（也没人会去看）。这里把"类目完整性"变成可执行的约束。
+    """
+
+    #: 索引本身与不作为独立条目列出的示例文件
+    INDEX = "docs/README.md"
+    SKIP = ("docs/README.md", "docs/nginx.conf.example")
+
+    def _documentation_files(self):
+        return sorted(
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / "docs").rglob("*.md"))
+
+    def test_every_doc_is_referenced_from_the_index(self):
+        index = read(self.INDEX)
+        missing = []
+        for relative in self._documentation_files():
+            if relative in self.SKIP:
+                continue
+            if Path(relative).name not in index and relative not in index:
+                missing.append(relative)
+        self.assertEqual(missing, [],
+                         "这些文档没有出现在 docs/README.md 的索引里：\n"
+                         + "\n".join(missing))
+
+    def test_all_scanned_docs_exist(self):
+        for name in DOCS:
+            with self.subTest(name=name):
+                self.assertTrue((ROOT / name).is_file(), f"{name} 不存在")
+
+    def test_index_lists_the_example_and_the_root_readme(self):
+        index = read(self.INDEX)
+        self.assertIn("nginx.conf.example", index)
+        self.assertIn("../README.md", index)

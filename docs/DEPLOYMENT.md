@@ -1,5 +1,9 @@
 # 站点部署指南（生产环境）
 
+> **适用读者**：把站点放到服务器上的人（首次部署、升级、备份）。
+> **相关文档**：[配置说明](CONFIGURATION.md) · [安全加固清单](SECURITY.md#10-部署侧加固清单) ·
+> [Nginx 示例](nginx.conf.example) · [运维指南](OPS_GUIDE.md) · [文档索引](README.md)
+
 Elenvind 是"应用服务器 + 可选前置静态托管"的两段式架构：
 
 - **应用**：Gunicorn（WSGI）跑 Python SSR（账号/评论/文章渲染/SEO 文件），
@@ -23,6 +27,19 @@ Elenvind 是"应用服务器 + 可选前置静态托管"的两段式架构：
 > 注意路径前缀：应用把 `elenvind/static/` **内容**挂在站点根，所以对应关系是
 > `/css/style.css` ↔ `<static根>/css/style.css`、`/imgs/favicon.ico` ↔
 > `<static根>/imgs/favicon.ico`。**没有 `/static` 这一层前缀**。
+
+---
+
+## 目录
+
+1. [环境要求](#一环境要求) —— Python / 依赖 / 数据库 / 反代
+2. [安装与首次启动](#二安装与首次启动) —— venv、`config.toml`、前台试跑
+3. [生产部署（Gunicorn + systemd + Nginx）](#三生产部署gunicorn--systemd--nginx)
+   —— [改配置](#1-修改配置文件) · [静态资源目录](#2-准备静态资源目录) · [systemd](#3-systemd-常驻) · [Nginx + HTTPS](#4-nginx-反代--https) · [安全边界联动](#5-与代码安全边界的联动务必核对)
+4. [上线自检清单](#四上线自检清单)
+5. [版本升级](#五版本升级)
+6. [备份（重要）](#六备份重要)
+7. [数据库与锁文件的部署要求（C0）](#七数据库与锁文件的部署要求c0)
 
 ---
 

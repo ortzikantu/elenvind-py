@@ -186,11 +186,32 @@ class ClientIpTrustTests(ElenvindTestCase):
         self.assertEqual(get_client_ip(self._headers("203.0.113.8"), "198.51.100.7"),
                          "198.51.100.7")
 
-    def test_first_forwarded_address_wins_within_trusted_peer(self):
-        self._config["server"]["trusted_proxies"] = ["127.0.0.1"]
+    def test_rightmost_untrusted_hop_is_the_client(self):
+        """取**最右**的非受信地址：右侧由受信代理写入，左侧可能是客户端伪造的。
+
+        这里模拟"代理把每一跳都登记进 trusted_proxies"的正确配置：
+        `X-Forwarded-For: <client>, <proxy1>, <proxy2>`，直连对端 <proxy2>。
+        """
+        self._config["server"]["trusted_proxies"] = ["127.0.0.1", "10.0.0.1", "10.0.0.2"]
         self.assertEqual(
             get_client_ip(self._headers("203.0.113.9, 10.0.0.1, 10.0.0.2"), "127.0.0.1"),
             "203.0.113.9")
+
+    def test_client_supplied_prefix_cannot_forge_the_client_ip(self):
+        """回归（真实漏洞）：代理用追加语义时，客户端自带的 XFF 前缀必须被忽略。
+
+        nginx `$proxy_add_x_forwarded_for` 会写成
+        `X-Forwarded-For: <客户端自带的头>, <真实客户端>`；若应用取最左值，
+        攻击者每个请求换一个前缀即可绕过按 IP 计数的登录/注册/评论限流。
+        """
+        self._config["server"]["trusted_proxies"] = ["127.0.0.1"]
+        forged = "1.2.3.4"
+        actual = get_client_ip(self._headers(f"{forged}, 203.0.113.7"), "127.0.0.1")
+        self.assertEqual(actual, "203.0.113.7")
+        self.assertNotEqual(actual, forged)
+        # 单值（覆盖式配置）行为不变
+        self.assertEqual(get_client_ip(self._headers("203.0.113.7"), "127.0.0.1"),
+                         "203.0.113.7")
 
     def test_x_real_ip_is_not_trusted(self):
         """应用只采信 X-Forwarded-For；X-Real-IP 单独存在时不得改变客户端 IP。"""
@@ -303,6 +324,49 @@ class ClientIpTrustTests(ElenvindTestCase):
         attempt("2.2.2.2", "198.51.100.1")
         blocked = attempt("3.3.3.3", "198.51.100.1")
         self.assertIn("Too many failed attempts from this address", blocked.text)
+
+    def test_trusted_proxy_cannot_be_used_to_rotate_the_client_ip(self):
+        """回归（真实漏洞）：受信代理 + 追加语义下，伪造前缀不能绕过 IP 限流。
+
+        模拟 nginx `proxy_add_x_forwarded_for`：客户端每个请求自带不同的
+        `X-Forwarded-For` 前缀，代理把真实客户端追加在最后。攻击者只有一个真实
+        IP，因此第 3 次尝试必须命中同一个 IP 计数桶并被拦住。
+        """
+        self.create_user(email="rotate@example.com")
+        self._config["login_limits"] = {
+            "max_email_failures": 100, "email_window_seconds": 86400,
+            "max_ip_failures": 2, "ip_window_seconds": 900,
+            "max_global_failures": 1000, "global_window_seconds": 900,
+        }
+        self._config["server"]["trusted_proxies"] = ["127.0.0.1"]
+        csrf = self.fetch_csrf()
+        real_client = "203.0.113.77"
+
+        def attempt(forged_prefix):
+            body = urlencode({"csrf_token": csrf, "email": "rotate@example.com",
+                              "password": "wrong password"}).encode()
+            return self.app.raw_request(
+                "POST", "/login", b"",
+                [("host", "example.com"),
+                 ("content-type", "application/x-www-form-urlencoded"),
+                 ("x-forwarded-for", f"{forged_prefix}, {real_client}"),
+                 ("cookie", f"csrf={csrf}"),
+                 ("content-length", str(len(body)))],
+                body=body, client=("127.0.0.1", 4444))
+
+        attempt("1.1.1.1")
+        attempt("2.2.2.2")
+        blocked = attempt("3.3.3.3")
+        self.assertIn("Too many failed attempts from this address", blocked.text,
+                      "伪造 XFF 前缀让攻击者每个请求换一个 IP，从而绕过 IP 限流")
+        # 落库的 IP 必须是真实客户端，不是攻击者自选的地址
+        from elenvind.core.db_base import connect
+        with connect() as conn:
+            rows = {row["ip"] for row in conn.execute(
+                "SELECT ip FROM login_attempts WHERE email = ?", ("rotate@example.com",))}
+        self.assertIn(real_client, rows)
+        for forged in ("1.1.1.1", "2.2.2.2", "3.3.3.3"):
+            self.assertNotIn(forged, rows)
 
 
 if __name__ == "__main__":

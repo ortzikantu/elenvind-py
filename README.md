@@ -10,22 +10,15 @@ A Personal Website Server
 
 - 100% functional without JavaScript.
 - 100% free of tracking and advertising.
+- A blog, a comment thread and a few static pages — and nothing you have to babysit.
 
-## Documentation
+A standard-library-first, **synchronous WSGI** SSR web app on **Gunicorn + SQLite**.
+`requirements.txt` pins Gunicorn, Jinja2 and Markdown — no ORM, no DI, no plugin
+system, no build step, no asyncio, no writer queue.
 
-Everything in Chinese, because we're classy like that:
+---
 
-- [Module Development Guide](docs/development/modules.md) — how to add a module (the intended DX)
-- [Configuration Guide](docs/CONFIGURATION.md) — every knob in config.toml
-- [Deployment Guide](docs/DEPLOYMENT.md) — systemd, Nginx, HTTPS, backups
-- [Nginx Config Example](docs/nginx.conf.example) — copy, paste, adjust, ship
-- [Ops Guide](docs/OPS_GUIDE.md) — articles, comments, logs, rate limits, tests, FAQ
-
-## Getting started
-
-A standard-library-first, **synchronous WSGI** SSR web app, with **Gunicorn as the
-WSGI server**. `requirements.txt` pins Gunicorn, Jinja2 and Markdown —
-no ORM, no DI, no plugin system, no framework, no build step, no asyncio.
+## Quick start
 
 ```bash
 git clone https://codeberg.org/ortzikantu/elenvind.git elenvind-py
@@ -33,23 +26,109 @@ cd elenvind-py
 
 python -m venv .venv
 source .venv/bin/activate
-
 pip install -r requirements.txt
+
+cp config.example.toml config.toml    # at minimum: site_url, title, [static] URLs
+python run.py
 ```
 
-Requires **Python 3.11+** (`tomllib` in the standard library).
-Then copy the template config and edit it before the first run:
+Requires **Python 3.11+** (`tomllib` in the standard library). `python run.py`
+validates `config.toml` once, refuses to start on a typo (with a reason), then serves
+the site with Gunicorn. There is nothing to generate, no key to paste anywhere, and
+exactly **one** optional environment variable: `ELENVIND_DB` (override the SQLite
+path, e.g. to isolate staging from production). You never *need* it.
+
+Production equivalent — same app, same config:
 
 ```bash
-cp config.example.toml config.toml
-# at minimum: site_url, title, [static] URLs
+gunicorn --workers 2 --bind 127.0.0.1:6789 elenvind.wsgi:application
+# or, to get config.toml's host/port/workers + trusted-proxy wiring:
+python run.py --workers 2
 ```
 
-For CSS, images, and whatnot, you're on your own. Set up Nginx (or equivalent) or a CDN. I can't be bothered.
-Static URLs live in `config.toml` (`[static]` + `params.social.icon`). See the Configuration Guide.
-`config.toml` is validated once at startup: a typo means a refused start with a reason, not a 500 later.
+Behind Nginx: copy `docs/nginx.conf.example`, drop in the paths, add TLS (`certbot`),
+put it under systemd, back up with `sqlite3 sqlite.db ".backup …"` (WAL mode — never
+raw-copy the file). Step-by-step: [Deployment Guide](docs/DEPLOYMENT.md).
 
-### Styling: bring your own, or use the built-in one
+## Architecture: modules do business, Web Core does Web security
+
+```
+Gunicorn (sync workers, WSGI)
+        │
+        ▼
+elenvind/wsgi.py          startup(STARTUP_HOOKS) → application  (PEP 3333)
+        │
+        ▼
+elenvind/app.py           Composition Root: the only place that knows both
+        │                 sides — route registration order, error pages, and the
+        ▼                 data each module gets from another module
+elenvind/modules/         blog · pages · auth · users · admin · seo · system
+        │                 (modules never import each other)
+        ▼
+elenvind/core/            config · HTTP · routing · security · session · csrf ·
+        │                 auth · templating · markdown · content · database · logging
+        ▼
+SQLite (WAL)
+```
+
+| Rule | Enforced by |
+|---|---|
+| Core never imports modules or the composition root | `tests/test_architecture.py` |
+| Modules never import the composition root | `tests/test_architecture.py` |
+| Modules never import each other (collaboration is injected in `app.py`) | `tests/test_architecture.py` |
+| No import cycles (module level: zero; Core's legacy lazy cycles: ratcheted) | `tests/test_architecture.py` |
+| Modules never touch SQLite, never re-implement security | `tests/test_core_contract.py` |
+| All writes go through `write_tx()` | `tests/test_core_contract.py`, `tests/test_c0_*.py` |
+
+Adding a page is just a route — security is applied by the dispatcher, not by you:
+
+```python
+@router.route("/hello", methods=["GET"])
+def hello(request):
+    return html(render_template("hello.html", {"greeting": "Hello"}))
+
+@router.route("/settings", methods=["POST"], auth="required")          # anonymous → 403
+def settings(request): ...
+
+@router.route("/admin", methods=["GET"], auth="required", permission="admin")
+def admin_home(request): ...
+```
+
+A module writes **no** CSRF code, sets **no** cookies, adds **no** security headers and
+checks **no** request size — Core does all of that, once. Details:
+[Architecture](docs/ARCHITECTURE.md) · [Module Development Guide](docs/development/modules.md).
+
+### Database writes: one entry point
+
+```python
+with write_tx() as conn:          # flock(LOCK_EX) on <db>.write.lock → BEGIN IMMEDIATE
+    conn.execute("INSERT INTO comment (...) VALUES (...)", (...))
+```
+
+Reads use `with connect()`. Every write transaction takes a cross-process `flock` on a
+lock file that sits *next to* the database (`sqlite.db` → `sqlite.db.write.lock`), then
+`BEGIN IMMEDIATE`, then commits or rolls back — so multiple Gunicorn workers are safe
+without a writer process, a queue, or a retry loop. Writes are serialized; reads are not.
+The full contract, its limits and what it deliberately does *not* promise:
+[Database & C0 write coordination](docs/development/database.md).
+
+## Project layout
+
+```
+elenvind/
+  app.py        composition root (wiring, injection, startup hooks)
+  wsgi.py       production entry point
+  core/         framework: HTTP, routing, security, sessions, CSRF, templates,
+                markdown, content format, database (connect/write_tx/migrations), logs
+  modules/      business: blog, pages, auth, users, admin, seo, system
+  templates/    Jinja2 templates (Python prepares data, HTML lives here)
+  static/       packaged assets, served by the app with URL mirroring disk
+articles/       your Markdown posts          custom_pages/  your standalone pages
+i18n/           zh/en/ja message tables      docs/          the handbook
+config.toml     your site (validated at startup)
+```
+
+## Styling: bring your own, or use the built-in one
 
 | `[static].css` | `use_builtin_css` | What you get |
 |---|---|---|
@@ -57,23 +136,15 @@ Static URLs live in `config.toml` (`[static]` + `params.social.icon`). See the C
 | empty | `true` (default) | the **default** stylesheet, served by the app at `/css/style.css` |
 | empty | `false` | no `<link>` at all — you handle styling yourself |
 
-So `python run.py` alone gives you a fully typeset site, with zero Nginx required.
-The built-in sheet is zero-JS, variable-driven, has both `prefers-color-scheme` and
-`data-theme` dark modes, and is covered by a drift guard
-(`tests/test_styles.py`) that fails if a template uses a class the sheet doesn't define.
-`style.example.css` at the repo root is a copy of it — start from that if you want to
-take over the look entirely.
+So a fresh clone typesets itself with zero Nginx. The built-in sheet is zero-JS,
+variable-driven, has `prefers-color-scheme` *and* `data-theme` dark modes, and is
+covered by a drift guard (`tests/test_styles.py`) that fails if a template uses a class
+the sheet doesn't define. `style.example.css` at the repo root is a copy of it.
 
-Default assets live inside the package and are served by the app itself. The whole
-`elenvind/static/` tree is exposed at `/`, with **URL mirroring disk**:
-
-```
-/css/style.css  ->  elenvind/static/css/style.css
-/imgs/logo.svg  ->  elenvind/static/imgs/logo.svg
-```
-
-So dropping a file into that tree is all it takes to make it available — no registry,
-no config edit.
+`elenvind/static/` is exposed at `/` with **URL mirroring disk**
+(`/css/style.css` → `elenvind/static/css/style.css`): dropping a file in is all it takes.
+Files are read per request (edit → refresh, no restart) and served with `ETag` +
+`Cache-Control: public, max-age=86400`.
 
 | Directory | Convention | Config key | Default URL |
 |---|---|---|---|
@@ -81,87 +152,38 @@ no config edit.
 | `elenvind/static/imgs/` | images | `[static].favicon` when empty | `/imgs/favicon.ico`/`.png` |
 | anything else under `elenvind/static/` | fonts, icons, … | — | by relative path |
 
-Same rule throughout: **config wins, packaged default fills in.** Order is
-`[static].css`/`favicon` → packaged file → nothing rendered. Responses carry an `ETag`
-and `Cache-Control: public, max-age=86400`, and files are read per request, so edits
-show up on refresh without a restart.
-
 **Security boundary:** the resolved path must stay inside `elenvind/static/`; hidden
 files/directories are 404; `../`, `%2e%2e`, backslashes and symlinks pointing outside
-are all rejected. These assets are **public** by design — never put private content here.
+are rejected. These assets are **public** by design — never put private content here.
+Your own `logo`, `hero` and social icons can stay on Nginx/CDN via plain URLs; when
+they're empty the element simply isn't rendered, so a fresh clone never shows a broken
+image.
 
-Your own `logo`, `hero` and social icons can stay on Nginx/CDN via plain URLs. When
-they're empty the element simply isn't rendered, so a fresh clone never shows a
-broken image.
-
-### Architecture: 模块负责业务，Web Core 负责 Web 安全
-
-```
-elenvind/
-  core/        Web Core —— 技术基座：请求/响应、安全头、Cookie、会话、认证、授权、
-               CSRF、模板（Jinja2 唯一入口）、Markdown、内容格式、路由、
-               数据库（connect() 只读 / write_tx() 唯一写入口 / 迁移）
-  modules/     业务模块 —— blog / pages / auth / users / admin / seo / system
-  app.py       组合入口（唯一同时认识 core 与 modules 的地方）：装配与注入
-  wsgi.py      生产入口：startup(STARTUP_HOOKS) + application
-  templates/   Jinja2 模板（Python 只准备数据，HTML 全在这里）
-```
-
-依赖方向**单向**，由 `tests/test_architecture.py` 守卫：
-
-```
-Application (app.py / wsgi.py)  →  modules/  →  core/
-```
-
-Core 不认识任何业务模块；模块只依赖 Core，且**模块之间互不 import**
-（需要协作时由 `app.py` 把数据源注入进去，例如 `/sitemap.xml` 的文章条目）。
-
-新增一个页面只需要声明路由，安全由框架默认施加：
-
-```python
-@route("/hello", methods=["GET"])
-def hello(request):
-    return render_template("hello.html", {"greeting": "Hello"})
-
-@route("/settings", methods=["POST"], auth="required")   # 未登录提交 -> 403
-def settings(request): ...
-
-@route("/admin", methods=["GET"], auth="required", permission="admin")
-def admin_home(request): ...
-```
-
-未登录访问受保护页面时，框架会 `302 → /login?next=<原路径>`，登录后自动回到原页面
-（`next` 只接受站内路径，防开放重定向）；已登录但权限不足才是 403。
-`/user` 与 `GET /logout` 这类"关于你自己"的页面在未登录时渲染友好的提示页，
-而状态变更始终只由 POST + CSRF 触发。
-
-模块里**不写** CSRF、不拼 Cookie、不加安全头、不检查请求体大小 ——
-这些都是 Core 的职责，且由 `tests/test_core_contract.py`（Core Contract）与
-`tests/test_architecture.py`（分层依赖方向）静态 + 运行时双重守卫。
-详见 [Module Development Guide](docs/development/modules.md)。
-
-### What it is made of
+## What it is made of
 
 | Concern | Choice |
 |---|---|
 | Runtime | Python standard library + Gunicorn (WSGI), synchronous business code |
 | Rendering | Jinja2 templates, server-side, Zero-JS |
-| Styling | Default stylesheet served by the app (`/css/style.css`); config can override with your own URL |
 | Database | SQLite (WAL, `PRAGMA foreign_keys=ON`, `user_version` migrations) |
-| Write coordination | Every write goes through Core's `write_tx()`: cross-process `flock` on a separate lock file + `BEGIN IMMEDIATE`. Multi-worker Gunicorn is safe; writes are serialized, reads are not |
+| Write coordination | `write_tx()`: cross-process `flock` on a separate lock file + `BEGIN IMMEDIATE`; multi-worker safe, writes serialized |
 | Content | Markdown body + TOML front matter (`+++` fence), rendered by `core.markdown` |
 | Markup safety | Whitelist HTML sanitiser in `core.markdown` (stdlib `html.parser`) |
-| Sessions | Server-side random tokens in SQLite (not JWT), with absolute + idle expiry |
+| Sessions | Server-side random tokens in SQLite (not JWT), absolute + idle expiry |
 | Passwords | `hashlib.scrypt`, self-describing hashes, transparent rehash on login |
 | CSRF | Double-submit cookie, enforced in one dispatcher gate |
 | AuthZ | Declarative `auth="required"` / `permission="admin"` on the route |
 | Cache | In-process file-snapshot caches for articles and custom pages |
 | Security headers | Injected by Core on every response (including 404/500) — modules never set them |
+| Observability | One access-log line per request, audit events for auth/comment changes, DEBUG write-transaction detail |
 
-### Security response headers
+Nothing derives from a shared secret: sessions are opaque random values stored
+server-side, CSRF is a double-submit cookie, passwords are self-describing scrypt
+hashes. That is why there is no signing key to manage.
 
-Core appends these on the way out, so a module just returns a `Response` and the
-headers are there. Nothing to remember, nothing to duplicate.
+## Security defaults
+
+Core appends these on the way out — a module just returns a `Response`:
 
 | Header | Default |
 |---|---|
@@ -171,81 +193,58 @@ headers are there. Nothing to remember, nothing to duplicate.
 | `Permissions-Policy` | camera/microphone/geolocation/payment/usb/… all `()` |
 | `Strict-Transport-Security` | only when **configured on** *and* the request is HTTPS |
 
-CSP and HSTS live in `config.toml` under `[security]` — turn them off or adjust any
-directive. HSTS is **off by default**; enabling it takes both `hsts_enabled = true`
-and an actual HTTPS request (a stale HSTS header on a site that still serves plain
-HTTP locks visitors out).
+HTTPS is detected from `X-Forwarded-Proto` **only** when the direct peer is listed in
+`[server].trusted_proxies` (default: loopback) — the same list `run.py` hands to
+Gunicorn's `forwarded_allow_ips`, so there is exactly one source of truth. Client IPs
+are resolved by walking `X-Forwarded-For` from the right, past trusted hops, so a client
+cannot forge its own address and slip past the IP rate limits.
 
-The CSP is strict where it counts and honest about where it can't be: the site is
-Zero-JS, so `script-src 'none'` applies, and the templates contain **no inline
-`<script>`, no inline event handlers and no `<style>` blocks** — there is a test that
-walks the rendered pages and fails if anyone reintroduces one.
+Threat model, every control and the reasoning behind them (including why `style-src`
+keeps `'unsafe-inline'`):
+[Security](docs/SECURITY.md) · [Configuration](docs/CONFIGURATION.md#security-安全响应头).
 
-`style-src` does keep `'unsafe-inline'`, and that is deliberate rather than lazy: CSP's
-`style-src` governs `style=` **attributes** as well as `<style>` elements, and the
-home-page hero background is an inline `style="background-image:url(…)"`. Dropping
-`'unsafe-inline'` makes the hero image silently vanish and floods the console with
-`style-src-elem` errors. (A hash or nonce won't help — those apply to `<style>`
-elements; `style=` attributes would need `'unsafe-hashes'`.) The injection risk is
-closed at the config layer instead: `[static].hero` must pass a character whitelist
-(no quotes, parens, backslashes or whitespace) and a scheme whitelist (http(s) or a
-site-relative path only). To remove `'unsafe-inline'` entirely you'd first have to
-reimplement the hero without an inline style. See
-[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#security-安全响应头).
+## Documentation
 
-See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#security-安全响应头) for the full
-key table. One footgun worth repeating: `[security]` must sit at the **end** of
-`config.toml`, because a TOML table swallows every top-level key written after it.
-A test guards the shipped configs against exactly that mistake.
+Everything in Chinese, because we're classy like that. Start at the
+**[documentation index](docs/README.md)**; the map:
 
-## Any Tips
-
-No secrets to manage. No signing key. Nothing to generate and paste into a systemd
-unit at 3am. Just:
-
-```bash
-python run.py
-```
-
-There is exactly **one** optional environment variable, `ELENVIND_DB` (override the
-SQLite file path, e.g. to isolate staging from production). You never *need* it.
-Everything else lives in `config.toml`.
-
-Why it works without a secret: sessions are **server-side random tokens** in SQLite
-(the client only ever holds an unguessable opaque value), CSRF is a **double-submit
-cookie** (the token itself is the random value), and passwords are **self-describing
-scrypt hashes**. Nothing here derives anything from a shared secret, so requiring one
-would have been pure ceremony.
-
-HTTPS? Cookies get `Secure` automatically — as long as your reverse proxy speaks
-`X-Forwarded-Proto`, and its address is listed in `[server].trusted_proxies`. Behind
-Nginx, just follow the example config and you're done. No code edits required.
-
-```bash
-sudo cp docs/nginx.conf.example /etc/nginx/sites-available/elenvind
-```
-
-Using Nginx? Might as well set up Let's Encrypt too.
-```bash
-sudo certbot certonly --standalone -d yourdomain.com -d www.yourdomain.com
-```
-
-Serve it forever with systemd, back up the SQLite database with `.backup` (WAL mode, don't raw-copy the file), and go touch grass. Details in the Deployment Guide.
+| | Document | What it is for |
+|---|---|---|
+| 🚀 | [Deployment Guide](docs/DEPLOYMENT.md) | systemd, Nginx, HTTPS, backups, upgrade |
+| ⚙️ | [Configuration Guide](docs/CONFIGURATION.md) | every knob in `config.toml`, with defaults |
+| 🧱 | [Architecture](docs/ARCHITECTURE.md) | layers, dependency rules, request pipeline, module map |
+| 🔐 | [Security](docs/SECURITY.md) | threat model, controls, proxy trust, headers, logging red lines |
+| 🧩 | [Module Development Guide](docs/development/modules.md) | how to add a module (the intended DX) |
+| 🗄️ | [Database & C0](docs/development/database.md) | `write_tx()`, lock file, migrations, limits |
+| 🧪 | [Testing](docs/development/testing.md) | suites, guards, how to run and extend them |
+| 🛠️ | [Ops Guide](docs/OPS_GUIDE.md) | day-2: content, users, comments, logs, limits, FAQ |
+| 📄 | [Nginx Config Example](docs/nginx.conf.example) | copy, paste, adjust, ship |
+| 🤝 | [Contributing](CONTRIBUTING.md) | patch workflow, style rules, pre-flight checklist |
 
 ## Tests
 
-Standard-library `unittest`, no extra dependencies. Temp DB and temp content dirs only —
+Standard-library `unittest`, no extra dependencies, temp DB and temp content dirs only —
 your real `sqlite.db` and `articles/` are never touched.
 
 ```bash
-python -m unittest discover -s tests -t .        # everything
-python -m unittest tests.test_core_contract -v   # one module
+python -m unittest discover -s tests -t .        # everything (~140s, 790+ tests)
+python -m unittest tests.test_architecture -v    # layering guards
+python -m unittest tests.test_core_contract -v   # security contract guards
+python -m unittest tests.test_c0_concurrency -v  # real multi-process write coordination
+python smoke_driver.py                           # boots real Gunicorn, 61 end-to-end checks
 ```
 
-Covers the HTTP body parser, CSRF, sessions, auth, comments, the article/page caches,
-SEO, config validation, the Markdown renderer + sanitiser (plus a seeded fuzz harness),
-the **Core Contract** (modules cannot bypass or duplicate security), and an
-end-to-end cold start walkthrough.
+They cover the HTTP body parser, CSRF, sessions, auth, comments, the article/page
+caches, SEO, config validation, the Markdown renderer + sanitiser (plus a seeded fuzz
+harness), the **Core Contract**, the **architecture guards**, real multi-process
+`write_tx()` coordination (including `SIGKILL` recovery and concurrent migrations), and
+an end-to-end cold start. What each suite is for: [Testing](docs/development/testing.md).
+
+## License
+
+This project is licensed under the [GPL-3.0-or-later](LICENSE) license.
+
+---
 
 No PRs, please.  
 Patches only.  
@@ -253,13 +252,11 @@ Test it.
 Commit it.  
 Generate one with `git format-patch`.  
 Then mail it to me.  
+
+Workflow, style rules and the pre-flight checklist live in
+[CONTRIBUTING.md](CONTRIBUTING.md):
+
 ```bash
-# Generate a patch for the latest commit
-git format-patch -1
-# Generate patches for all commits not yet pushed to the remote branch
-git format-patch origin/main
+git format-patch -1            # the latest commit
+git format-patch origin/main   # everything not yet pushed
 ```
-
-## License
-
-This project is licensed under the [GPL-3.0-or-later](LICENSE) license.

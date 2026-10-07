@@ -103,11 +103,23 @@ server {
         proxy_pass http://127.0.0.1:6789;
         proxy_http_version 1.1;
 
-        # 透传真实客户端信息；应用只在“直连对端属于 [server].trusted_proxies”时信任它们
+        # 透传真实客户端信息；应用只在“直连对端属于 [server].trusted_proxies”时信任它们。
+        #
+        # 注意 X-Forwarded-For 必须**覆盖**为 $remote_addr，不要用
+        # $proxy_add_x_forwarded_for：后者会把客户端自带的 X-Forwarded-For
+        # 原样保留在前面，等于让任何人自选一个"客户端 IP"，从而绕过按 IP 计数的
+        # 登录 / 注册 / 评论限流。（应用已按"最右侧非受信地址"取值做加固，
+        # 但覆盖式配置才是唯一正确的写法。）
+        # 若有 CDN/多级代理：每一跳都写进 [server].trusted_proxies，并在这里
+        # 覆盖成本级的真实对端地址（$remote_addr 即上一跳）。
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For   $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 不要公告后端技术栈：gunicorn 默认会回 `Server: gunicorn`（无版本号）。
+        # Nginx 自己的版本号已由 server_tokens off 隐藏。
+        proxy_hide_header Server;
 
         # 应用是纯流式 SSR，无需缓冲调整；超时给足（Elenvind 渲染很快，默认即可）
         proxy_connect_timeout 5s;

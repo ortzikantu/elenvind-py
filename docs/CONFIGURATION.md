@@ -1,11 +1,29 @@
 # 配置文件使用指南（config.toml）
 
+> **适用读者**：要改站点行为的人（标题、限流阈值、会话寿命、安全头、日志……）。
+> **相关文档**：[部署](DEPLOYMENT.md) · [安全模型](SECURITY.md) · [运维](OPS_GUIDE.md) ·
+> [文档索引](README.md)
+
 配置文件位于项目根目录的 `config.toml`（模板见 `config.example.toml`）。
 配置只在**启动时加载并校验一次**（`run.py` 与 lifespan 阶段各校验一次，
 不合法直接拒绝启动），修改后需重启服务生效；
 文章与自定义页面不在此列（见《运维使用指南》的热更新说明）。
 
 **路径类配置一律相对项目根目录解析**，不受启动时工作目录（cwd）影响。
+
+## 目录
+
+| 章节 | 内容 |
+|---|---|
+| [顶层键](#顶层键) | `locale` / `title` / `site_url` / `admin_user_id` / 评论上限 / 注册开关 / 会话寿命 / 请求体上限 / 路径 |
+| [`[server]`](#server-服务监听) | 监听地址、worker 数、**代理信任边界**、`__Host-` 前缀 |
+| [限流](#pagination-分页) | `[pagination]`、`[comment_limits]`、`[login_limits]`、`[register_limits]` |
+| [`[static]`](#static-静态资源地址) | 样式表 / 图标 / 站标 / hero，以及通用静态服务 |
+| [`[params]`](#params-首页与站点内容) | 首页文案、导航、社交链接、Projects |
+| [`[security]`](#security-安全响应头) | CSP / Permissions-Policy / HSTS |
+| [会话过期](#会话过期session_absolute_days--session_idle_days) | 绝对 + 滑动过期语义 |
+| [`[logging]`](#logging-日志) | 级别、文件、轮转 |
+| [启动校验](#启动校验错误配置不会跑到页面才炸) · [常见修改示例](#常见修改示例) · [注意事项](#注意事项) | 出错行为与配方 |
 
 ## 顶层键
 
@@ -79,9 +97,17 @@
 
 **只有一个信任来源：`trusted_proxies`。** 它同时控制两件事：
 
-1. **客户端 IP**：`X-Forwarded-For` 的第一个地址（登录/评论限流按此计数）；
-2. **HTTP scheme（`https` 判定）**：`X-Forwarded-Proto` 的第一个值，据此决定
-   `Secure` Cookie 与 HSTS 是否下发。
+1. **客户端 IP**：`X-Forwarded-For` 中**最右侧的非受信代理地址**（登录/评论限流
+   按此计数）。取最右而不是最左，是为了让"客户端自己塞进来的前缀"永远无法左右
+   判定：直接对端若不是受信代理，整条头都不看，直接用它；是受信代理，则从右往左
+   跳过受信代理地址，第一个非受信地址就是最近的、由代理写入的真实来源；
+2. **HTTP scheme（`https` 判定）**：`X-Forwarded-Proto` 中最右侧的有效值，据此
+   决定 `Secure` Cookie 与 HSTS 是否下发。
+
+> 代理侧请用**覆盖**语义：`proxy_set_header X-Forwarded-For $remote_addr;`
+> 若用 `$proxy_add_x_forwarded_for`（追加），客户端自带的头会被保留在左侧 ——
+> 应用虽然已按最右取值加固，但覆盖式配置才是唯一正确的写法。
+> 多级代理时把每一跳都写进 `trusted_proxies`。
 
 两者都在应用内判定，因此不存在"HTTP 服务器一份列表、应用又一份列表"的漂移
 （`run.py` 只是把这份列表**原样**交给 Gunicorn 的 `forwarded_allow_ips`，

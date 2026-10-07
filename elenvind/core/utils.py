@@ -30,18 +30,34 @@ def get_client_ip(headers, peer: str) -> str:
     """从请求头 + 直连对端解析客户端 IP 地址。
 
     安全边界：只有直连对端本身是受信代理（默认 127.0.0.1 / ::1，可用
-    config.toml [server].trusted_proxies 覆盖）时才读取 X-Forwarded-For 的
-    第一个地址；否则一律使用直连 IP。防止应用端口被公网直连时伪造代理头
-    绕过登录限流等 IP 维度防护。
+    config.toml [server].trusted_proxies 覆盖）时才读取 `X-Forwarded-For`；
+    否则一律使用直连 IP。防止应用端口被公网直连时伪造代理头绕过登录限流等
+    IP 维度防护。
+
+    **取最右侧的、非受信代理地址**（而不是最左侧）：X-Forwarded-For 的右侧
+    是离应用最近的跳，由受信代理自己写入；左侧可能整段来自客户端提供的头。
+
+    反例（本函数修掉的真实漏洞）：Nginx 用 `$proxy_add_x_forwarded_for` 时会把
+    客户端自带的 `X-Forwarded-For` **原样保留在前面**，于是
+    `X-Forwarded-For: 1.2.3.4, <真实客户端>` 里的 `1.2.3.4` 完全由攻击者选定。
+    若取最左值，攻击者每请求换一个前缀就能绕过按 IP 计数的登录/注册/评论限流。
+    从右往左跳过受信代理地址，可以在"覆盖"与"追加"两种代理配置下都拿到真实
+    客户端（多级代理请把每一跳都写进 trusted_proxies）。
     """
     # 受信代理列表：默认回环地址；config 可配置（字符串或列表均可）
-    if peer not in _trusted_proxies():
+    trusted = _trusted_proxies()
+    if peer not in trusted:
         return peer
 
     forwarded = str(headers.get("x-forwarded-for", "") or "")
-    # 取第一个地址（通常是最原始的客户端）
-    first = forwarded.split(",")[0].strip()
-    return first or peer
+    hops = [part.strip() for part in forwarded.split(",") if part.strip()]
+    if not hops:
+        return peer
+    for hop in reversed(hops):
+        if hop not in trusted:
+            return hop
+    # 全是受信代理地址（代理链配置异常）：不伪造，退回最左值
+    return hops[0]
 
 
 def get_request_scheme(environ, headers) -> str:
@@ -49,7 +65,10 @@ def get_request_scheme(environ, headers) -> str:
 
     WSGI 服务器只报告**它自己看到的**那条连接：TLS 在 Nginx 终止时，
     gunicorn 收到的是明文，`wsgi.url_scheme` 永远是 `"http"`。
-    因此当直连对端是受信代理时，采信 `X-Forwarded-Proto` 的第一个值。
+    因此当直连对端是受信代理时，采信 `X-Forwarded-Proto`。
+
+    与 `get_client_ip()` 同理，取**最右**的有效值：那是最靠近应用的受信代理
+    写的；客户端能塞进请求头的值只会出现在左侧，不能决定 https 判定。
 
     这里与 `get_client_ip()` 共用**同一份** `[server].trusted_proxies`
     白名单 —— 两份列表不可能漂移。历史上"HTTP 服务器一份、应用一份"的配置
@@ -63,8 +82,10 @@ def get_request_scheme(environ, headers) -> str:
     if peer_address(environ) not in _trusted_proxies():
         return scheme
     forwarded = str(headers.get("x-forwarded-proto", "") or "")
-    first = forwarded.split(",")[0].strip().lower()
-    return first if first in ("http", "https") else scheme
+    for value in reversed([part.strip().lower() for part in forwarded.split(",")]):
+        if value in ("http", "https"):
+            return value
+    return scheme
 
 
 # 受信代理列表缓存：配置只在启动时加载一次，无需每个请求重新解析
