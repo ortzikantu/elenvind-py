@@ -57,7 +57,7 @@ class EntryPointContractTests(ElenvindTestCase):
         recorded = []
         original_startup = lifespan_module.startup
         original_shutdown = lifespan_module.shutdown
-        lifespan_module.startup = lambda hooks=(): recorded.append(tuple(hooks))
+        lifespan_module.startup = lambda hooks=(), prepare_database=None: recorded.append(tuple(hooks))
         lifespan_module.shutdown = lambda: recorded.append("shutdown")
         sys.modules.pop("elenvind.wsgi", None)
         try:

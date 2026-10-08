@@ -27,10 +27,10 @@ from __future__ import annotations
 
 import atexit
 
-from .app import STARTUP_HOOKS, app
+from .app import STARTUP_HOOKS, app, prepare_database
 from .core.lifespan import shutdown, startup
 
-startup(STARTUP_HOOKS)
+startup(STARTUP_HOOKS, prepare_database=prepare_database)
 atexit.register(shutdown)
 
 #: WSGI callable（PEP 3333）：`gunicorn elenvind.wsgi:application`

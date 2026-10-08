@@ -15,8 +15,8 @@ sys.path.insert(0, ".")
 
 from tests.support import ElenvindTestCase
 
-from elenvind.core.db_base import connect
-from elenvind.core.db_session import (
+from elenvind.db import connect
+from elenvind.db.session import (
     DEFAULT_ABSOLUTE_DAYS,
     DEFAULT_IDLE_DAYS,
     cleanup_expired_sessions,
@@ -97,7 +97,7 @@ class AbsoluteExpiryTests(ElenvindTestCase):
         - 正好 30.000000 天 -> 过期（`>=` 生效）
         - 30 天差 1 秒      -> 有效
         """
-        from elenvind.core.db_session import DAY_SECONDS, _is_expired
+        from elenvind.db.session import DAY_SECONDS, _is_expired
 
         now = 1_000_000_000.0
         window = DEFAULT_ABSOLUTE_DAYS * DAY_SECONDS
@@ -122,7 +122,7 @@ class AbsoluteExpiryTests(ElenvindTestCase):
 
     def test_exact_idle_boundary_is_expired(self):
         """精确边界：空闲维度同样是 `>=`。"""
-        from elenvind.core.db_session import DAY_SECONDS, _is_expired
+        from elenvind.db.session import DAY_SECONDS, _is_expired
 
         now = 1_000_000_000.0
         window = DEFAULT_IDLE_DAYS * DAY_SECONDS
@@ -243,7 +243,7 @@ class MalformedTimestampTests(ElenvindTestCase):
     """
 
     def test_null_timestamps_are_treated_as_expired(self):
-        from elenvind.core.db_session import _is_expired
+        from elenvind.db.session import _is_expired
         now = time.time()
         self.assertTrue(_is_expired({"created_at": None, "last_seen": now},
                                     DEFAULT_ABSOLUTE_DAYS, DEFAULT_IDLE_DAYS, now))
@@ -268,7 +268,7 @@ class MalformedTimestampTests(ElenvindTestCase):
         self.assertEqual(get_session_user(token), user_id)
 
     def test_valid_timestamps_are_not_flagged(self):
-        from elenvind.core.db_session import _is_expired
+        from elenvind.db.session import _is_expired
         now = time.time()
         self.assertFalse(_is_expired({"created_at": now - 60,
                                       "last_seen": now - 30},
@@ -280,7 +280,7 @@ class MalformedTimestampTests(ElenvindTestCase):
         旧实现只判了 NULL，遇到字符串会直接 `TypeError` 冒到 App 层变成 500 ——
         于是每个带该 Cookie 的请求都 500，而不是干脆当作未登录（用户重新登录即可）。
         """
-        from elenvind.core.db_session import _is_expired
+        from elenvind.db.session import _is_expired
         now = time.time()
         for bad in ("not-a-number", "2026-01-01T00:00:00", b"12345", "",
                     [], {}, object()):
@@ -294,7 +294,7 @@ class MalformedTimestampTests(ElenvindTestCase):
                                 DEFAULT_ABSOLUTE_DAYS, DEFAULT_IDLE_DAYS, now))
 
     def test_nan_and_inf_are_treated_as_expired(self):
-        from elenvind.core.db_session import _is_expired
+        from elenvind.db.session import _is_expired
         now = time.time()
         for bad in (float("nan"), float("inf"), float("-inf")):
             with self.subTest(value=bad):
@@ -304,7 +304,7 @@ class MalformedTimestampTests(ElenvindTestCase):
 
     def test_numeric_strings_are_accepted(self):
         """看起来像数字的字符串是 SQLite 动态类型的正常产物，应当可用。"""
-        from elenvind.core.db_session import _as_timestamp
+        from elenvind.db.session import _as_timestamp
         self.assertEqual(_as_timestamp("1234.5"), 1234.5)
         self.assertEqual(_as_timestamp(1234), 1234.0)
         self.assertIsNone(_as_timestamp(True), "bool 不是时间戳")

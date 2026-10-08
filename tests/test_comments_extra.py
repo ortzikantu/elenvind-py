@@ -12,13 +12,13 @@ import unittest
 
 from tests.support import ElenvindTestCase
 
-from elenvind.core.db_base import connect
-from elenvind.core.db_comment import create_comment, get_comment_by_id, get_comments_by_article
+from elenvind.db import connect
+from elenvind.db.comment import create_comment, get_comment_by_id, get_comments_by_article
 from elenvind.modules.blog import logic as blog
 
 
 def expand_tree(comments):
-    """树展开 —— 直接调生产实现 `core.db_comment.flatten_comment_tree`。
+    """树展开 —— 直接调生产实现 `db.comment.flatten_comment_tree`。
 
     返回 `(ordered, by_id)` 以保持原调用点不变。
     这里曾经有一份"与生产实现同构"的副本；副本与生产**都**缺少对
@@ -26,7 +26,7 @@ def expand_tree(comments):
     而副本多出的 `seen` 又让缺陷看起来已经被处理。详见 test_comments.py
     里 CommentTreeTests 的说明。
     """
-    from elenvind.core.db_comment import flatten_comment_tree
+    from elenvind.db.comment import flatten_comment_tree
 
     by_id = {row["id"]: row for row in comments}
     return flatten_comment_tree(comments), by_id
@@ -108,7 +108,7 @@ class CorruptCommentDataTests(ElenvindTestCase):
     def test_reply_depth_is_bounded_when_chain_is_corrupt(self):
         """父链被人为拉长/成环时，层级计算必须是常数级有界的，不能死循环。"""
         from elenvind.modules.blog import logic as _blog_logic
-        from elenvind.core.db_comment import get_comment_by_id
+        from elenvind.db.comment import get_comment_by_id
 
         self._config["max_comment_depth"] = 3
         ids = [create_comment("post", 1, f"c{index}") for index in range(6)]
@@ -141,7 +141,7 @@ class CommentCapConcurrencyTests(ElenvindTestCase):
     """单篇文章评论上限必须在写事务内判定（并发下不能超发）。"""
 
     def test_cap_is_enforced_inside_the_write_transaction(self):
-        from elenvind.core.db_comment_rate import try_post_comment
+        from elenvind.db.comment_rate import try_post_comment
 
         user_id, _ = self.create_user()
         for index in range(3):
@@ -160,7 +160,7 @@ class CommentCapConcurrencyTests(ElenvindTestCase):
 
     def test_interleaved_writers_cannot_exceed_cap(self):
         """多连接交替写入（模拟并发）时，上限依然成立。"""
-        from elenvind.core.db_comment_rate import try_post_comment
+        from elenvind.db.comment_rate import try_post_comment
 
         user_id, _ = self.create_user()
         writers = [f"10.0.0.{index}" for index in range(3)]

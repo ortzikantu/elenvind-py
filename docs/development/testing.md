@@ -40,7 +40,7 @@ python smoke_driver.py                               # 61 项检查
 
 `smoke_driver.py` 会用一个临时数据库起真实 Gunicorn（2 worker），跑完自动停：
 启动 → 首页/文章/自定义页面/robots/sitemap → 静态资源与路径穿越 → 主题 → 404/405 →
-注册/登录/会话 Cookie 属性 → 个人中心 → 评论（发表/回复/删除/恢复）→ 改密/注销 →
+注册/登录/会话 Cookie 属性 → 个人中心 → 评论（发表/回复/**编辑**/**涂黑删除**）→ 改密/注销 →
 413/411/415 → Host 头投毒。部署后想快速自检，直接跑它。
 
 ---
@@ -53,6 +53,9 @@ python smoke_driver.py                               # 61 项检查
 | `test_core_contract` | **Core Contract**：模块不得重造 CSRF/Cookie/密码/模板环境/Markdown，不得执行 SQL、不得开连接；写 SQL 必须落入 `write_tx()` |
 | `test_doc_consistency` | 文档与代码一致：会话天数、`max_comment_depth=0` 语义、`admin_user_id`、引用的路径/符号/图标存在、config 键集合配平、索引列出所有文档 |
 | `test_c0_write_tx` | 单进程写事务语义：提交/回滚/嵌套拒绝/锁覆盖整个事务/连接设置/WAL |
+| `test_login_rate_limit` | **登录限流安全语义**：并发不超发（8 线程 / 阈值 3）、占位记账、被拦不写行、渐进 backoff 会过期（不是 24h 硬锁）、`Retry-After` 头、时间索引、v4→v5 迁移 |
+| `test_markdown_security` | **Markdown/XSS 回归**：协议相对 URL 被拒、scheme 混淆（实体/TAB/百分号/大小写）、`style=`/`on*=` 剥离、危险容器连内容删除、缩进误判边界下的属性剥离、围栏与注释不可藏 payload |
+| `test_hardening` | **加固回归**：CSP 默认不含远程通配、非回环监听 + 信任转发头会告警、静态软链指向隐藏文件被拒、会话轮换/登出只杀当前会话 |
 | `test_c0_concurrency` | **真多进程**：并发写不丢数据、临界区不重叠、`SIGKILL` 恢复杂、并发 `init_db()`、非幂等迁移只执行一次、不同库不同锁 |
 | `test_http` | 请求边界：Content-Length、类型白名单、体积上限、HEAD、Unicode、坏 UTF-8、405/Allow、安全头 |
 | `test_wsgi` | PEP 3333：同步 callable、`start_response`、响应头 native str + latin-1、`SCRIPT_NAME`、代理 scheme 判定、无 async/ASGI 残留 |
@@ -61,7 +64,8 @@ python smoke_driver.py                               # 61 项检查
 | `test_runtime_logging` | 运行期日志详细度：访问日志字段、写事务明细、审计事件、控制字符转义 |
 | `test_security` / `test_security_headers` / `test_security_regression` | 密码哈希与 rehash、CSP/Permissions-Policy/HSTS、历史漏洞回归（开放重定向、Host 投毒、500 页不泄漏） |
 | `test_auth` / `test_cookie_policy` / `test_session_expiry` | 注册/登录/限流/删号、Cookie 属性与 `__Host-` 前缀、会话绝对/滑动过期与清理 |
-| `test_comments` / `test_comments_extra` | 评论树、深度上限、软删除与恢复、限流、权限（作者/管理员）、N+1 防护 |
+| `test_comments` / `test_comments_extra` | 评论树、深度上限、涂黑删除、限流、权限（作者/管理员）、N+1 防护 |
+| `test_comment_edit` | **涂黑与编辑**：原文从库里消失（含库文件明文扫描）、等长上限、幂等、v6 迁移涂黑历史行、无恢复入口（404/405）、渲染对管理员同样涂黑、编辑表单预填（`?edit=`）、只有作者能改（管理员也不行）、已涂黑不可编辑、空/超长/CSRF/跨文章拒绝、编辑不动树位置 |
 | `test_articles` / `test_markdown` / `test_fuzz` | 内容索引与缓存原子性、Markdown 渲染契约、净化白名单、固定种子的 fuzz |
 | `test_seo` / `test_config_behavior` / `test_config_i18n` | robots/sitemap（Host 不可投毒）、配置校验与运行期行为、i18n 表完整性 |
 | `test_styles` | 样式表与模板的类名漂移守卫（模板用了未定义的 class 就失败） |

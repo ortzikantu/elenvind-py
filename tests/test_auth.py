@@ -5,10 +5,10 @@ import unittest
 
 from tests.support import ElenvindTestCase
 
-from elenvind.core.db_base import connect
-from elenvind.core.db_login import count_email_failures
-from elenvind.core.db_session import get_session_user
-from elenvind.core.db_user import get_user_by_email, get_user_by_id
+from elenvind.db import connect
+from elenvind.db.auth import count_email_failures
+from elenvind.db.session import get_session_user
+from elenvind.db.user import get_user_by_email, get_user_by_id
 from elenvind.core.security import hash_password, password_needs_rehash, verify_password
 
 
@@ -112,7 +112,7 @@ class LoginTests(ElenvindTestCase):
         self.assertEqual(get_session_user(new_session), user_id)
 
     def test_expired_session_is_rejected_and_removed(self):
-        from elenvind.core.db_session import create_session
+        from elenvind.db.session import create_session
         user_id, _ = self.create_user(email="exp@example.com")
         token = create_session(user_id)
         # 把创建时间推到绝对过期窗口之外（默认 30 天）
@@ -134,7 +134,7 @@ class LoginTests(ElenvindTestCase):
     def test_password_is_rehashed_on_login_when_legacy(self):
         """历史格式哈希在登录成功后必须被透明升级为新格式（渐进式 rehash）。"""
         import hashlib
-        from elenvind.core.db_user import update_user_password
+        from elenvind.db.user import update_user_password
 
         user_id, password = self.create_user(email="legacy@example.com")
         salt = b"0123456789abcdef"
@@ -238,7 +238,7 @@ class PasswordChangeTests(ElenvindTestCase):
         而 `login` 本身会清掉旧的，所以这里直接在库里落一个额外会话
         （等价于"另一个浏览器还登着"）。
         """
-        from elenvind.core.db_session import create_session, get_session_user
+        from elenvind.db.session import create_session, get_session_user
 
         user_id, password = self.create_user(email="pw-concurrent@example.com")
         current, csrf = self.login_ok("pw-concurrent@example.com", password)
@@ -270,7 +270,7 @@ class PasswordChangeTests(ElenvindTestCase):
 
     def test_password_change_does_not_kill_other_accounts_sessions(self):
         """改密只影响自己：不得误伤别人的会话。"""
-        from elenvind.core.db_session import create_session, get_session_user
+        from elenvind.db.session import create_session, get_session_user
 
         victim_id, password = self.create_user(email="victim-pw@example.com")
         bystander_id, _ = self.create_user(email="bystander@example.com")
@@ -334,8 +334,8 @@ class DeleteAccountTests(ElenvindTestCase):
         受害者删号前注册 `deleted_<id>@example.com`；等到受害者删号时撞
         UNIQUE 约束 -> 500 -> **账号被永久锁死删不掉**。
         """
-        from elenvind.core.db_user import delete_user
-        from elenvind.core.db_user import create_user as core_create_user
+        from elenvind.db.user import delete_user
+        from elenvind.db.user import create_user as core_create_user
 
         victim_id, _ = self.create_user(nickname="Victim", email="victim@example.com")
         # 攻击者抢注旧实现会用的占位邮箱
@@ -355,7 +355,7 @@ class DeleteAccountTests(ElenvindTestCase):
 
     def test_placeholder_email_is_random_and_unregisterable(self):
         import re
-        from elenvind.core.db_user import delete_user
+        from elenvind.db.user import delete_user
 
         ids = []
         for index in range(3):
@@ -376,7 +376,7 @@ class DeleteAccountTests(ElenvindTestCase):
                                 ".invalid 是 RFC 2606 保留域，永不可注册")
 
     def test_double_delete_reports_instead_of_silently_succeeding(self):
-        from elenvind.core.db_user import delete_user
+        from elenvind.db.user import delete_user
 
         user_id, _ = self.create_user(email="twice@example.com")
         delete_user(user_id)
@@ -410,7 +410,7 @@ class RegistrationTests(ElenvindTestCase):
 
     def test_concurrent_duplicate_registration_races_are_handled(self):
         """绕过查重、直接并发插同一邮箱：UNIQUE 约束必须给出可读错误而非 500。"""
-        from elenvind.core.db_user import create_user
+        from elenvind.db.user import create_user
 
         create_user("First", "race@example.com", hash_password("password-123"))
         # 模拟"两个请求都通过了查重，然后一起 INSERT"

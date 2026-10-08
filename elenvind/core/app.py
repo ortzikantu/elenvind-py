@@ -33,7 +33,6 @@ from .http import (
     send_response,
 )
 from .routing import Router
-from .session import load_user
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +102,13 @@ class App:
     """
 
     def __init__(self, *, router=None, not_found=None, forbidden=None,
-                 server_error=None):
+                 server_error=None, bad_request=None, user_loader=None):
         self.router = router or Router()
+        #: 400 友好页（模块提供；未提供时回落纯文本）。CSRF 失败走这里。
+        self.bad_request = bad_request
+        #: 会话 → 用户（装配层注入 `core.session.load_user` 并绑定 db store）。
+        #: core 自己不 import 持久化层，因此这里只保存一个 callable。
+        self.user_loader = user_loader
         self.not_found = not_found
         self.forbidden = forbidden
         #: 渲染带布局的 500 页面（由装配层提供，见 `elenvind/app.py`）。
@@ -148,10 +152,14 @@ class App:
                 return [body]
 
             token = bind_request(request)
-            load_user(request)
+            if self.user_loader is None:
+                request.user = None
+            else:
+                self.user_loader(request)
 
             response = self.router.dispatch(request, not_found=self.not_found,
-                                            forbidden=self.forbidden)
+                                            forbidden=self.forbidden,
+                                            bad_request=self.bad_request)
             body = send_response(guarded_start_response, request, response,
                                  head_only=head_only)
             sent_size[0] = len(body)

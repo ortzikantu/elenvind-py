@@ -43,6 +43,17 @@ def current_lang() -> str:
     return normalize(config.get("locale", "en"))
 
 
+#: 用户总数提供者（装配层注入，例如 `db.get_user_number`）。
+#: core 不认识 db，所以这里只保留一个显式的注入点，而不是去 import 持久化层。
+_user_count_provider = None
+
+
+def set_user_count_provider(provider) -> None:
+    """装配层注入"用户总数"数据源（`elenvind/app.py` 调用）。"""
+    global _user_count_provider
+    _user_count_provider = provider
+
+
 def build_render_context(context: dict) -> dict:
     """给模板上下文补齐 Core 提供的公共变量。
 
@@ -103,8 +114,9 @@ def build_render_context(context: dict) -> dict:
     merged.setdefault("copyright_name", str(copyright_name))
     merged.setdefault("current_year", datetime.now().year)
     if "user_count" not in merged:
-        from .db_user import get_user_number
-        merged["user_count"] = get_user_number()
+        # 用户总数来自数据库，但 core 不认识 db：由装配层注入 provider
+        # （见 `set_user_count_provider`；未注入时按 0 处理，模板照常渲染）。
+        merged["user_count"] = _user_count_provider() if _user_count_provider else 0
 
     params = config.get("params") or {}
     merged.setdefault("nav_items", _nav_items(params))

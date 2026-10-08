@@ -1,26 +1,30 @@
-"""架构守卫：分层依赖方向（Application → Modules → Core）必须是单向的。
+"""架构守卫：分层、SQLite 边界与模块边界。
 
-为什么单独一个测试文件：`tests/test_core_contract.py` 管的是"Core 承诺的安全能力
-不能被业务模块绕过"（请求边界、CSRF、Cookie、SQL 写入约束…）；本文件管的是
-**目录与 import 结构**本身。两者互补，互不替代。
+目标架构（见 docs/ARCHITECTURE.md）：
 
-判定方式以 **Python import 结构（AST）** 为准，不用目录字符串猜依赖关系。
-只有"旧 features 路径残留"这一项才做文本扫描（它就是关于字符串的规则）。
+    Application（elenvind/app.py、elenvind/wsgi.py）
+        │
+        ├──► core     项目专属运行时基座（不认识 db，也不认识 modules）
+        ├──► db       持久化基座：**唯一** SQLite 边界（不认识 core/modules/app）
+        └──► modules  业务模块（可依赖 core 与 db；模块之间零 import）
 
-规则与对应测试：
+判定方式：以 Python **import 结构（AST）** 为准，不用目录字符串猜依赖关系；
+只有"旧结构路径残留"这一项才做文本扫描（它本身就是关于字符串的规则）。
 
 | # | 规则 | 测试 |
 |---|---|---|
-| 1 | Core 不 import 业务模块，也不 import 装配层 | `test_core_does_not_import_modules_or_the_composition_root` |
-| 2 | 模块不 import 装配层（不取全局对象） | `test_modules_do_not_import_the_composition_root` |
-| 3 | 模块之间互不 import | `test_modules_do_not_import_each_other` |
-| 4 | 无循环 import | `test_module_level_import_graph_is_acyclic`、`test_import_graph_within_modules_is_acyclic`、`test_core_lazy_import_cycles_do_not_grow` |
-| 5 | 模块不直接访问 SQLite 写连接（复用 Core Contract 扫描器） | `test_modules_do_not_touch_the_database_directly` |
-| 6 | 所有写事务进入 `write_tx()`（复用 Core Contract 扫描器） | `test_db_writes_still_go_through_write_tx` |
-| 7 | 无旧 `features/` 路径残留 | `test_no_legacy_features_paths` |
-| 8 | 模块公开入口形状 + 每个模块必须在清单里声明 | `test_module_public_entrypoints` |
-| 9 | `modules/__init__.py` 是纯命名空间（无副作用导入） | `test_modules_package_has_no_side_effect_imports` |
-| 10 | 每个模块都能被独立 import（无导入顺序依赖） | `test_every_module_imports_standalone` |
+| 1 | core ↛ db / core ↛ modules / core ↛ app | `test_core_only_depends_on_itself` |
+| 2 | db ↛ core / db ↛ modules / db ↛ app | `test_db_is_independent` |
+| 3 | modules ↛ app | `test_modules_do_not_import_the_composition_root` |
+| 4 | modules 之间零 import | `test_modules_do_not_import_each_other` |
+| 5 | 只有 db/ 可以 import sqlite3 | `test_only_db_imports_sqlite3` |
+| 6 | 只有 db/ 可以执行 SQL / 提交事务 | `test_sql_and_transactions_stay_inside_db` |
+| 7 | `BEGIN IMMEDIATE` 只出现在 db/transaction.py | `test_begin_immediate_only_in_the_transaction_module` |
+| 8 | 模块不得直接访问 SQLite（复用 Core Contract 扫描器） | `test_modules_do_not_touch_the_database_directly` |
+| 9 | 所有写 SQL 都在 write_tx()/事务连接内 | `test_db_writes_still_go_through_write_tx` |
+| 10 | 无 import 环（模块级；db 层彻底无环；Core 延迟环有棘轮） | `ImportCycleTests` |
+| 11 | 无旧 features/ 与 core/db_* 残留；文档指向新结构 | `LegacyPathTests` |
+| 12 | 模块公开入口形状 + db 公开面稳定 | `ModuleShapeTests` |
 """
 import ast
 import subprocess
@@ -30,9 +34,7 @@ from pathlib import Path
 
 from tests.support import PROJECT_ROOT
 
-#: 复用 Core Contract 的扫描器：只维护一套"模块里不能出现的数据库用法"，
-#: 两个测试文件从不同角度断言同一件事（这里断言"规则存在且被应用"，
-#: 那里断言"当前代码遵守"）。
+#: 复用 Core Contract 的扫描器：只维护一套"模块里不能出现的数据库用法"。
 from tests.test_core_contract import (
     _db_module_write_offenders,
     _driver_import_offenders,
@@ -42,14 +44,14 @@ from tests.test_core_contract import (
 
 PACKAGE = PROJECT_ROOT / "elenvind"
 CORE = PACKAGE / "core"
+DB = PACKAGE / "db"
 MODULES = PACKAGE / "modules"
 COMPOSITION_ROOT = (
-    PACKAGE / "app.py",        # 组合入口：装配 Core App + 模块
-    PACKAGE / "wsgi.py",       # 生产入口：startup(STARTUP_HOOKS) + application
+    PACKAGE / "app.py",        # 组合入口：装配 Core App + db + 模块
+    PACKAGE / "wsgi.py",       # 生产入口：startup(...) + application
 )
 
 #: 每个业务模块的公开入口（缺一个就要显式加到这里 —— 避免"偷偷多一个模块"）。
-#: 形状不强制统一：system 是错误页提供者，没有 `register`。
 MODULE_ENTRYPOINTS = {
     "blog": ("routes", "register"),
     "pages": ("routes", "register"),
@@ -57,20 +59,15 @@ MODULE_ENTRYPOINTS = {
     "users": ("routes", "register"),
     "admin": ("routes", "register"),
     "seo": ("routes", "register"),
-    "system": ("routes", "not_found"),
+    "system": ("routes", "not_found"),   # 错误页提供者，没有 register
 }
 
-#: Core 里**既有的**、靠函数内延迟 import 打破的环（技术债，不是本次引入的）。
-#: 棘轮守卫：只允许减少，不允许增加 —— 新代码不得再用延迟 import 掩盖循环依赖。
-#: 想缩小这个集合需要重构 Core 的 config/security/templating 依赖关系，
-#: 属于独立的一次改动（见最终报告"技术债"）。
+#: Core 里**既有的**、靠函数内延迟 import 打破的环（技术债，非本次引入）。
+#: 棘轮守卫：只允许减少，不允许增加（缩小它需要一次独立的 Core 内部重构）。
 KNOWN_CORE_LAZY_CYCLE_EDGES = frozenset({
     ("elenvind.core.config", "elenvind.core.security"),
     ("elenvind.core.context", "elenvind.core.config"),
-    ("elenvind.core.context", "elenvind.core.db_user"),
-    ("elenvind.core.db_base", "elenvind.core.config"),
-    ("elenvind.core.db_session", "elenvind.core.config"),
-    ("elenvind.core.db_user", "elenvind.core.utils"),
+    ("elenvind.core.csrf", "elenvind.core.utils"),
     ("elenvind.core.http", "elenvind.core.config"),
     ("elenvind.core.http", "elenvind.core.security"),
     ("elenvind.core.http", "elenvind.core.session"),
@@ -81,7 +78,7 @@ KNOWN_CORE_LAZY_CYCLE_EDGES = frozenset({
     ("elenvind.core.templating", "elenvind.core.assets"),
 })
 
-#: 旧路径残留的精确形状（只匹配"路径/标识符"，不匹配英文单词 features）。
+#: 旧结构残留的精确形状（只匹配"路径/标识符"，不匹配英文单词 features）。
 LEGACY_PATH_PATTERNS = (
     r"elenvind\.features",
     r"elenvind/features",
@@ -89,14 +86,14 @@ LEGACY_PATH_PATTERNS = (
     r"features/registry\.py",
     r"docs/development/features\.md",
     r"FEATURES_DIR",
-    r"elenvind\.modules\.registry",   # 已删除的旧装配点
+    r"elenvind\.core\.db_",          # 迁移前 SQLite 实现曾住在 core/
+    r"elenvind\.modules\.registry",
 )
 
 
 # ======================= import 图（AST） =======================
 
 def _package_of(path: Path) -> str:
-    """文件对应的包名（例如 `elenvind/modules/blog/routes.py` -> `elenvind.modules.blog`）。"""
     return ".".join(path.relative_to(PROJECT_ROOT).with_suffix("").parts[:-1])
 
 
@@ -114,8 +111,7 @@ def _resolve_relative(path: Path, node: ast.ImportFrom) -> str:
 def _iter_imports(path: Path):
     """产出 (目标模块名, "module"|"lazy")。
 
-    "module" = 模块级（导入时立即执行，决定 import 期正确性）；
-    "lazy"   = 函数/类体内的延迟导入（运行到那里才执行）。
+    "module" = 模块级（导入时立即执行）；"lazy" = 函数/类体内的延迟导入。
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in tree.body:
@@ -127,7 +123,13 @@ def _iter_imports(path: Path):
                     yield alias.name, kind
             elif isinstance(child, ast.ImportFrom):
                 if child.level or (child.module or "").startswith("elenvind"):
-                    yield _resolve_relative(path, child), kind
+                    base = _resolve_relative(path, child)
+                    yield base, kind
+                    # `from ... import db` 这类写法要展开成 `elenvind.db`，
+                    # 否则模块导入包的子模块会被误判成"依赖包根"。
+                    for alias in child.names:
+                        if alias.name != "*":
+                            yield f"{base}.{alias.name}", kind
 
 
 def _python_files(root: Path):
@@ -147,7 +149,6 @@ def _package_edges():
 
 
 def _find_cycles(pairs):
-    """返回所有环（每个环是节点元组列表，含回到起点的那一步）。"""
     adjacency = {}
     for source, target in pairs:
         if source != target:
@@ -172,33 +173,43 @@ def _find_cycles(pairs):
 
 
 def _is_cross_module(source: str, target: str) -> bool:
-    """source / target 是否属于 modules 下的**不同**模块。"""
     if ".modules." not in source or ".modules." not in target:
         return False
-    own = source.rsplit(".", 1)[0]          # 例如 elenvind.modules.blog
+    own = source.rsplit(".", 1)[0]
     return not (target == own or target.startswith(own + "."))
 
 
-# ======================= 1~3. 依赖方向 =======================
+# ======================= 1~4. 依赖方向 =======================
 
 class LayerDirectionTests(unittest.TestCase):
-    """Core 不认识业务；模块不认识装配层；模块之间互不认识。"""
+    """core 不认识 db/modules；db 谁都不认识；模块之间互不认识。"""
 
-    def test_core_does_not_import_modules_or_the_composition_root(self):
+    def test_core_only_depends_on_itself(self):
         offenders = []
         for path in _python_files(CORE):
             for target, kind in _iter_imports(path):
-                if target.startswith("elenvind.modules") or \
+                if target.startswith(("elenvind.db", "elenvind.modules")) or \
                         target in ("elenvind.app", "elenvind.wsgi"):
                     offenders.append(f"{path.name}: -> {target} [{kind}]")
         self.assertEqual(offenders, [],
-                         "Core 反向依赖了业务模块/装配层：\n" + "\n".join(offenders))
+                         "core 反向依赖了 db / 业务模块 / 装配层：\n" + "\n".join(offenders))
+
+    def test_db_is_independent(self):
+        """db 只依赖标准库：不认识 core、modules、装配层（配置由装配层注入）。"""
+        offenders = []
+        for path in _python_files(DB):
+            for target, kind in _iter_imports(path):
+                if target.startswith(("elenvind.core", "elenvind.modules")) or \
+                        target in ("elenvind.app", "elenvind.wsgi"):
+                    offenders.append(f"{path.name}: -> {target} [{kind}]")
+        self.assertEqual(offenders, [],
+                         "db 反向依赖了 core / 业务模块 / 装配层：\n" + "\n".join(offenders))
 
     def test_modules_do_not_import_the_composition_root(self):
         offenders = []
         for path in _python_files(MODULES):
             for target, kind in _iter_imports(path):
-                if target in ("elenvind.app", "elenvind.wsgi", "elenvind"):
+                if target in ("elenvind.app", "elenvind.wsgi"):
                     offenders.append(f"{path.name}: -> {target} [{kind}]")
         self.assertEqual(offenders, [],
                          "业务模块 import 了装配层（会拿到装配期的全局对象）：\n"
@@ -214,69 +225,76 @@ class LayerDirectionTests(unittest.TestCase):
                          "业务模块之间出现了直接依赖（请改成由装配层注入）：\n"
                          + "\n".join(sorted(offenders)))
 
-    def test_composition_root_imports_core_and_modules(self):
-        """反向确认：装配层确实同时引用 Core 与各模块（否则上面的守卫会形同虚设）。"""
+    def test_composition_root_imports_core_db_and_modules(self):
+        """反向确认：装配层确实同时引用 core、db 与各模块。"""
         imported = set()
         for path in COMPOSITION_ROOT:
             imported.update(target for target, _ in _iter_imports(path))
         self.assertIn("elenvind.core.app", imported)
+        self.assertIn("elenvind.db", imported)
         for name in MODULE_ENTRYPOINTS:
-            self.assertTrue(any(target.startswith(f"elenvind.modules.{name}") for target in imported),
+            self.assertTrue(any(target.startswith(f"elenvind.modules.{name}")
+                                for target in imported),
                             f"装配层没有引用模块 {name}")
 
 
-# ======================= 4. 循环依赖 =======================
+# ======================= 5~9. SQLite 边界 =======================
 
-class ImportCycleTests(unittest.TestCase):
-    """不允许循环依赖，也不允许用延迟 import 掩盖新的环。"""
+class SqliteBoundaryTests(unittest.TestCase):
+    """SQLite 只能出现在 db/：import sqlite3、执行 SQL、提交事务都不例外。"""
 
-    def test_module_level_import_graph_is_acyclic(self):
-        """模块级 import 决定 import 期正确性：必须无环。"""
-        cycles = _find_cycles({(s, d) for s, d, k in _package_edges() if k == "module"})
-        self.assertEqual(cycles, [],
-                         "模块级 import 出现环：\n" + "\n".join(" -> ".join(c) for c in cycles))
+    SQL_METHODS = {"execute", "executemany", "executescript"}
+    TX_METHODS = {"commit", "rollback"}
 
-    def test_import_graph_within_modules_is_acyclic(self):
-        """业务模块层（含延迟 import）必须完全无环。"""
-        pairs = {(s, d) for s, d, k in _package_edges()
-                 if ".modules." in s or ".modules." in d}
-        cycles = _find_cycles(pairs)
-        self.assertEqual(cycles, [],
-                         "业务模块出现环：\n" + "\n".join(" -> ".join(c) for c in cycles))
+    def test_only_db_imports_sqlite3(self):
+        offenders = []
+        for path in _python_files(PACKAGE):
+            if path.is_relative_to(DB):
+                continue
+            for target, _kind in _iter_imports(path):
+                if target == "sqlite3":
+                    offenders.append(str(path.relative_to(PROJECT_ROOT)))
+        self.assertEqual(offenders, [],
+                         "只有 db/ 可以 import sqlite3：\n" + "\n".join(offenders))
 
-    def test_core_lazy_import_cycles_do_not_grow(self):
-        """棘轮：Core 既有的"延迟 import 环"只允许减少。
+    def test_sql_and_transactions_stay_inside_db(self):
+        offenders = []
+        for path in _python_files(PACKAGE):
+            if path.is_relative_to(DB):
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    continue
+                if node.func.attr in self.SQL_METHODS or node.func.attr in self.TX_METHODS:
+                    offenders.append(
+                        f"{path.relative_to(PROJECT_ROOT)}:{node.lineno}: .{node.func.attr}()")
+        self.assertEqual(offenders, [],
+                         "db/ 之外不允许执行 SQL 或提交/回滚事务：\n" + "\n".join(offenders))
 
-        这些边是历史遗留（配置/安全/模板三个模块互相需要），修它们要动 Core 的
-        安全关键路径，属于独立改动 —— 但**新代码不允许再加**：
-        新增一条用延迟 import 掩盖的环会让这条测试变红。
+    def test_begin_immediate_only_in_the_transaction_module(self):
+        """`BEGIN IMMEDIATE` 只允许作为**可执行的** SQL 出现在 db/transaction.py。
+
+        按 AST 找"调用 `.execute()` 且首个参数是含该串的字符串字面量"，
+        因此 docstring / 注释里提到它的地方不会被误判（历史上正是这种误报）。
         """
-        pairs = {(s, d) for s, d, k in _package_edges()}
-        cycle_edges = set()
-        for cycle in _find_cycles(pairs):
-            for index in range(len(cycle) - 1):
-                cycle_edges.add((cycle[index], cycle[index + 1]))
-        lazy_edges = {(s, d) for s, d, k in _package_edges()
-                      if k == "lazy" and ".core." in s and ".core." in d}
-        current = cycle_edges & lazy_edges
-        new_ones = current - KNOWN_CORE_LAZY_CYCLE_EDGES
-        self.assertEqual(sorted(new_ones), [],
-                         "新增了靠延迟 import 掩盖的循环依赖：\n"
-                         + "\n".join(f"{s} -> {d}" for s, d in sorted(new_ones)))
-
-
-# ======================= 5~6. 数据库边界（复用 Core Contract 扫描器） =======================
-
-class DatabaseBoundaryStillEnforcedTests(unittest.TestCase):
-    """目录改名不得放宽 C0 的静态扫描范围（扫描目标现在叫 modules/）。"""
-
-    def test_scan_target_is_the_modules_tree(self):
-        sources = list(_module_sources())
-        self.assertGreaterEqual(len(sources), len(MODULE_ENTRYPOINTS),
-                                "模块扫描没有覆盖到全部模块")
-        for path, _ in sources:
-            self.assertTrue(path.is_relative_to(MODULES),
-                            f"扫描到了 modules/ 之外的路径：{path}")
+        offenders = []
+        for path in _python_files(PACKAGE):
+            if path.name == "transaction.py" and path.is_relative_to(DB):
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not node.args:
+                    continue
+                if getattr(node.func, "attr", "") != "execute":
+                    continue
+                literal = node.args[0]
+                if isinstance(literal, ast.Constant) and isinstance(literal.value, str) \
+                        and "BEGIN IMMEDIATE" in literal.value:
+                    offenders.append(f"{path.relative_to(PROJECT_ROOT)}:{node.lineno}")
+        self.assertEqual(offenders, [],
+                         "BEGIN IMMEDIATE 只允许出现在 db/transaction.py：\n"
+                         + "\n".join(offenders))
 
     def test_modules_do_not_touch_the_database_directly(self):
         offenders = []
@@ -286,25 +304,70 @@ class DatabaseBoundaryStillEnforcedTests(unittest.TestCase):
             for detail in _driver_import_offenders(source):
                 offenders.append(f"{path.name}: {detail}")
         self.assertEqual(offenders, [],
-                         "模块直接碰数据库（必须走 Core 的业务 DB API）：\n"
+                         "模块直接碰数据库（必须走 db 层提供的 API）：\n"
                          + "\n".join(offenders))
 
     def test_db_writes_still_go_through_write_tx(self):
         offenders = []
-        for path in sorted(CORE.glob("db_*.py")):
+        for path in sorted(DB.glob("*.py")):
             offenders.extend(_db_module_write_offenders(
                 path.name, path.read_text(encoding="utf-8")))
         self.assertEqual(offenders, [],
-                         "这些 DB 函数执行了写 SQL 却没有 write_tx()/conn 边界：\n"
+                         "这些 db 函数执行了写 SQL 却没有 write_tx()/conn 边界：\n"
                          + "\n".join(offenders))
 
+    def test_scan_target_is_the_modules_tree(self):
+        sources = list(_module_sources())
+        self.assertGreaterEqual(len(sources), len(MODULE_ENTRYPOINTS),
+                                "模块扫描没有覆盖到全部模块")
+        for path, _ in sources:
+            self.assertTrue(path.is_relative_to(MODULES),
+                            f"扫描到了 modules/ 之外的路径：{path}")
 
-# ======================= 7. 旧路径残留 =======================
+
+# ======================= 10. 循环依赖 =======================
+
+class ImportCycleTests(unittest.TestCase):
+    """不允许循环依赖，也不允许用延迟 import 掩盖新的环。"""
+
+    def test_module_level_import_graph_is_acyclic(self):
+        cycles = _find_cycles({(s, d) for s, d, k in _package_edges() if k == "module"})
+        self.assertEqual(cycles, [],
+                         "模块级 import 出现环：\n" + "\n".join(" -> ".join(c) for c in cycles))
+
+    def test_db_layer_is_fully_acyclic(self):
+        pairs = {(s, d) for s, d, k in _package_edges()
+                 if ".db." in s or s == "elenvind.db" or ".db." in d or d == "elenvind.db"}
+        cycles = _find_cycles(pairs)
+        self.assertEqual(cycles, [],
+                         "db 层出现环：\n" + "\n".join(" -> ".join(c) for c in cycles))
+
+    def test_import_graph_within_modules_is_acyclic(self):
+        pairs = {(s, d) for s, d, k in _package_edges()
+                 if ".modules." in s or ".modules." in d}
+        cycles = _find_cycles(pairs)
+        self.assertEqual(cycles, [],
+                         "业务模块出现环：\n" + "\n".join(" -> ".join(c) for c in cycles))
+
+    def test_core_lazy_import_cycles_do_not_grow(self):
+        """棘轮：Core 既有的"延迟 import 环"只允许减少。"""
+        cycle_edges = set()
+        for cycle in _find_cycles({(s, d) for s, d, _ in _package_edges()}):
+            for index in range(len(cycle) - 1):
+                cycle_edges.add((cycle[index], cycle[index + 1]))
+        lazy_edges = {(s, d) for s, d, k in _package_edges()
+                      if k == "lazy" and ".core." in s and ".core." in d}
+        new_ones = (cycle_edges & lazy_edges) - KNOWN_CORE_LAZY_CYCLE_EDGES
+        self.assertEqual(sorted(new_ones), [],
+                         "新增了靠延迟 import 掩盖的循环依赖：\n"
+                         + "\n".join(f"{s} -> {d}" for s, d in sorted(new_ones)))
+
+
+# ======================= 11. 旧路径残留 =======================
 
 class LegacyPathTests(unittest.TestCase):
-    """仓库里不得再出现旧 `features/` 路径（结构迁移必须彻底）。"""
+    """仓库里不得再出现旧结构路径（迁移必须彻底）。"""
 
-    #: 守卫文件自己会写下这些模式（作为规则），因此跳过自己。
     SELF = Path(__file__).resolve()
 
     SCAN = (
@@ -312,7 +375,7 @@ class LegacyPathTests(unittest.TestCase):
         (PROJECT_ROOT / "tests", (".py",)),
         (PROJECT_ROOT / "docs", (".md", ".example")),
     )
-    SCAN_FILES = ("README.md", "config.toml", "config.example.toml",
+    SCAN_FILES = ("README.md", "CONTRIBUTING.md", "config.toml", "config.example.toml",
                   "run.py", "smoke_driver.py")
 
     def _scan_targets(self):
@@ -328,7 +391,7 @@ class LegacyPathTests(unittest.TestCase):
             if path.is_file():
                 yield path
 
-    def test_no_legacy_features_paths(self):
+    def test_no_legacy_paths(self):
         import re
 
         patterns = [re.compile(p) for p in LEGACY_PATH_PATTERNS]
@@ -341,29 +404,29 @@ class LegacyPathTests(unittest.TestCase):
                         offenders.append(
                             f"{path.relative_to(PROJECT_ROOT)}:{lineno}: {line.strip()[:90]}")
         self.assertEqual(offenders, [],
-                         "仍有旧 features 路径引用：\n" + "\n".join(offenders))
+                         "仍有旧结构引用（features/ 或 core/db_*）：\n" + "\n".join(offenders))
 
-    def test_documentation_uses_the_new_name(self):
+    def test_documentation_describes_the_new_tree(self):
         guide = PROJECT_ROOT / "docs" / "development" / "modules.md"
-        self.assertTrue(guide.is_file(), "开发指南应改名为 docs/development/modules.md")
-        self.assertFalse((PROJECT_ROOT / "docs" / "development" / "features.md").exists(),
-                         "旧文档路径不该继续存在")
+        self.assertTrue(guide.is_file())
+        self.assertFalse((PROJECT_ROOT / "docs" / "development" / "features.md").exists())
         readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("docs/development/modules.md", readme)
+        architecture = (PROJECT_ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
+        self.assertIn("elenvind/db/", architecture, "架构文档必须描述一级 db/ 包")
 
 
-# ======================= 8~10. 模块公开入口与独立性 =======================
+# ======================= 12. 模块与 db 公开面 =======================
 
 class ModuleShapeTests(unittest.TestCase):
-    """模块的公开入口形状 + 独立可导入性。"""
+    """模块的公开入口形状 + db 公开面稳定性。"""
 
     def _module_names(self):
         return sorted(p.name for p in MODULES.iterdir()
                       if p.is_dir() and (p / "__init__.py").is_file())
 
     def test_every_module_is_declared_with_an_entrypoint(self):
-        names = self._module_names()
-        self.assertEqual(sorted(MODULE_ENTRYPOINTS), names,
+        self.assertEqual(sorted(MODULE_ENTRYPOINTS), self._module_names(),
                          "模块清单与磁盘不一致（新增/删除模块必须显式登记）")
 
     def test_module_public_entrypoints_are_callable(self):
@@ -371,22 +434,40 @@ class ModuleShapeTests(unittest.TestCase):
 
         for name, (module_attr, function_name) in MODULE_ENTRYPOINTS.items():
             with self.subTest(module=name):
-                module = importlib.import_module(
-                    f"elenvind.modules.{name}.{module_attr}")
+                module = importlib.import_module(f"elenvind.modules.{name}.{module_attr}")
                 entry = getattr(module, function_name, None)
                 self.assertTrue(callable(entry),
                                 f"modules/{name}/{module_attr}.py 缺少可调用的 {function_name}()")
 
     def test_modules_package_has_no_side_effect_imports(self):
-        """`elenvind.modules` 是纯命名空间：import 它不该触发任何业务模块。"""
         tree = ast.parse((MODULES / "__init__.py").read_text(encoding="utf-8"))
         imports = [node for node in ast.walk(tree)
                    if isinstance(node, (ast.Import, ast.ImportFrom))]
         self.assertEqual(imports, [],
                          "modules/__init__.py 不该 import 任何东西（副作用/循环风险）")
 
+    def test_db_package_exposes_the_documented_api(self):
+        """db 的公开面必须稳定：装配层与模块都依赖它。"""
+        import elenvind.db as db
+
+        for name in ("configure", "connect", "write_tx", "init_db", "migrate",
+                     "lock_path_for", "IntegrityError", "MigrationError", "DB_PATH",
+                     "SCHEMA_VERSION"):
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(db, name), f"db 未导出 {name}")
+
+    def test_db_does_not_handle_http_or_templates(self):
+        """db 是持久化基座：不处理 HTTP、Cookie、模板、业务页面流程。"""
+        forbidden = {"http", "cookie", "cookies", "templating", "render_template",
+                     "markdown"}
+        offenders = []
+        for path in _python_files(DB):
+            for target, _kind in _iter_imports(path):
+                if target.rpartition(".")[2] in forbidden:
+                    offenders.append(f"{path.name} -> {target}")
+        self.assertEqual(offenders, [], "db 里出现了 HTTP/模板依赖：\n" + "\n".join(offenders))
+
     def test_every_module_imports_standalone(self):
-        """每个模块都必须能单独 import（没有隐含的导入顺序要求）。"""
         for name in MODULE_ENTRYPOINTS:
             with self.subTest(module=name):
                 result = subprocess.run(

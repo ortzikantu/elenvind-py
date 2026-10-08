@@ -6,12 +6,13 @@
   `normalize_email` 再落库。
 - 所有"取用户"查询都过滤 is_deleted = 0，已注销账号视为不存在。
 - **读走 `connect()`，写走 `write_tx()`**：写事务由 Core 的唯一写入口提供
-  跨进程 flock 与 BEGIN IMMEDIATE（见 db_base.write_tx）。
+  跨进程 flock 与 BEGIN IMMEDIATE（见 db.write_tx）。
 """
 import time
 import uuid
 
-from .db_base import connect, write_tx
+from .connection import connect
+from .transaction import write_tx
 
 
 def _invalidate_user_count():
@@ -32,8 +33,7 @@ def create_user(nickname: str, email: str, password_hash: str) -> int:
     见 `get_user_by_email`），如果写入侧漏了一处，就会存进大写邮箱并导致
     查不到 —— 把不变式收在唯一的写入原语里，调用方就不可能漏。
     """
-    from .utils import normalize_email
-
+    
     with write_tx() as conn:
         cursor = conn.execute(
             "INSERT INTO user (nickname, email, password, created_at, nickname_changed_at) "
@@ -59,8 +59,7 @@ def get_user_by_email(email: str):
     因此这里的入参先转小写、再用 BINARY 比较即可命中索引
     （实测 `SEARCH user USING INDEX sqlite_autoindex_user_1 (email=?)`）。
     """
-    from .utils import normalize_email
-
+    
     with connect() as conn:
         return conn.execute(
             "SELECT * FROM user WHERE email = ? AND is_deleted = 0",
@@ -86,8 +85,7 @@ def update_user_profile(user_id: int, nickname=None, email=None):
 
     传 `None` 表示"这一项不改"。返回是否实际更新了行。
     """
-    from .utils import normalize_email
-
+    
     fields = []
     params = []
     if nickname is not None:
@@ -163,3 +161,12 @@ def get_user_number():
     value = row[0] if row else 0
     _user_count_cache = (now, value)
     return value
+
+
+def normalize_email(email) -> str:
+    """邮箱规范化：strip + 小写（**写入与查询都必须经过它**）。
+
+    大小写不敏感现在靠"数据规范化"实现（查询用 BINARY 比较以命中索引），
+    所以写入侧漏一处就会存进大写邮箱并导致查不到 —— 定义收在数据层里。
+    """
+    return str(email or "").strip().lower()

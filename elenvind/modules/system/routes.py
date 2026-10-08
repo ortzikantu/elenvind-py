@@ -18,6 +18,17 @@ def not_found(request):
     return html(render_template("errors/404.html", {}), status=404)
 
 
+def bad_request(request):
+    """400：表单令牌失效 / 请求体不合法时的**友好页**。
+
+    UX 背景：CSRF 令牌会过期（页面开了很久、浏览器清过 Cookie、手改过表单），
+    此时只回一行 `Invalid CSRF token` 会让用户完全不知道怎么办。
+    这里给出一致的页面与"返回上一页重新提交"的指引；
+    **安全语义不变**：依旧 400、不执行任何状态变更、不泄漏任何上下文。
+    """
+    return html(render_template("errors/400.html", {}), status=400)
+
+
 def forbidden(request):
     """403：未登录访问受保护页面时使用。"""
     return html(render_template("errors/error.html", {

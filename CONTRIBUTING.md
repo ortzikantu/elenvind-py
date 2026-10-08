@@ -49,8 +49,9 @@ git format-patch origin/main   # 尚未推送的全部提交
 | 同步 | 业务代码是普通 `def`。**不要**引入 `async`/`await`/asyncio（有守卫测试） |
 | 标准库优先 | 新增运行期依赖要先论证；`requirements.txt` 只放真正需要的 |
 | KISS | 能用一个函数解决的不要引入类；能显式传参的不要引入注册表/容器 |
-| 分层 | Core 不认识模块；模块之间零 import；跨模块协作由 `elenvind/app.py` 注入 |
-| 写库 | 只能 `with write_tx() as conn:`；读用 `with connect() as conn:` |
+| 分层 | Core 不认识 db/模块；db 不认识 core/模块；模块之间零 import；跨模块协作由 `elenvind/app.py` 注入 |
+| SQLite | 只有 `elenvind/db/` 可以 `import sqlite3`、执行 SQL、提交事务（有 AST 守卫） |
+| 写库 | 只能 `with db.write_tx() as conn:`；读用 `with db.connect() as conn:` |
 | 安全 | CSRF / Cookie / 密码 / 安全头 / 请求限制由 Core 提供，模块**不要**重复实现 |
 | 注释 | 写"为什么这样做"与"边界在哪里"，而不是复述代码；中文 |
 | 文案 | 面向用户的文案放 `i18n/*.toml`（zh/en/ja 三份保持同步） |

@@ -528,6 +528,11 @@ class DefaultStylesheetCoverageTests(unittest.TestCase):
         "action.css",
         # 逻辑运算符被误当类名（模板已修为 |default 形式，此处兜底）
         "or",
+        # 评论行/输入框的类名由模块算好后传入（{{ row.css }} / {{ comment_form.css }}），
+        # 扫到的是表达式片段，不是真实类名；真实取值为
+        # comment / comment comment-reply / comment is-redacted(…)、comment-compose / is-editing
+        "row.css",
+        "comment_form.css",
     }
 
     def setUp(self):

@@ -280,8 +280,21 @@ from ...core.markdown import render_markdown
 from ...core.session import current_user
 from ...core.auth import require_owner, is_admin_user
 from ...core.config import config
-from ...core.db_base import connect, write_tx, IntegrityError
+from ... import db                                     # 模块可以依赖 db
+from ...db.user import get_user_by_email               # 或按领域直接导入
 from ...core.security import hash_password, verify_password      # 使用原语，OK
+```
+
+读写数据库走 `db` 包（`db.connect()` / `db.write_tx()` / 各领域 API）：
+
+```python
+from ... import db
+
+with db.connect() as conn:                             # 只读
+    row = conn.execute("SELECT ...").fetchone()
+
+with db.write_tx() as conn:                            # 唯一写入口（flock + BEGIN IMMEDIATE）
+    conn.execute("INSERT INTO ...", (...))
 ```
 
 抛 `HttpError` 家族异常即可得到对应状态码（调度器统一翻译成响应）：
@@ -428,7 +441,7 @@ Markdown 没有原生视频语法，而正文里的**原始 HTML 会被转义**�
 ## 7. 数据访问（读 `connect()`，写 `write_tx()`）
 
 ```python
-from ...core.db_base import connect, write_tx
+from ...db.transaction import connect, write_tx
 
 def count_rows() -> int:
     with connect() as conn:                       # 只读：不加锁
@@ -447,19 +460,27 @@ def rename(row_id: int, name: str) -> None:
 
 | 入口 | 用途 | 事务/锁 |
 |---|---|---|
-| `connect()` | **只读**查询（SELECT） | 不加锁；`with conn:` 只在 DML 时才有隐式事务 |
-| `write_tx()` | **所有**写事务（INSERT/UPDATE/DELETE/REPLACE/DDL） | `flock` 跨进程排他 + `BEGIN IMMEDIATE` + commit/rollback + close |
+| `db.connect()` | **只读**查询（SELECT） | 不加锁；`with conn:` 只在 DML 时才有隐式事务 |
+| `db.write_tx()` | **所有**写事务（INSERT/UPDATE/DELETE/REPLACE/DDL） | `flock` 跨进程排他 + `BEGIN IMMEDIATE` + commit/rollback + close |
+
+**会话要带 store**：Core 的 HTTP 层不认识 db，所以涉及会话持久化的调用由模块传入 store：
+
+```python
+login_user(request, user["id"], store=db)              # 登录（轮换会话）
+logout_user(request, store=db)                          # 登出（只杀当前会话）
+invalidate_user_sessions(user["id"], request=request, store=db)   # 改密/删号（全端失效）
+```
 
 - `write_tx()` 是**整个项目唯一正式的写事务入口**，也是唯一允许开写事务的地方；
-- `write_tx()` **不接收 SQL**：它不是 executor，业务 SQL 仍写在各自的 `core/db_*.py` 里；
+- `write_tx()` **不接收 SQL**：它不是 executor，业务 SQL 仍写在各自的 `db/*.py` 里；
 - **读-判断-写**必须整体放进**同一个** `write_tx()`（见 `db_comment_rate.try_post_comment`、
   `db_session.get_session_user`），否则判断依据可能在两者之间被别人改掉（TOCTOU）；
 - `write_tx()` **不可嵌套**：同一线程里再进一次会立刻抛 `RuntimeError`。所以
-  "写完之后顺手清理"这类动作（`core.db_prune.prune()`）必须在块**外**调用；
-- 需要关联的异常类型（如 `IntegrityError`）请从 `core.db_base` 取，
+  "写完之后顺手清理"这类动作（`db.maintenance.prune()`）必须在块**外**调用；
+- 需要关联的异常类型（如 `IntegrityError`）请从 `db.transaction` 取，
   不要 `import sqlite3`（有静态守卫）。
 - 用户行是 `sqlite3.Row`：**不支持 `getattr`**，只能用 `row["col"]`。
-- 新增表/列时改 `core/db_base.py` 的 `SCHEMA_VERSION` 与 `_MIGRATIONS`；
+- 新增表/列时改 `db/transaction.py` 的 `SCHEMA_VERSION` 与 `_MIGRATIONS`；
   迁移与初始化本身也在 `write_tx()` 之内，不需要（也不该）自己 `BEGIN`。
 
 ### 7.2 C0 写协调到底保证什么、不保证什么

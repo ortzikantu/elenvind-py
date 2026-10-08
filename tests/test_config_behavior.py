@@ -16,9 +16,11 @@ from pathlib import Path
 
 from tests.support import PROJECT_ROOT, ElenvindTestCase
 
-from elenvind.core import db_base
+from elenvind import db
+from elenvind.db import connection as db_connection
+from elenvind.app import resolve_db_path
 from elenvind.core.config import ROOT
-from elenvind.core.db_comment import get_comments_by_article
+from elenvind.db.comment import get_comments_by_article
 
 
 class ConfigBehaviorTests(ElenvindTestCase):
@@ -168,7 +170,7 @@ class ConfigBehaviorTests(ElenvindTestCase):
                                           "confirm_password": "password-123"},
                                     cookies={"csrf": csrf})
         self.assertIn("closed", response.text.lower())
-        from elenvind.core.db_user import get_user_by_email
+        from elenvind.db.user import get_user_by_email
         self.assertIsNone(get_user_by_email("off@example.com"))
 
         self._config["registration_enabled"] = True
@@ -235,27 +237,28 @@ class ConfigBehaviorTests(ElenvindTestCase):
     # ---------- 管理员 ----------
     def test_admin_user_id_controls_privileges(self):
         other_id, _ = self.create_user(nickname="Other", email="other@example.com")
+        victim_id, _ = self.create_user(nickname="Victim", email="victim@example.com")
         self.write_article("post", "body")
-        from elenvind.core.db_comment import create_comment
-        comment_id = create_comment("post", other_id, "content")
+        from elenvind.db.comment import create_comment
+        # 评论属于第三方：这样"编辑"探针测的才是权限，而不是"作者改自己的话"
+        comment_id = create_comment("post", victim_id, "content")
 
         # 默认 admin_user_id = 1：id=1 的账号不是管理员时不能恢复
         self._config["admin_user_id"] = other_id
         self.create_user(nickname="First", email="first@example.com")
         session, csrf = self.login_ok("other@example.com", "correct horse battery")
         cookies = self.app_cookies(session=session, csrf=csrf)
-        from elenvind.core.db_comment import soft_delete_comment, get_comment_by_id
-        soft_delete_comment(comment_id)
-        response = self.app.request("POST", f"/article/post/comment/restore/{comment_id}",
+        from elenvind.db.comment import get_comment_by_id
+        response = self.app.request("POST", f"/article/post/comment/delete/{comment_id}",
                                     form={"csrf_token": csrf}, cookies=cookies)
         self.assertEqual(response.status, 302)
-        self.assertEqual(get_comment_by_id(comment_id)["is_deleted"], 0)
+        self.assertEqual(get_comment_by_id(comment_id)["is_deleted"], 1)
 
-        # 指向别的 id 后同一个人失去权限
+        # 指向别的 id 后同一个人失去权限（对别人的评论既不能删也不能改）
         self._config["admin_user_id"] = 999
-        soft_delete_comment(comment_id)
-        denied = self.app.request("POST", f"/article/post/comment/restore/{comment_id}",
-                                  form={"csrf_token": csrf}, cookies=cookies)
+        denied = self.app.request("POST", f"/article/post/comment/edit/{comment_id}",
+                                  form={"csrf_token": csrf, "content": "hijack"},
+                                  cookies=cookies)
         self.assertEqual(denied.status, 403)
 
     def test_admin_badge_is_configurable(self):
@@ -298,9 +301,9 @@ class ConfigBehaviorTests(ElenvindTestCase):
     def test_deleted_user_nickname_is_used(self):
         user_id, _ = self.create_user(nickname="Leaver", email="leaver@example.com")
         self.write_article("post", "body")
-        from elenvind.core.db_comment import create_comment
+        from elenvind.db.comment import create_comment
         create_comment("post", user_id, "old comment")
-        from elenvind.core.db_user import delete_user
+        from elenvind.db.user import delete_user
         delete_user(user_id)
 
         self._config["deleted_user_nickname"] = "GONE-AWAY"
@@ -496,12 +499,12 @@ class DatabasePathConfigTests(unittest.TestCase):
     """database 键必须真正控制 SQLite 路径，优先级必须与文档一致。"""
 
     def setUp(self):
-        self._original_path = db_base.DB_PATH
+        self._original_path = db_connection.DB_PATH
         self._original_env = os.environ.pop("ELENVIND_DB", None)
         self._original_config = dict(_config_dict())
 
     def tearDown(self):
-        db_base.DB_PATH = self._original_path
+        db_connection.DB_PATH = self._original_path
         if self._original_env is None:
             os.environ.pop("ELENVIND_DB", None)
         else:
@@ -513,47 +516,47 @@ class DatabasePathConfigTests(unittest.TestCase):
     def test_config_database_key_sets_path(self):
         live = _config_dict()
         live["database"] = "custom.db"
-        db_base.apply_db_path()
-        self.assertEqual(Path(db_base.DB_PATH), ROOT / "custom.db")
+        db_connection.configure(resolve_db_path())
+        self.assertEqual(Path(db_connection.DB_PATH), ROOT / "custom.db")
 
     def test_relative_database_resolves_against_project_root(self):
         live = _config_dict()
         live["database"] = "data/nested/custom.db"
-        db_base.apply_db_path()
-        self.assertEqual(Path(db_base.DB_PATH), ROOT / "data" / "nested" / "custom.db")
+        db_connection.configure(resolve_db_path())
+        self.assertEqual(Path(db_connection.DB_PATH), ROOT / "data" / "nested" / "custom.db")
 
     def test_environment_variable_wins_over_config(self):
         live = _config_dict()
         live["database"] = "from-config.db"
         os.environ["ELENVIND_DB"] = str(ROOT / "from-env.db")
-        db_base.DB_PATH = ROOT / "sentinel.db"
-        db_base.apply_db_path()
-        self.assertEqual(Path(db_base.DB_PATH), ROOT / "from-env.db")
+        db_connection.DB_PATH = ROOT / "sentinel.db"
+        db_connection.configure(resolve_db_path())
+        self.assertEqual(Path(db_connection.DB_PATH), ROOT / "from-env.db")
 
     def test_blank_config_falls_back_to_default(self):
         live = _config_dict()
         live["database"] = ""
         # 测试夹具会设置 ELENVIND_DB 兜底；这里要验证的是"无环境变量时"的行为
         os.environ.pop("ELENVIND_DB", None)
-        db_base.DB_PATH = ROOT / "sentinel.db"
-        db_base.apply_db_path()
-        self.assertEqual(Path(db_base.DB_PATH), db_base.DEFAULT_DB_PATH)
+        db_connection.DB_PATH = ROOT / "sentinel.db"
+        db_connection.configure(resolve_db_path())
+        self.assertEqual(Path(db_connection.DB_PATH), db_connection.DEFAULT_DB_PATH)
 
     def test_blank_config_also_covers_whitespace_only(self):
         live = _config_dict()
         live["database"] = "   "
         os.environ.pop("ELENVIND_DB", None)
-        db_base.DB_PATH = ROOT / "sentinel.db"
-        db_base.apply_db_path()
-        self.assertEqual(Path(db_base.DB_PATH), db_base.DEFAULT_DB_PATH)
+        db_connection.DB_PATH = ROOT / "sentinel.db"
+        db_connection.configure(resolve_db_path())
+        self.assertEqual(Path(db_connection.DB_PATH), db_connection.DEFAULT_DB_PATH)
 
     def test_env_absence_does_not_clobber_an_already_applied_path(self):
         """环境变量不存在且配置合法时，路径来自 config（不是启动时读到的 env）。"""
         live = _config_dict()
         live["database"] = "configured-only.db"
         os.environ.pop("ELENVIND_DB", None)
-        db_base.apply_db_path()
-        self.assertEqual(Path(db_base.DB_PATH), ROOT / "configured-only.db")
+        db_connection.configure(resolve_db_path())
+        self.assertEqual(Path(db_connection.DB_PATH), ROOT / "configured-only.db")
 
 
 class LoggingPathConfigTests(unittest.TestCase):

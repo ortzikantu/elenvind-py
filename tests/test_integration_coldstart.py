@@ -9,8 +9,10 @@ import unittest
 
 from tests.support import PROJECT_ROOT, AppHarness  # noqa: F401
 
+from elenvind.app import prepare_database
 from elenvind.core import config as config_module
-from elenvind.core import db_base
+from elenvind import db
+from elenvind.db import connection as db_connection
 from elenvind.core import lifespan as lifespan_module
 from elenvind.core.config import apply_runtime_config, load_config, validate_config
 from elenvind.modules.blog import logic as blog_logic
@@ -33,7 +35,7 @@ class ColdStartTests(unittest.TestCase):
 
         # 先加载真实 config.toml，再只覆盖路径类配置（其余保持仓库设定）
         self._original_config = dict(config_module.config)
-        self._original_db_path = db_base.DB_PATH
+        self._original_db_path = db_connection.DB_PATH
         self._original_db_env = os.environ.get("ELENVIND_DB")
         load_config()
         config_module.config["database"] = str(self.db_path)
@@ -51,7 +53,7 @@ class ColdStartTests(unittest.TestCase):
         (self.tmpdir / "custom_pages" / "about.md").write_text(
             "About page **content**.", encoding="utf-8")
 
-        db_base.DB_PATH = self.db_path
+        db_connection.DB_PATH = self.db_path
         os.environ["ELENVIND_DB"] = str(self.db_path)
         lifespan_module.SKIP_CONFIG_LOAD["value"] = True
         self.app = AppHarness()
@@ -62,7 +64,7 @@ class ColdStartTests(unittest.TestCase):
         import shutil
 
         lifespan_module.SKIP_CONFIG_LOAD["value"] = False
-        db_base.DB_PATH = self._original_db_path
+        db_connection.DB_PATH = self._original_db_path
         if self._original_db_env is None:
             os.environ.pop("ELENVIND_DB", None)
         else:
@@ -161,18 +163,21 @@ class ColdStartTests(unittest.TestCase):
         self.assertIn('id="comments"', rendered.text)
 
         # 删除评论 → 恢复（本人可删；恢复仅管理员，这里由 id=1 的同一账号执行）
-        from elenvind.core.db_comment import get_comments_by_article
+        from elenvind.db.comment import get_comments_by_article
         comment_id = get_comments_by_article("smoke")[0]["id"]
         deleted = self.app.request("POST", f"/article/smoke/comment/delete/{comment_id}",
                                    form={"csrf_token": csrf}, cookies=cookies)
         self.assertEqual(deleted.status, 302)
-        # 管理员看到的是删除线原文（访客会被打码，见 test_comments）
+        # 删除 = 永久涂黑：原文在库里已被替换，页面显示黑块（没有恢复入口）
         masked = self.app.request("GET", "/article/smoke", cookies=cookies)
-        self.assertIn("is-deleted", masked.text)
-        restored = self.app.request("POST", f"/article/smoke/comment/restore/{comment_id}",
-                                    form={"csrf_token": csrf}, cookies=cookies)
-        self.assertEqual(restored.status, 302)
-        self.assertIn("first!", self.app.request("GET", "/article/smoke").text)
+        self.assertIn("is-redacted", masked.text)
+        self.assertNotIn("first!", masked.text)
+        from elenvind.db.comment import get_comment_by_id
+        self.assertEqual(set(get_comment_by_id(comment_id)["content"]), {"█"})
+        restore_gone = self.app.request(
+            "POST", f"/article/smoke/comment/restore/{comment_id}",
+            form={"csrf_token": csrf}, cookies=cookies)
+        self.assertIn(restore_gone.status, (404, 405))
 
         # 改密 → 全会话失效 → 用新密码重新登录（模拟一个全新浏览器：不带旧 Cookie）
         changed = self.app.request("POST", "/user",
@@ -225,7 +230,7 @@ class ColdStartTests(unittest.TestCase):
         try:
             config_module.config["server"]["port"] = 999999   # 非法端口
             with self.assertRaises(ConfigError) as caught:
-                startup()
+                startup(prepare_database=prepare_database)
             self.assertIn("port", str(caught.exception))
         finally:
             config_module.config.clear()
@@ -243,7 +248,7 @@ class ColdStartTests(unittest.TestCase):
 
 def fragment_app():
     """返回被测 WSGI 应用对象（延迟导入，避免模块级循环依赖）。"""
-    from elenvind.app import app
+    from elenvind.app import app, prepare_database
     return app
 
 

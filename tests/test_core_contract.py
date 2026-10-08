@@ -18,11 +18,13 @@ from urllib.parse import quote
 
 from tests.support import PROJECT_ROOT, ElenvindTestCase
 
+from elenvind import db
 from elenvind.app import app
 from elenvind.core.context import build_render_context
 
 MODULES_DIR = PROJECT_ROOT / "elenvind" / "modules"
 CORE_DIR = PROJECT_ROOT / "elenvind" / "core"
+DB_DIR = PROJECT_ROOT / "elenvind" / "db"
 
 
 def _module_sources():
@@ -590,7 +592,7 @@ class NoDuplicateSecurityTests(unittest.TestCase):
         """模块不得自己开连接或自己管事务：连接/事务 API 只在 Core DB 层用。
 
         C0 契约（见下方 `DatabaseWriteBoundaryTests`）：模块只能调用
-        Core 的业务数据库 API（`core.db_user` / `core.db_comment` / …），
+        Core 的业务数据库 API（`db.user` / `db.comment` / …），
         由它们在 `write_tx()` 里完成写事务。模块自己碰
         `connect()` / `get_connection()` / `write_tx()`（或直接 import sqlite3）
         都会让协调边界失效。
@@ -832,7 +834,7 @@ class DatabaseWriteBoundaryTests(unittest.TestCase):
 
     def test_db_modules_writes_go_through_write_tx(self):
         offenders = []
-        for path in sorted(CORE_DIR.glob("db_*.py")):
+        for path in sorted(DB_DIR.glob("*.py")):
             offenders.extend(_db_module_write_offenders(
                 path.name, path.read_text(encoding="utf-8")))
         self.assertEqual(offenders, [],
@@ -840,17 +842,24 @@ class DatabaseWriteBoundaryTests(unittest.TestCase):
                          + "\n".join(offenders))
 
     def test_write_entrypoints_and_migrations_use_the_write_guard(self):
-        source = (CORE_DIR / "db_base.py").read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        functions = {node.name: node for node in ast.walk(tree)
-                     if isinstance(node, ast.FunctionDef)}
+        # 结构迁移后：事务入口在 db/transaction.py，schema/迁移在 db/migration.py
+        sources = {
+            "transaction": (DB_DIR / "transaction.py").read_text(encoding="utf-8"),
+            "migration": (DB_DIR / "migration.py").read_text(encoding="utf-8"),
+        }
+        functions = {}
+        for label, source in sources.items():
+            for node in ast.walk(ast.parse(source)):
+                if isinstance(node, ast.FunctionDef):
+                    functions[node.name] = (source, node)
         for name in ("init_db", "migrate", "write_tx", "_run_migrations"):
-            self.assertIn(name, functions, f"db_base.py 缺少 {name}()")
+            self.assertIn(name, functions, f"db/ 缺少 {name}()")
         for name in ("init_db", "migrate"):
-            body = _code_of(source, functions[name])
+            source, node = functions[name]
+            body = _code_of(source, node)
             self.assertIn("write_tx(", body,
                           f"{name}() 必须通过 write_tx() 执行写操作")
-        run_migrations = _code_of(source, functions["_run_migrations"])
+        run_migrations = _code_of(*functions["_run_migrations"])
         self.assertNotIn("BEGIN IMMEDIATE", run_migrations,
                          "_run_migrations() 不该自己开事务：BEGIN IMMEDIATE 由 write_tx() 统一负责")
         self.assertNotIn("commit()", run_migrations,
@@ -862,10 +871,14 @@ class DatabaseWriteBoundaryTests(unittest.TestCase):
         用 **AST 语句顺序**比较（不是子串位置）：函数 docstring 里也会出现
         `BEGIN IMMEDIATE` 之类的字样，子串比较会被文档骗到。
         """
-        source = (CORE_DIR / "db_base.py").read_text(encoding="utf-8")
+        source = (DB_DIR / "transaction.py").read_text(encoding="utf-8")
+        # 锁文件实现住在 connection.py（拆分后的边界），因此两个文件都要读
+        connection_source = (DB_DIR / "connection.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         functions = {node.name: node for node in ast.walk(tree)
                      if isinstance(node, ast.FunctionDef)}
+        lock_functions = {node.name: node for node in ast.walk(ast.parse(connection_source))
+                          if isinstance(node, ast.FunctionDef)}
         write = functions["write_tx"]
 
         def find(predicate):
@@ -907,12 +920,12 @@ class DatabaseWriteBoundaryTests(unittest.TestCase):
         for name, node in (("commit", commit), ("rollback", rollback), ("close", close)):
             self.assertIsNotNone(node, f"write_tx 缺少 {name}()")
 
-        lock_source = ast.get_source_segment(source, functions["_write_file_lock"]) or ""
+        lock_source = ast.get_source_segment(connection_source, lock_functions["_write_file_lock"]) or ""
         self.assertIn("fcntl.flock", lock_source)
         self.assertIn("LOCK_EX", lock_source)
         self.assertIn("LOCK_UN", lock_source)
         self.assertNotIn("LOCK_NB", lock_source, "必须是阻塞式等待，不做非阻塞轮询")
-        self.assertIn("_WRITE_LOCK_SUFFIX", source)
+        self.assertIn("_WRITE_LOCK_SUFFIX", connection_source)
 
     def test_guard_detects_violations(self):
         """反向控制：故意构造的违规样本必须被判为违规。
@@ -1115,7 +1128,7 @@ class FailClosedTests(ElenvindTestCase):
                           content_type="", content_length=None,
                           client_ip="127.0.0.1", secure=True, lang="en",
                           session_token=session_token)
-        load_user(request)
+        load_user(request, store=db)
         return request
 
     def test_missing_csrf_cookie_denies(self):

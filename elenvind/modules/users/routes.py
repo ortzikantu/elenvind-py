@@ -1,7 +1,7 @@
 """Users 模块：个人中心（资料查看/修改、改密、删号）。
 
 认证由 Core 完成（`auth="required"`）；密码与会话操作由 Core 提供：
-- 改密 -> `core.db_user.update_user_password` + `core.security.hash_password`，
+- 改密 -> `db.user.update_user_password` + `core.security.hash_password`，
   随后 `core.session.invalidate_user_sessions()` 强制全端重登（Core 语义）；
 - 删号 -> 逻辑删除 + 清理全部会话。
 本模块不写任何 session cookie / CSRF / 密码逻辑。
@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from ...core.config import config
 
 from ...core.context import current_lang
 # 捕获"邮箱被他人抢先占用"要用的异常类型：由 Core 重新导出，
 # 模块不需要（也不该）import sqlite3 —— 见 Core Contract 守卫。
-from ...core.db_base import IntegrityError
-from ...core.db_user import (
+from ...db import IntegrityError
+from ...db.user import (
     delete_user,
     get_user_by_email,
     update_user_password,
@@ -31,9 +32,11 @@ from ...core.security import (
     hash_password,
     verify_password,
 )
+from ... import db
 from ...core.session import invalidate_user_sessions
 from ...core.templating import render_template
-from ...core.utils import format_datetime, normalize_email
+from ...db.user import normalize_email
+from ...core.utils import format_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +90,7 @@ def register(router):
                 # Core 语义：改密后该账号全部会话失效，强制重新登录。
                 # 传入 request 让 Core 同时清除浏览器 Cookie ——
                 # 模块不 delete_cookie、不 import SESSION_COOKIE。
-                invalidate_user_sessions(user["id"], request=request)
+                invalidate_user_sessions(user["id"], request=request, store=db)
                 logger.info("Password changed: user_id=%s ip=%s",
                             user["id"], request.client_ip)
                 return redirect("/login")
@@ -99,8 +102,12 @@ def register(router):
                 logger.warning("Account deletion rejected (wrong password): "
                                "user_id=%s ip=%s", user["id"], request.client_ip)
             else:
+                # 身份删除：先把**可关联**的登录流水按原邮箱清掉（里面含 IP），
+                # 再逻辑删除用户行。顺序不能反 —— 删号会把邮箱替换成占位值。
+                deleted_email = user["email"]
                 delete_user(user["id"])
-                invalidate_user_sessions(user["id"], request=request)
+                db.clear_login_attempts(deleted_email)
+                invalidate_user_sessions(user["id"], request=request, store=db)
                 logger.info("Account deleted: user_id=%s ip=%s",
                             user["id"], request.client_ip)
                 return redirect("/")
@@ -125,6 +132,8 @@ def _input_limits():
 
 def _render_profile(request, user, message, kind):
     return render_template("users/profile.html", {
+        # 删除账号的披露文案里要说出"评论会显示成什么名字"
+        "deleted_user_nickname": config.get("deleted_user_nickname", "Journeyed On"),
         "message": message,
         "message_kind": kind,
         "limits": _input_limits(),

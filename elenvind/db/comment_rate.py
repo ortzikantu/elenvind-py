@@ -5,7 +5,7 @@
 - 单 IP 窗口内评论数（防同一出口批量刷屏）。
 窗口都很短（默认 60 秒），误伤概率低。
 
-流水清理分两层（见 `core.db_prune`）：
+流水清理分两层（见 `db.maintenance`）：
 - **启动时**全量清一次（`cleanup_old_comment_attempts`）；
 - **运行期**每次发布提交之后，机会式清理（每小时最多一次），
   这样长跑进程不会无界增长，又不会把 O(表大小) 的 DELETE 放进写事务里。
@@ -21,9 +21,9 @@
 """
 import time
 
-from .db_base import write_tx
-from .db_comment import comment_depth
-from .db_prune import prune
+from .transaction import write_tx
+from .comment import comment_depth
+from .maintenance import prune
 
 RETENTION_DAYS = 7
 
@@ -98,7 +98,7 @@ def try_post_comment(article_slug: str, user_id: int, ip: str, content: str,
                 conn.rollback()
                 return "bad_parent"
             if max_depth > 0:
-                # 复用 core.db_comment.comment_depth（防环 + limit 兜底都在那里），
+                # 复用 db.comment.comment_depth（防环 + limit 兜底都在那里），
                 # 传 conn 以确保回溯与 INSERT 处于同一事务。
                 parent_depth = comment_depth(parent, max_depth=max_depth, conn=conn)
                 if parent_depth + 1 > max_depth:

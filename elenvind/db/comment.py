@@ -15,7 +15,8 @@
 """
 from datetime import datetime
 
-from .db_base import connect, write_tx
+from .connection import connect
+from .transaction import write_tx
 
 
 def get_comments_by_article(article_slug: str):
@@ -56,14 +57,47 @@ def get_comment_by_id(comment_id: int):
 
 
 
-def soft_delete_comment(comment_id: int):
-    with write_tx() as conn:
-        conn.execute("UPDATE comment SET is_deleted = 1 WHERE id = ?", (comment_id,))
+#: 涂黑字符：U+2588 FULL BLOCK。删除后正文被它替换并**写回数据库**。
+REDACTION_BLOCK = "\u2588"
+#: 涂黑上限：超长评论也只存这么多黑块（正文长度信息仍保留在等长前缀里，
+#: 但不允许一条评论把库撑大 —— 这是"删除"语义，不是"保留副本"）。
+REDACTION_MAX_BLOCKS = 400
 
 
-def restore_comment(comment_id: int):
+def redact_comment(comment_id: int, *, max_blocks: int = REDACTION_MAX_BLOCKS) -> int:
+    """**永久涂黑**：把正文替换成等长（有上限）的黑块，并标记 `is_deleted = 1`。
+
+    为什么不是"只改标志位、渲染时打码"：那样原文一直留在库里，
+    "已删除"的承诺不成立（数据库副本、备份、任何拿到库文件的人都读得到）。
+    现在原文在同一个 UPDATE 里被覆盖 —— 数据库里不再有可恢复的副本，
+    而评论行本身仍在（`parent_id` 链完整，评论树不会散架）。
+
+    保留长度是为了视觉信息量：读者能看出"这里原本有一段话"，
+    但内容不可复原。返回受影响行数（0 = 评论不存在）。
+    """
     with write_tx() as conn:
-        conn.execute("UPDATE comment SET is_deleted = 0 WHERE id = ?", (comment_id,))
+        row = conn.execute("SELECT content FROM comment WHERE id = ?",
+                           (comment_id,)).fetchone()
+        if row is None:
+            return 0
+        normalized = (row["content"] or "").replace("\r\n", "\n").replace("\r", "\n")
+        blocks = REDACTION_BLOCK * max(min(len(normalized), max_blocks), 1)
+        conn.execute("UPDATE comment SET is_deleted = 1, content = ? WHERE id = ?",
+                     (blocks, comment_id))
+    return 1
+
+
+def update_comment_content(comment_id: int, content: str) -> int:
+    """编辑评论正文。返回受影响行数（0 = 不存在或已涂黑）。
+
+    `is_deleted = 0` 是 WHERE 的一部分：已涂黑的评论**不可编辑**
+    （原文已经不存在，编辑它只会把黑块换掉，等于伪造历史）。
+    """
+    with write_tx() as conn:
+        cursor = conn.execute(
+            "UPDATE comment SET content = ? WHERE id = ? AND is_deleted = 0",
+            (content, comment_id))
+        return cursor.rowcount
 
 
 def comment_depth(comment, *, max_depth: int, conn=None) -> int:

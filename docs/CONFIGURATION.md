@@ -41,13 +41,13 @@
 | `max_length` | `1000` | 单条评论最大字符数（服务端校验与 textarea 双重限制）。 |
 | `max_comment_depth` | `32` | 评论最大层级（顶层 = 1）。到顶后页面不再显示回复入口，**写入侧同样拒绝**（`too_deep`）。合法区间 `1–10000`；**`0` 不是"不限层级"，会被拒绝启动**。 |
 
-`max_comment_depth` 是**硬约束**，且判定点在 `core.db_comment_rate.try_post_comment`
+`max_comment_depth` 是**硬约束**，且判定点在 `db.comment_rate.try_post_comment`
 的事务内（与 `INSERT` 同一事务）：
 
 - 模板不渲染回复按钮只是**提示**——`reply_to` 是表单字段，可以直接构造；
 - 路由层还有一道预检，但它在事务**之外**，属于 TOCTOU（并发时两个请求可能同时
   看到"还没到顶"），因此只作为"给出更友好文案"的快捷路径，不作数；
-- 层级计算只有一处实现：`core.db_comment.comment_depth`（渲染侧
+- 层级计算只有一处实现：`db.comment.comment_depth`（渲染侧
   `modules/blog/logic.comment_depth` 是它的包装），因此两边不会算出不同结果。
 
 **没有"不限制层级"这个选项**：合法区间是 `1–10000`（`core/config.py` 的
@@ -140,6 +140,10 @@
 不会出现"检查通过但并发插入绕过"的竞态；被限流的请求也不写流水。
 
 ## `[login_limits]` 登录限流
+
+> 达到阈值后不是"永久锁死"，而是**渐进式冷却**：等待时长 = `60s × 2^(超出次数)`，
+> 封顶 24 小时；冷却结束即可重试（被限流时响应会带 `Retry-After`）。
+> 判定与记账在同一个写事务里完成（`db.reserve_login_attempt`），并发不会超发。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -249,6 +253,7 @@ CSS/JS/SVG/字体等常见类型有显式映射（避免被回成 `text/plain` �
 |---|---|
 | `name` | 平台名，作为图片 alt 与悬停提示。 |
 | `url` | 链接地址（`http(s)://` 站外链接自动新窗口打开；站内路径不弹新窗）。 |
+| | **写外链请写全 `https://host/...`**：协议相对写法 `//host/...` 会被拒绝（避免"不写 scheme 也能引入任意第三方资源"）。 |
 | `icon` | 图标图片 URL（建议托管在 Nginx/CDN）。留空则该条目退化为文字链接。 |
 
 社交行自动按当前语言拼接成句：英文 `Find me on A, B and C.`、
@@ -295,6 +300,16 @@ hsts_enabled = false ───────────────────�
 `__Host-` 前缀要求全程 HTTPS，开启它就说明站点已经把自己约束在 HTTPS 上。
 
 ### `[security.csp]` 指令表
+
+> **默认允许外链图片/视频**（`img-src 'self' data: http: https:`、`media-src 'self' http: https:`）——
+> 这是刻意的产品取舍：文章配图/视频走外链，单机静态服务不必承担大文件带宽与磁盘
+> （内置 `static/` 只放 favicon、logo 这类小而特殊的资源）。代价是访问者会向第三方
+> 发起请求（对方可见其 IP/UA）。
+>
+> 想收窄就**显式列出主机**：`img-src = ["'self'", "data:", "https://cdn.example.com"]`。
+> 守卫只允许"收窄"：删掉默认里的 `http:`/`https:` 通配、换成具体主机；
+> 裸 `http:` / `https:` / `*` 写进 `config.toml` 会被 `tests/test_doc_consistency.py` 拒绝。
+> 完全自托管（图片/视频都放 `elenvind/static/`）时写 `["'self'", "data:"]` / `["'self'"]`。
 
 只写想改的条目，其余保持默认。默认值：
 

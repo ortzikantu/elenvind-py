@@ -145,6 +145,11 @@ def resolve_asset(relative: str):
     if not resolved.is_relative_to(root):
         logger.warning("static asset outside root rejected: %r", relative)
         return None
+    # 解析之后再查一次"点开头"的路径段：URL 段检查挡不住
+    # `static/x.png -> static/.secret` 这种"根内软链指向根内隐藏文件"。
+    if _has_hidden_segment(resolved.relative_to(root).parts):
+        logger.warning("static asset resolves into a hidden path: %r", relative)
+        return None
     if not resolved.is_file():
         return None
     return resolved

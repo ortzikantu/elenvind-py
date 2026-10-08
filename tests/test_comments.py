@@ -9,13 +9,14 @@ import unittest
 
 from tests.support import ElenvindTestCase
 
-from elenvind.core.db_base import connect
-from elenvind.core.db_comment import (
+from elenvind.db import connect
+from elenvind.db.comment import (
     create_comment,
+    redact_comment,
     get_comment_by_id,
     get_comments_by_article,
 )
-from elenvind.core.db_comment_rate import try_post_comment
+from elenvind.db.comment_rate import try_post_comment
 from elenvind.core.templating import render_template
 from elenvind.modules.blog import logic
 from elenvind.modules.blog import logic as blog
@@ -35,6 +36,13 @@ def render_comments(slug, user, *, reply_to=None, max_length=1000, csrf_token=No
         "reply_to_value": str(reply_to or ""),
         "reply_to_message": "",
         "article": {"slug": slug},
+        # 发表/编辑复用同一个表单：测试渲染走与视图同样的上下文形状
+        "comment_form": {
+            "action": f"/article/{slug}/comment", "title": "Post a Comment",
+            "submit": "Post Comment", "content": "", "reply_to": str(reply_to or ""),
+            "editing": False, "css": "comment-compose", "cancel_url": "",
+            "cancel_label": "Cancel",
+        },
     }
     return render_template("partials/comments.html", context)
 
@@ -42,7 +50,7 @@ def render_comments(slug, user, *, reply_to=None, max_length=1000, csrf_token=No
 class CommentTreeTests(unittest.TestCase):
     """评论树展开。
 
-    **测试调用生产实现** `core.db_comment.flatten_comment_tree`，不再复制算法。
+    **测试调用生产实现** `db.comment.flatten_comment_tree`，不再复制算法。
 
     这里曾经有一份 `_order()` 副本（"build_comment_rows 需要数据库，所以
     自己写一份同样的算法"）—— 结果是两份实现慢慢分叉，而且测试测的是副本：
@@ -64,7 +72,7 @@ class CommentTreeTests(unittest.TestCase):
 
     def _order(self, comments):
         """返回 [(row, depth)]，走生产实现。"""
-        from elenvind.core.db_comment import flatten_comment_tree
+        from elenvind.db.comment import flatten_comment_tree
 
         return flatten_comment_tree(comments)
 
@@ -264,7 +272,7 @@ class CommentRowShapeTests(ElenvindTestCase):
     """
 
     def _rows(self):
-        from elenvind.core.db_comment import get_comment_by_id, get_comments_by_article
+        from elenvind.db.comment import get_comment_by_id, get_comments_by_article
         user_id, _ = self.create_user(nickname="Ann", email="ann@example.com")
         self.write_article("post", "body")
         comment_id = create_comment("post", user_id, "root")
@@ -286,7 +294,7 @@ class CommentRowShapeTests(ElenvindTestCase):
 
     def test_reply_page_renders_when_logged_in(self):
         """点"回复"进文章页（?reply_to=N）必须 200 并显示回复提示。"""
-        from elenvind.core.db_comment import get_comments_by_article
+        from elenvind.db.comment import get_comments_by_article
         user_id, _ = self.create_user(nickname="Ann", email="ann@example.com")
         self.write_article("post", "body")
         create_comment("post", user_id, "root")
@@ -304,8 +312,8 @@ class CommentRowShapeTests(ElenvindTestCase):
 
     def test_reply_page_renders_for_deleted_author(self):
         """回复"已注销用户"的评论也必须 200（走昵称占位分支）。"""
-        from elenvind.core.db_comment import get_comments_by_article
-        from elenvind.core.db_user import delete_user
+        from elenvind.db.comment import get_comments_by_article
+        from elenvind.db.user import delete_user
 
         user_id, _ = self.create_user(nickname="Gone", email="gone@example.com")
         self.write_article("post", "body")
@@ -353,27 +361,31 @@ class CommentRenderTests(ElenvindTestCase):
         self.assertIn("<br>", html)   # 换行保留
 
     def test_deleted_comment_is_masked_for_visitors(self):
-        from elenvind.core.db_comment import soft_delete_comment
+        from elenvind.db.comment import redact_comment
         user_id, _ = self.create_user()
         self.write_article("post", "body")
         comment_id = create_comment("post", user_id, "secret message")
-        soft_delete_comment(comment_id)
+        redact_comment(comment_id)
         html = render_comments("post", None)
         self.assertNotIn("secret message", html)
         self.assertIn("█", html)
 
-    def test_deleted_comment_visible_to_admin_with_strikethrough(self):
-        from elenvind.core.db_comment import soft_delete_comment
-        admin_id, admin_pw = self.create_user(nickname="Boss", email="boss@example.com")
+    def test_deleted_comment_is_masked_for_admins_too(self):
+        """涂黑是**不可恢复**的：管理员也拿不到原文（库里已经没有了）。"""
+        from elenvind.db.comment import redact_comment
+        admin_id, _ = self.create_user(nickname="Boss", email="boss@example.com")
         user_id, _ = self.create_user(nickname="Ann", email="ann@example.com")
         self.write_article("post", "body")
         comment_id = create_comment("post", user_id, "flagged text")
-        soft_delete_comment(comment_id)
+        redact_comment(comment_id)
         admin_row = {"id": admin_id, "nickname": "Boss"}
         html = render_comments("post", admin_row, csrf_token="c" * 43)
-        self.assertIn("flagged text", html)
-        self.assertIn("is-deleted", html)
-        self.assertIn("Restore", html)
+        self.assertNotIn("flagged text", html)
+        self.assertIn("█", html)
+        self.assertIn("is-redacted", html)
+        # 取消恢复功能：管理员也不再看到"恢复"按钮
+        self.assertNotIn("Restore", html)
+        self.assertNotIn("/comment/restore/", html)
 
     def test_reply_hint_uses_parent_author(self):
         author_id, _ = self.create_user(nickname="Parent & Co", email="p@example.com")
@@ -439,10 +451,10 @@ class CommentHttpTests(ElenvindTestCase):
 
     def test_reply_to_soft_deleted_comment_is_allowed(self):
         """软删除可恢复，因此已删除评论仍可被回复（关系链保持完整）。"""
-        from elenvind.core.db_comment import soft_delete_comment
+        from elenvind.db.comment import redact_comment
         self._post_comment("root")
         root_id = get_comments_by_article("post")[0]["id"]
-        soft_delete_comment(root_id)
+        redact_comment(root_id)
         response = self._post_comment("reply", reply_to=root_id)
         self.assertEqual(response.status, 302, response.text[:300])
         comments = get_comments_by_article("post")
@@ -520,7 +532,11 @@ class CommentHttpTests(ElenvindTestCase):
         response = self.app.request("POST", f"/article/post/comment/delete/{comment_id}",
                                     form={"csrf_token": self.csrf}, cookies=self.cookies)
         self.assertEqual(response.status, 302)
-        self.assertEqual(get_comment_by_id(comment_id)["is_deleted"], 1)
+        row = get_comment_by_id(comment_id)
+        self.assertEqual(row["is_deleted"], 1)
+        # 涂黑写回数据库：原文不再是"只是被遮住"，而是**不存在**
+        self.assertEqual(set(row["content"]), {"█"})
+        self.assertNotIn("mine", row["content"])
 
     def test_author_cannot_delete_others_comment(self):
         # 把管理员让给一个不存在的 id，使当前用户（id=1）成为普通用户
@@ -532,17 +548,21 @@ class CommentHttpTests(ElenvindTestCase):
         self.assertEqual(response.status, 403)
         self.assertEqual(get_comment_by_id(comment_id)["is_deleted"], 0)
 
-    def test_author_cannot_restore_comment(self):
-        from elenvind.core.db_comment import soft_delete_comment
-        self._config["admin_user_id"] = 999
+    def test_restore_route_no_longer_exists(self):
+        """取消恢复功能：路由已删除（404/405），没有任何"撤销涂黑"的入口。"""
+        from elenvind.db.comment import redact_comment
         self._post_comment("mine")
         comment_id = get_comments_by_article("post")[0]["id"]
-        soft_delete_comment(comment_id)
-        response = self.app.request("POST", f"/article/post/comment/restore/{comment_id}",
-                                    form={"csrf_token": self.csrf}, cookies=self.cookies)
-        self.assertEqual(response.status, 403)
+        redact_comment(comment_id)
+        for method in ("POST", "GET"):
+            with self.subTest(method=method):
+                response = self.app.request(
+                    method, f"/article/post/comment/restore/{comment_id}",
+                    form={"csrf_token": self.csrf}, cookies=self.cookies)
+                self.assertIn(response.status, (404, 405), response.status)
+        self.assertEqual(get_comment_by_id(comment_id)["is_deleted"], 1)
 
-    def test_admin_can_delete_and_restore_any_comment(self):
+    def test_admin_can_redact_any_comment(self):
         other_id, _ = self.create_user(nickname="Ann2", email="ann2@example.com")
         comment_id = create_comment("post", other_id, "spam")
         # 默认 admin_user_id = 1，当前登录用户 id 为 1（首个注册用户）
@@ -552,21 +572,23 @@ class CommentHttpTests(ElenvindTestCase):
         delete = self.app.request("POST", f"/article/post/comment/delete/{comment_id}",
                                   form={"csrf_token": admin_csrf}, cookies=admin_cookies)
         self.assertEqual(delete.status, 302)
-        self.assertEqual(get_comment_by_id(comment_id)["is_deleted"], 1)
-
-        restore = self.app.request("POST", f"/article/post/comment/restore/{comment_id}",
-                                   form={"csrf_token": admin_csrf}, cookies=admin_cookies)
-        self.assertEqual(restore.status, 302)
-        self.assertEqual(get_comment_by_id(comment_id)["is_deleted"], 0)
+        row = get_comment_by_id(comment_id)
+        self.assertEqual(row["is_deleted"], 1)
+        self.assertEqual(set(row["content"]), {"█"}, "涂黑必须写回数据库")
 
     def test_non_admin_id_1_is_not_admin(self):
-        """admin_user_id 可配置：默认 id=1 以外的用户没有管理员权限。"""
+        """admin_user_id 可配置：默认 id=1 以外的用户没有管理员权限。
+
+        用"编辑别人的评论"作为探针（恢复功能已取消）。
+        """
         self._config["admin_user_id"] = 999
         other_id, _ = self.create_user(nickname="NotBoss", email="notboss@example.com")
         comment_id = create_comment("post", other_id, "spam")
-        response = self.app.request("POST", f"/article/post/comment/restore/{comment_id}",
-                                    form={"csrf_token": self.csrf}, cookies=self.cookies)
+        response = self.app.request("POST", f"/article/post/comment/edit/{comment_id}",
+                                    form={"csrf_token": self.csrf, "content": "hijack"},
+                                    cookies=self.cookies)
         self.assertEqual(response.status, 403)
+        self.assertEqual(get_comment_by_id(comment_id)["content"], "spam")
 
     def test_missing_admin_config_means_no_admin(self):
         self._config.pop("admin_user_id", None)
@@ -684,11 +706,11 @@ class ParentIdValidationTests(ElenvindTestCase):
 
     def test_soft_deleted_parent_is_accepted(self):
         """本项目的删除是软删除、可恢复，因此已删除评论仍可被回复。"""
-        from elenvind.core.db_comment import soft_delete_comment
+        from elenvind.db.comment import redact_comment
         user_id, _ = self.create_user()
         self.write_article("post", "body")
         root = create_comment("post", user_id, "root")
-        soft_delete_comment(root)
+        redact_comment(root)
         self.assertTrue(get_comment_by_id(root)["is_deleted"])
 
         self.assertEqual(self._post("post", user_id, root, "reply to deleted"), "ok")
@@ -766,9 +788,9 @@ class ParentIdHttpTests(ElenvindTestCase):
 
     def test_reply_to_soft_deleted_comment_succeeds(self):
         """回归：曾经**拒绝**回复已删除评论，与"软删除可恢复"的语义冲突。"""
-        from elenvind.core.db_comment import soft_delete_comment
+        from elenvind.db.comment import redact_comment
         root = create_comment("post-a", 1, "root")
-        soft_delete_comment(root)
+        redact_comment(root)
         response = self._post(root)
         self.assertEqual(response.status, 302, response.text[:300])
         comments = get_comments_by_article("post-a")
@@ -852,11 +874,18 @@ class CommentContentRenderingTests(unittest.TestCase):
                 out = self.render(content, is_deleted=1, admin=False)
                 self.assertEqual(out.count("█"), 3)
 
-    def test_admin_sees_deleted_content_with_strikethrough_class(self):
-        out = self.render("<b>x</b>", is_deleted=1, admin=True)
-        self.assertIn("is-deleted", out)
-        self.assertIn("&lt;b&gt;", out)          # 仍然转义
-        self.assertNotIn("█", out)               # 管理员不打码
+    def test_admin_also_sees_redacted_blocks(self):
+        """不可恢复：管理员看到的也是黑块（库里已经没有原文了）。"""
+        out = self.render("flagged text", is_deleted=1, admin=True)
+        self.assertIn("is-redacted", out)
+        self.assertIn("█" * len("flagged text"), out)
+        self.assertNotIn("flagged text", out)
+
+    def test_deleted_row_with_unredacted_content_is_still_masked(self):
+        """纵深防御：即使库里存在"标了已删除但正文还在"的行，渲染也不泄漏。"""
+        out = self.render("legacy secret", is_deleted=1, admin=True)
+        self.assertNotIn("legacy secret", out)
+        self.assertEqual(out.count("█"), len("legacy secret"))
 
     def test_empty_content_renders_empty_span(self):
         out = self.render("")
@@ -877,7 +906,7 @@ class CommentRateTransactionGuardTests(unittest.TestCase):
     `DELETE FROM comment_rate` 是 O(表大小) 的操作，放在 `BEGIN IMMEDIATE`
     之后会拉长写锁持有时间（高并发下互相排队）。
 
-    流水清理分两层（见 `core/db_prune.py`）：
+    流水清理分两层（见 `db/maintenance.py`）：
     - **启动时**全量清一次（`cleanup_old_comment_attempts`）；
     - **运行期**在发布**提交之后**做机会式清理（默认每小时最多一次），
       因此既不占写锁，长跑进程也不会无界增长。
@@ -890,8 +919,8 @@ class CommentRateTransactionGuardTests(unittest.TestCase):
     def setUpClass(cls):
         import pathlib
         from tests.support import PROJECT_ROOT
-        cls.source = (PROJECT_ROOT / "elenvind" / "core"
-                      / "db_comment_rate.py").read_text(encoding="utf-8")
+        cls.source = (PROJECT_ROOT / "elenvind" / "db"
+                      / "comment_rate.py").read_text(encoding="utf-8")
 
     def _function_body(self, name):
         import re
@@ -1073,8 +1102,8 @@ class ReplyDepthWriteSideTests(ElenvindTestCase):
         self.assertEqual(outcome, "ok")
 
     def test_depth_check_reuses_core_walk(self):
-        """深度计算只有一处实现：core.db_comment.comment_depth。"""
-        from elenvind.core.db_comment import comment_depth as core_depth
+        """深度计算只有一处实现：db.comment.comment_depth。"""
+        from elenvind.db.comment import comment_depth as core_depth
         from elenvind.modules.blog import logic
         ids = self._chain(3)
         row = get_comment_by_id(ids[-1])
@@ -1117,7 +1146,7 @@ class ReplyDepthWriteSideTests(ElenvindTestCase):
 
     def test_read_side_guard_untouched(self):
         """读侧的防环与 limit 兜底未被改动。"""
-        from elenvind.core.db_comment import comment_depth as core_depth
+        from elenvind.db.comment import comment_depth as core_depth
         deep = self._chain(8)
         # limit 兜底：返回上限是 max_depth + 1
         self.assertEqual(logic_depth(get_comment_by_id(deep[-1])), 4)

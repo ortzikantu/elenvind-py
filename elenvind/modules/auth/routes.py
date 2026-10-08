@@ -15,9 +15,10 @@ from ...core.config import config
 from ...core.context import current_lang
 # 捕获"邮箱已存在"要用的异常类型：由 Core 重新导出，模块不需要（也不该）
 # import sqlite3 —— 见 Core Contract 守卫。
-from ...core.db_base import IntegrityError
-from ...core.db_register import try_register_attempt
-from ...core.db_user import create_user, get_user_by_email
+from ...db import IntegrityError
+from ... import db
+from ...db.auth import complete_login_success, reserve_login_attempt, try_register_attempt
+from ...db.user import create_user, get_user_by_email, update_user_password
 from ...core.http import html, redirect, safe_next_path
 from ...core.i18n import t
 from ...core.security import (
@@ -30,7 +31,7 @@ from ...core.security import (
 )
 from ...core.session import login_user, logout_user
 from ...core.templating import render_template
-from ...core.utils import normalize_email
+from ...db.user import normalize_email
 
 logger = logging.getLogger(__name__)
 
@@ -101,16 +102,22 @@ def register(router):
         if request.method == "POST":
             email = normalize_email(request.form.get("email", ""))
             password = request.form.get("password", "")
-            message = _try_login(request, email, password, lang)
+            message, retry_after = _try_login(request, email, password, lang)
             if message is None:
                 # 会话 Cookie 与 CSRF Cookie 由 Core 的 send_response 统一下发
                 # （模块不拼 Cookie 名，因此 __Host- 前缀之类的策略自动生效）
                 return redirect(next_path or "/")
-        return html(render_template("auth/login.html", {
+        else:
+            retry_after = 0
+        response = html(render_template("auth/login.html", {
             "message": message, "message_kind": "error",
             "limits": input_limits(),
             "next_path": next_path,
         }))
+        if retry_after:
+            # 被限流时明确告诉客户端还要等多久（不再是一句模糊的"稍后再试"）
+            response.headers.append((b"Retry-After", str(int(retry_after)).encode("ascii")))
+        return response
 
     @router.route("/register", methods=["GET", "POST"])
     def register(request):
@@ -146,7 +153,7 @@ def register(router):
         # 模块不 delete_cookie、不 import SESSION_COOKIE（否则既知道 Cookie
         # 名字、又得自己处理 __Host- 前缀，两套策略迟早漂移）。
         logger.info("Logout: user_id=%s ip=%s", request.user["id"], request.client_ip)
-        logout_user(request)
+        logout_user(request, store=db)
         return redirect("/")
 
     return router
@@ -168,46 +175,67 @@ def safe_next(raw) -> str:
     return "" if (value == "/" and raw.strip() != "/") else value
 
 
-def _try_login(request, email, password, lang):
-    """返回 None 表示成功；否则返回错误文案。"""
-    from ...core.db_login import (
-        clear_login_attempts,
-        count_email_failures,
-        count_global_recent_failures,
-        count_ip_failures,
-        record_login_attempt,
-    )
+def _lock_message(lang, reason, retry_after: int):
+    """限流提示：基础文案 + 由渐进 backoff 算出的等待时间。
 
+    历史上提示里硬编码了"24 小时"，而窗口是可配置的 —— 改配置后文案就在撒谎。
+    现在等待时间来自真实判定（`db.reserve_login_attempt` 的返回值）。
+    """
+    keys = {"global": "auth_err_global", "email": "auth_err_email_lock",
+            "ip": "auth_err_ip_lock"}
+    base = _message(lang, keys.get(reason, "auth_err_global"))
+    minutes = max(1, (int(retry_after) + 59) // 60)
+    return f"{base} {t(lang, 'auth_err_retry_after', minutes=minutes)}"
+
+
+def _try_login(request, email, password, lang):
+    """返回 `(message | None, retry_after)`；`message is None` 表示登录成功。
+
+    流程（顺序是安全语义的一部分）：
+
+        1. 一次**短写事务**：三闸门判定 + 占位记账（并发不可能超发）
+        2. 释放 SQLite 写锁，再做昂贵的 scrypt 校验（不占锁）
+        3. 成功 → 一次短写事务收尾（清失败流水 + 审计 + 可选 rehash）
+    """
     ip = request.client_ip or "unknown"
     limits = login_limits()
     if len(email) > EMAIL_MAX or not email or len(password) > PASSWORD_MAX:
-        return _message(lang, "auth_err_creds")
-    if count_global_recent_failures(limits["global_window_seconds"]) >= limits["max_global_failures"]:
-        # 三个闸门都记 WARNING：它们是"有人在爆破"的唯一信号来源
-        logger.warning("Login blocked (global failure limit): ip=%s", ip)
-        return _message(lang, "auth_err_global")
-    if count_email_failures(email, limits["email_window_seconds"]) >= limits["max_email_failures"]:
-        logger.warning("Login blocked (email failure limit): ip=%s", ip)
-        return _message(lang, "auth_err_email_lock")
-    if count_ip_failures(ip, limits["ip_window_seconds"]) >= limits["max_ip_failures"]:
-        logger.warning("Login blocked (ip failure limit): ip=%s", ip)
-        return _message(lang, "auth_err_ip_lock")
+        return _message(lang, "auth_err_creds"), 0
 
-    user, ok, _rehashed = verify_credentials(email, password)
+    # 1) 判定 + 占位：旧实现在这里读三次计数（各自独立连接），
+    #    中间还夹着 scrypt，并发请求会同时读到低计数而全部放行。
+    allowed, reason, retry_after = reserve_login_attempt(
+        email, ip,
+        max_email_failures=limits["max_email_failures"],
+        email_window_seconds=limits["email_window_seconds"],
+        max_ip_failures=limits["max_ip_failures"],
+        ip_window_seconds=limits["ip_window_seconds"],
+        max_global_failures=limits["max_global_failures"],
+        global_window_seconds=limits["global_window_seconds"],
+    )
+    if not allowed:
+        # 三个闸门都记 WARNING：它们是"有人在爆破"的唯一信号来源
+        logger.warning("Login blocked (%s failure limit): ip=%s retry_after=%ss",
+                       reason, ip, retry_after)
+        return _lock_message(lang, reason, retry_after), retry_after
+
+    # 2) 写锁已释放，才做密码校验（scrypt 约 240ms，不能让写锁陪着等）
+    user = get_user_by_email(email)
+    ok, rehashed_hash = verify_credentials(user, password)
     if ok:
-        clear_login_attempts(email)
-        record_login_attempt(email, ip, success=True)
-        login_user(request, user["id"])       # Core：轮换会话 + 写 Cookie
+        # 3) 收尾：清该邮箱失败流水 + 记成功 +（必要时）落新哈希，同一事务
+        complete_login_success(email, ip, user_id=user["id"],
+                               new_password_hash=rehashed_hash)
+        login_user(request, user["id"], store=db)   # 轮换会话 + 写 Cookie（store 注入）
         logger.info("Login succeeded: user_id=%s ip=%s", user["id"], ip)
-        return None
+        return None, 0
 
     # 账号不存在时也做一次等量哈希校验，弱化计时侧信道（Core 之外只此一处）
-    if get_user_by_email(email) is None:
+    if user is None:
         dummy_verify(password)
-    record_login_attempt(email, ip, success=False)
-    # 刻意不记邮箱（PII）：失败计数已经进 login_attempts 表，日志只需要 IP + 结果
+    # 失败无需再记账：第 1 步的占位就是这次失败
     logger.info("Login failed: ip=%s", ip)
-    return _message(lang, "auth_err_creds")
+    return _message(lang, "auth_err_creds"), 0
 
 
 def _try_register(request, lang):

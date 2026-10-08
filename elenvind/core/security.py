@@ -337,6 +337,12 @@ DEFAULT_CSP_DIRECTIVES = {
     "default-src": ("'self'",),
     "script-src": ("'none'",),
     "style-src": ("'self'", "'unsafe-inline'"),
+    # 默认放行外链图片/视频：这是**产品取舍** —— 文章配图与视频走外部链接，
+    # 单机静态服务因此不必承担大文件带宽与磁盘（内置 static 只放 favicon、logo
+    # 这类小而特殊的资源）。代价是访问者会向第三方发起请求（对方可见其 IP/UA）。
+    # 想收紧：在 config.toml 的 [security.csp] 里显式写主机 allowlist，
+    #   例：img-src = ["'self'", "data:", "https://cdn.example.com"]
+    #   （文档一致性守卫拒绝裸 "http:" / "https:" / "*"，允许显式主机列表）
     "img-src": ("'self'", "data:", "http:", "https:"),
     "media-src": ("'self'", "http:", "https:"),
     "font-src": ("'self'",),

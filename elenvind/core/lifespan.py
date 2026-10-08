@@ -29,11 +29,6 @@ import time
 
 from .config import apply_runtime_config, config, load_config, validate_config
 from .console import success, warning
-from .db_base import DB_PATH, SCHEMA_VERSION, connect, init_db, lock_path_for
-from .db_comment_rate import cleanup_old_comment_attempts
-from .db_login import cleanup_old_login_attempts
-from .db_register import cleanup_old_attempts
-from .db_session import cleanup_expired_sessions
 from .logging_config import resolve_log_path, setup_logging, shutdown_logging
 
 logger = logging.getLogger(__name__)
@@ -53,8 +48,12 @@ def shutdown():
     shutdown_logging()
 
 
-def startup(hooks=()):
+def startup(hooks=(), prepare_database=None):
     """按固定顺序完成全部启动步骤；异常向上抛，由调用方决定如何终止进程。
+
+    参数 `prepare_database`：数据库启动步骤（解析路径 → 配置 db → 建表/迁移 →
+    清理过期数据 → 记录库信息）。由装配层提供 —— core 不认识 db，
+    因此"怎么初始化数据库"不是它的职责。
 
     参数 `hooks`：`[(说明, callable)]`，在数据库与模板就绪后**按序**执行
     （业务模块的内容缓存预热）。由装配层显式传入：钩子抛异常会使启动失败 ——
@@ -102,23 +101,11 @@ def startup(hooks=()):
     get_environment()
     success("Templates loaded")
 
-    init_db()
-    success("Database initialized and migrated")
-
-    # 运行期排障最常问的三个问题：库在哪、日志模式是什么、锁文件在哪 —— 直接记下来。
-    with connect() as conn:
-        journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).upper()
-    logger.info("Database: %s (schema v%s, journal_mode=%s, write lock %s)",
-                DB_PATH, SCHEMA_VERSION, journal_mode, lock_path_for(DB_PATH))
-
-    # 会话过期清理：与限流流水清理同一风格（启动时统一扫一遍）。
-    # 运行期间读过期会话也会顺手删除，这里只是兜住"长期没被访问"的那些行。
-    removed_sessions = cleanup_expired_sessions()
-    cleanup_old_login_attempts(days=30)
-    cleanup_old_comment_attempts(days=7)
-    cleanup_old_attempts(days=7)
-    success(f"Expired sessions and rate-limit history cleaned "
-            f"({removed_sessions} session(s) removed)")
+    if prepare_database is None:
+        # 没有装配层提供数据库步骤（极少见：只有不碰数据库的测试才这样）
+        logger.warning("No database bootstrapper injected; skipping DB initialization")
+    else:
+        prepare_database()
 
     for label, hook in hooks:
         hook()

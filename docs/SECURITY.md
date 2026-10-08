@@ -129,12 +129,20 @@ proxy_set_header Host              $host;
 
 | 头 | 默认值 |
 |---|---|
-| `Content-Security-Policy` | `default-src 'self'; script-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data: http: https:; media-src 'self' http: https:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` |
+| `Content-Security-Policy` | `default-src 'self'; script-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` |
 | `X-Content-Type-Options` | `nosniff` |
 | `Referrer-Policy` | `strict-origin-when-cross-origin` |
 | `Permissions-Policy` | camera / microphone / geolocation / payment / usb / … 全部 `()` |
 | `Strict-Transport-Security` | 仅在 `hsts_enabled = true` **且**请求确为 HTTPS 时下发（默认关闭） |
 
+- **外链图片/视频默认放行**（`img-src 'self' data: http: https:`、`media-src 'self' http: https:`）：
+  这是产品取舍 —— 配图/视频走外链，单机静态服务不必承担大文件带宽与磁盘（内置 `static/`
+  只放 favicon、logo 等小而特殊的资源）。代价是访问者会向第三方发起请求（IP/UA 可见）；
+  想收紧就在 `[security.csp]` 里**显式列出主机**
+  （例：`img-src = ["'self'", "data:", "https://cdn.example.com"]`）——
+  守卫只允许收窄，裸 `http:` / `https:` / `*` 会被 `tests/test_doc_consistency.py` 拒绝；
+- 协议相对 URL（`//host/x`）在 Markdown 与净化器层都被拒绝 —— 否则内容作者不写
+  `http(s)://` 也能引入任意第三方资源；
 - **404 / 403 / 500 也带全套头**（守卫与真实请求都验证过）；
 - `script-src 'none'` 是 Zero-JS 的直接落地：模板里没有 `<script>`、没有内联事件属性；
 - `style-src` 保留 `'unsafe-inline'` 是**刻意**的：CSP 的 `style-src` 同时管
@@ -151,20 +159,63 @@ proxy_set_header Host              $host;
 
 | 维度 | 默认 | 目的 |
 |---|---|---|
-| 登录 · 单邮箱 | 5 次 / 24 h | 定向爆破主防线 |
-| 登录 · 单 IP | 20 次 / 15 min | 辅助防线 |
-| 登录 · 全站 | 200 次 / 15 min | 分布式爆破最后闸门 |
+| 登录 · 单邮箱 | 5 次 / 24 h 窗口 | 定向爆破主防线 |
+| 登录 · 单 IP | 20 次 / 15 min 窗口 | 辅助防线 |
+| 登录 · 全站 | 200 次 / 15 min 窗口 | 分布式爆破最后闸门 |
 | 注册 · 单 IP | 5 次 / 1 h | 防批量注册 |
 | 评论 · 单用户 / 单 IP | 5 / 10 条每分钟 | 防刷屏 |
 
-- 计数落库（不是内存），多 worker 共享同一份计数；命中即 `429`（登录为友好文案 + 拒绝）；
+- 计数落库（不是内存），多 worker 共享同一份计数；
+- **判定与记账在同一个写事务里**（`db.reserve_login_attempt`）：并发请求不可能同时
+  读到"还没到阈值"而超发（旧实现是"读计数 → scrypt → 记账"，存在 TOCTOU）；
+- 达到阈值后是**渐进式冷却**（`60s × 2^(超出次数)`，封顶 24h）而不是一刀切硬锁：
+  偶尔打错的正常用户等约一分钟就能重试，持续爆破的等待时间迅速增长；
+  被限流时会下发 `Retry-After` 并在文案里给出真实等待时长；
+- 昂贵的 scrypt 校验**不持有 SQLite 写锁**（短事务：占位 → 释放 → 校验 → 收尾）；
 - 登录成功后该账号的失败流水**立即清除**，正常用户不会被历史失败拖累；
 - IP 计数的正确性依赖 §2 的信任边界：代理头配置错误 = IP 限流形同虚设；
 - 误锁处理（家庭 NAT 被拖累等）见 [OPS_GUIDE.md](OPS_GUIDE.md#五限流策略与误锁处理)。
 
+**账号删除的语义（身份删除 ≠ 内容删除）**——站点在删号页面明确列出：
+
+| 删除 | 保留（匿名化） |
+|---|---|
+| 登录凭据（密码）、邮箱地址、昵称、**全部会话**（所有设备登出） | 历史评论**正文**仍然可见，但不再与账号关联：显示为配置的占位昵称（如"已远行"），**不再显示用户编号**（避免用稳定 id 反查同一个人） |
+| 该邮箱的登录失败流水（含 IP） | 用户行本身（`is_deleted = 1`，保留 `id`/`created_at` 供评论归属与审计） |
+
+- 具体实现：`db.delete_user()`（逻辑删除 + 邮箱替换为不可注册占位值）、
+  `db.clear_login_attempts(原邮箱)`、`invalidate_user_sessions(...)`；
+- 是否**连评论正文一起删除**属于产品决策（当前选择保留，以维持讨论串完整性）；
+  若政策要求"彻底删除"，需要新增一个显式的正文清除入口并写进本表。
+
 **已知取舍**：注册失败不区分"邮箱已占用"与其它原因（防账号枚举），代价是文案不精确。
 
 ---
+
+### 13.1 登录的 CPU 成本（实测，未修改 scrypt 参数）
+
+`scrypt` 是 CPU 密集的（自描述哈希 `ln=15,r=8,p=1`）。在**同步 WSGI + Gunicorn
+sync worker** 下，每个并发登录占用一个 worker 直到哈希完成，因此并发升高时表现为
+排队（而不是失败）。真实压测（2 worker，临时数据库，全部 302 成功、无 5xx）：
+
+| 并发 | p50 | p95 | p99 | max | 墙钟 | 吞吐 |
+|---|---|---|---|---|---|---|
+| 1 | 84 ms | 84 ms | 84 ms | 84 ms | 86 ms | ~12/s |
+| 5 | 167 ms | 168 ms | 168 ms | 248 ms | 250 ms | ~20/s |
+| 20 | 453 ms | 815 ms | 815 ms | 820 ms | 826 ms | ~24/s |
+| 50 | 1064 ms | 1954 ms | 2035 ms | 2038 ms | 2054 ms | ~24/s |
+
+**结论与处置（刻意不改密码参数）**：
+
+- 吞吐上限 ≈ `workers / 单次哈希耗时`（实测约 24 次登录/秒 @2 worker）；并发超过
+  worker 数后延迟线性上升，这是同步模型的正常排队行为；
+- **写锁不参与**：scrypt 在校验前已经释放 SQLite 写锁（短事务占位 → 释放 → 校验），
+  因此登录风暴不会拖住评论/注册等写入；
+- 登录限流（邮箱/IP/全局三桶 + 渐进冷却）会把"爆破型并发"压在阈值内，
+  正常游客的偶发并发（个位数）延迟仍在百毫秒级；
+- 若站点真的会出现登录突发：**加 worker**（登录是 CPU-bound，加 worker 有效）
+  或在反代层加限速；**不要**为了压测数字调低 scrypt 参数；
+- 注册（`/register`）同样要付一次哈希，属同类成本。
 
 ## 9. 日志安全
 

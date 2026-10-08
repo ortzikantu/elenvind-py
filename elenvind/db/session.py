@@ -20,7 +20,7 @@
 import secrets
 import time
 
-from .db_base import write_tx
+from .transaction import write_tx
 
 #: 兜底默认值（配置缺失时使用）。config.toml 里的同名键是实际生效来源。
 DEFAULT_ABSOLUTE_DAYS = 30
@@ -28,25 +28,36 @@ DEFAULT_IDLE_DAYS = 15
 
 DAY_SECONDS = 86400
 
+#: 生效窗口（由装配层按 config.toml 注入；db 不读配置）
+_LIMITS = {"absolute_days": DEFAULT_ABSOLUTE_DAYS, "idle_days": DEFAULT_IDLE_DAYS}
+
+
+#: 装配层注入的窗口来源（`() -> (absolute_days, idle_days)`）。
+#: db 不认识 config，所以这里只保存一个 callable；调用时**实时**取值，
+#: 因此运行期改配置（测试里就是这么做的）会立刻生效。
+_limits_provider = None
+
+
+def set_limits_provider(provider) -> None:
+    """装配层注入会话过期窗口来源（`elenvind/app.py` 调用）。"""
+    global _limits_provider
+    _limits_provider = provider
+
 
 def _session_limits():
     """返回 (absolute_days, idle_days)；0 表示该维度不设过期。
 
-    配置在启动时已由 config.validate_config() 校验过类型与范围，
-    这里再做一次防御性转换：配置层若被绕过，也不能让非数值混进来。
+    数值来自装配层注入的 provider（config 层已校验类型/范围）；
+    未注入时用兜底默认值。这里再做一次防御性 `int()`：配置层若被绕过，
+    也不能让非数值混进比较运算。
     """
-    from .config import config
-
-    def read(key, default):
-        value = config.get(key, default)
+    if _limits_provider is not None:
         try:
-            return max(int(value), 0)
+            absolute, idle = _limits_provider()
+            return max(int(absolute), 0), max(int(idle), 0)
         except (TypeError, ValueError):
-            return default
-
-    return read("session_absolute_days", DEFAULT_ABSOLUTE_DAYS), \
-        read("session_idle_days", DEFAULT_IDLE_DAYS)
-
+            pass
+    return _LIMITS["absolute_days"], _LIMITS["idle_days"]
 
 def _is_expired(row, absolute_days: int, idle_days: int, now: float) -> bool:
     """判断会话行是否已过期（两个维度任一命中）。

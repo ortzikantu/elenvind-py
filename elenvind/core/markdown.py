@@ -122,10 +122,13 @@ def safe_media_url(value: str):
         return None
     if any(character in url for character in ("\"", "'", "<", ">", "&", "`", "\\")):
         return None
+    if url.startswith("//"):
+        # 协议相对：会去请求任意第三方（视频也能当追踪像素用）——拒绝，
+        # 站内媒体请写 /imgs/x.mp4 这样的单斜杠路径。
+        return None
     match = _SCHEME_RE.match(url)
     if match is None:
-        # 相对路径 / 协议相对（//host/x）：站内或同源资源，放行
-        return url
+        return url                       # 相对路径 / 锚点：放行
     return url if match.group(1).lower() in VIDEO_SCHEMES else None
 
 
@@ -209,6 +212,11 @@ def _safe_url(value: str):
         return None
     url = value.strip()
     if not url or _CONTROL_RE.search(url):
+        return None
+    if url.startswith("//"):
+        # 协议相对 URL（//evil.test/x）会继承页面协议去请求**任意第三方**：
+        # 内容作者不写 http(s):// 也能塞进外链图片/追踪像素，等于绕过白名单。
+        # 站内资源请写单斜杠绝对路径（/imgs/x.png）。
         return None
     match = _SCHEME_RE.match(url)
     if match is None:

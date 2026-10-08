@@ -90,7 +90,7 @@ class StoredXssTests(ElenvindTestCase):
                              f"payload {payload!r} was reflected verbatim")
 
     def test_comment_payloads_are_escaped(self):
-        from elenvind.core.db_comment import create_comment
+        from elenvind.db.comment import create_comment
 
         user_id, _ = self.create_user(nickname="Ann", email="ann@example.com")
         for payload in XSS_PAYLOADS:
@@ -138,14 +138,14 @@ class StoredXssTests(ElenvindTestCase):
         self._assert_no_injection(response.text, payload)
 
     def _make_user(self, nickname):
-        from elenvind.core.db_user import create_user
+        from elenvind.db.user import create_user
         from elenvind.core.security import hash_password
         existing = len(self._all_emails())
         email = f"user{existing + 1}@example.com"
         return create_user(nickname, email, hash_password("password-123"))
 
     def _all_emails(self):
-        from elenvind.core.db_base import connect
+        from elenvind.db import connect
         with connect() as conn:
             return [row["email"] for row in conn.execute("SELECT email FROM user")]
 
@@ -183,7 +183,7 @@ class ReflectedXssTests(ElenvindTestCase):
         走真实渲染路径：`build_comment_rows` 会转义评论正文，
         系统错误页渲染 `error_message` 时由 Jinja 自动转义。
         """
-        from elenvind.core.db_comment import create_comment
+        from elenvind.db.comment import create_comment
         from elenvind.core.templating import render_template
         from elenvind.modules.blog import logic as blog
 

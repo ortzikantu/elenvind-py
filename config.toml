@@ -175,9 +175,12 @@ hsts_include_subdomains = false    # 子域全部支持 HTTPS 后再开
 #        删掉会让 hero 图静默失效并刷 style-src-elem 报错）、
 #       default-src 'self'、object-src / base-uri / frame-ancestors 'none'。
 [security.csp]
-# 现用外链图片（hero 托管在 GitHub），因此保留 http/https 通配；
-# 若把图片全部收进站内（elenvind/static/imgs/），可收紧成 ["'self'", "data:"]。
-img-src = ["'self'", "data:", "http:", "https:"]
-# 视频同理：@video(url) 支持外部地址
-media-src = ["'self'", "http:", "https:"]
+# 代码默认已允许外链图片/视频（img-src 'self' data: http: https:、media-src 'self' http: https:），
+# 这是刻意的产品取舍：文章配图/视频走外链，单机静态服务不必承担大文件带宽与磁盘；
+# 内置 static/ 只放 favicon、logo 这类小而特殊的资源。
+#
+# 想收紧（例如只允许自己+指定 CDN，避免访问者向任意第三方发起请求）就显式写出主机：
+#   img-src = ["'self'", "data:", "https://raw.githubusercontent.com"]
+#   media-src = ["'self'", "https://www.w3schools.com"]
+# 守卫（tests/test_doc_consistency.py）只允许"收窄"：拒绝裸 "http:" / "https:" / "*"。
 

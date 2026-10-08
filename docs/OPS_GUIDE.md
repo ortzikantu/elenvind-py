@@ -54,7 +54,7 @@ journalctl -u elenvind -n 100 --no-pager      # 看 systemd 侧输出
 | INFO | **每个请求一行访问日志**（Core 统一记） | `Request handled: GET /article/post -> 200 in 3.4 ms (5120 bytes, ip=203.0.113.5, user=3, pid=2481)` |
 | INFO | 启动细节：日志文件、库路径、schema 版本、journal_mode、锁文件、耗时与 pid | `Database: /opt/elenvind-py/sqlite.db (schema v4, journal_mode=WAL, write lock /opt/elenvind-py/sqlite.db.write.lock)`、`Startup complete in 142 ms (pid=2481, 2 startup hook(s), locale=zh)` |
 | INFO | 认证审计：登录成功/失败、注册成功/被拒、改密、删号、注销 | `Login succeeded: user_id=3 ip=203.0.113.5`、`Logout: user_id=3 ip=…` |
-| INFO | 评论审计：发表、软删除、恢复 | `Comment created: slug=post user_id=3 parent_id=None ip=…` |
+| INFO | 评论审计：发表、涂黑删除、编辑 | `Comment created/redacted/edited: id=… slug=post user_id=…` |
 | DEBUG | 每笔写事务：耗时、改动行数、库路径 | `Write transaction committed: 2.1 ms, 1 row(s) changed (path=/opt/elenvind-py/sqlite.db)` |
 | DEBUG | 锁获取明细（无竞争时） | `Write lock acquired in 0.31 ms (path=…)` |
 | WARNING | 锁等待 ≥ 1s / 写事务 ≥ 1s | `Write lock wait 1101 ms (path=…)`、`Write transaction slow: 1523 ms, 1 row(s) changed (path=…)` |
@@ -116,12 +116,18 @@ grep "pid=2481" logs/app.log                      # 只跟某一个 worker 看
 ### 管理员
 
 - `config.toml` 顶层 `admin_user_id` 指定的用户即站长（默认 `1`，即最早注册的账号）：
-  导航带徽章、可删除任意评论、可恢复已删评论；
+  导航带徽章、可**涂黑**任意评论（不可逆）；
 - **要取消管理员**：把该键显式写为 `null`（`admin_user_id = null`）。
   写成 `0` / 负数 / 非整数会**拒绝启动**——这是刻意的，避免"以为关掉了管理入口、
   其实配置没生效"；
-- 恢复/删除是**软删除**：访客看到等长方块打码，站长看到删除线，可随时恢复；
-- **没有物理删除入口**：评论只做软删除，永久保留在库里（这是审计与误删恢复的前提）。
+- 删除 = **永久涂黑**：正文在数据库里被等长黑块（U+2588，上限 400 块）替换。
+  原文立即从库里消失，任何角色（含管理员）都无法恢复，**没有恢复入口**；
+- 保留评论行（`is_deleted = 1`）而不是物理删除，是为了 `parent_id` 树不散架 ——
+  被涂黑评论的子回复仍然挂在原来的位置上；
+- 作者可以**编辑自己的评论**（复用评论区同一个输入框：`?edit=<id>#comment-form`）；
+  管理员可以涂黑别人的话，但不能改写它；
+- 若确需"彻底移除某行"（例如法律要求），那是库外运维动作：停服 → 直接 DELETE →
+  自行处理其子树（产品内没有这个入口）。
   数据库层 `parent_id` 是 `ON DELETE SET NULL`，因此即便在库外手工清理了父行，
   子评论也会自动升级为顶层评论，不会跟着消失。
 
@@ -209,7 +215,7 @@ python smoke_driver.py    # 需要环境里已安装 gunicorn
 
 它会在临时目录（`.smoketmp/`）里起一个**真实的 Gunicorn（默认 2 个 worker）**
 并走完整流程：首页 / 文章 / Markdown / 自定义页面 / 内置样式表 / 登录 / 注册 /
-注销 / 改密 / 发表评论 / 回复评论 / 软删除 / 恢复 / SEO / 主题 / 404 / 405，
+注销 / 改密 / 发表评论 / 回复评论 / 涂黑删除 / 编辑评论 / SEO / 主题 / 404 / 405，
 以及请求体边界（411 / 413 / 415）与 Host 头投毒，共 61 项断言。
 
 端口默认自动挑选空闲端口；要固定端口可设 `SMOKE_PORT`，要改 worker 数可设
@@ -231,6 +237,11 @@ python smoke_driver.py    # 需要环境里已安装 gunicorn
 
 以上阈值都可在 `config.toml` 的 `[login_limits]` / `[comment_limits]` /
 `[register_limits]` 段落调整（见《配置文件使用指南》）。
+
+**限流现在是渐进式冷却**（不再是"锁 24 小时"）：达到阈值后等待时长 = `60s × 2^(超出次数)`，
+封顶 24 小时，冷却结束即可重试；被限流时响应带 `Retry-After`，日志里能看到
+`Login blocked (email failure limit): ip=… retry_after=…s`。
+正常用户偶尔打错密码，等约一分钟即可 —— 只有持续爆破会迅速逼近封顶。
 
 误锁/需要立即解锁（例如家庭 NAT 被他人拖累）：
 

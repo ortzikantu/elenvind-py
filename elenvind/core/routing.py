@@ -267,7 +267,7 @@ class Router:
         return (), tuple(allowed)
 
     # ---------- 调度 ----------
-    def dispatch(self, request, *, not_found=None, forbidden=None):
+    def dispatch(self, request, *, not_found=None, forbidden=None, bad_request=None):
         """执行一个请求：匹配 -> 逐个尝试候选路由 -> 安全闸门 -> handler。
 
         `not_found` / `forbidden` 是可选的自定义处理函数（模块用它们渲染
@@ -288,20 +288,24 @@ class Router:
 
         for route, params in candidates:
             try:
-                return self._run(route, params, request, forbidden)
+                return self._run(route, params, request, forbidden, bad_request)
             except RouteMiss:
                 # 该路由"路径匹配但资源不存在"（例如静态文件缺失）：
                 # 继续交给下一个候选，让自定义页面兜底有机会接手。
                 continue
         return not_found(request) if not_found else error_response(404)
 
-    def _run(self, route, params, request, forbidden):
+    def _run(self, route, params, request, forbidden, bad_request=None):
         """跑单个路由：安全闸门 + handler。抛出 `RouteMiss` 表示继续找下一个。"""
         try:
             # --- 默认 CSRF 保护：非安全方法一律校验 ---
             # 状态码用 400（与历史契约一致，也是"表单令牌无效"的常规语义）；
             # 认证/权限失败才是 403。
             if requires_protection(request.method) and not validate_request(request):
+                # 模块提供了 400 友好页就优先用它（UX：令牌过期时给出可操作提示）；
+                # 拿不到处理器才回落纯文本。安全语义不变：依旧 400、不写任何状态。
+                if bad_request is not None and request is not None:
+                    return bad_request(request)
                 return error_response(400, "Invalid CSRF token")
 
             # --- 认证与权限声明 ---

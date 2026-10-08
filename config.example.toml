@@ -211,8 +211,8 @@ hsts_include_subdomains = false  # 有子域且全部支持 HTTPS 时再开
 #   default-src 'self'
 #   script-src  'none'                    <- 本站 Zero-JS，直接掐断脚本执行链
 #   style-src   'self' 'unsafe-inline'    <- 必需，见下方说明
-#   img-src     'self' data: http: https:
-#   media-src   'self' http: https:
+#   img-src     'self' data: http: https:  <- 默认允许外链图片（减轻服务器压力）
+#   media-src   'self' http: https:        <- 默认允许外链视频
 #   font-src    'self'
 #   connect-src 'self'
 #   object-src  'none'
@@ -231,7 +231,13 @@ hsts_include_subdomains = false  # 有子域且全部支持 HTTPS 时再开
 # 想彻底去掉 'unsafe-inline'：先把 hero 改成非内联实现（写进 CSS 或用类名）。
 #
 # 用法：
-#   - 收紧：img-src = ["'self'", "data:"]        （不再允许任意外部图片）
+#   - 收紧为**显式主机 allowlist**（更保护访问者隐私，但外链只能来自这些主机）：
+#         img-src = ["'self'", "data:", "https://cdn.example.com"]
+#         media-src = ["'self'", "https://videos.example.com"]
+#     守卫只允许"收窄"：删掉默认里的 http:/https: 通配、换成具体主机；
+#     裸 "http:" / "https:" / "*" 会被拒绝（那等于允许任意第三方）。
+
+#   - 只允许站内：img-src = ["'self'", "data:"] / media-src = ["'self'"]
 #   - 关掉：object-src = false                    （该指令整条不输出）
 #   - 字符串也行：style-src = "'self' 'unsafe-inline'"
 #
@@ -239,6 +245,6 @@ hsts_include_subdomains = false  # 有子域且全部支持 HTTPS 时再开
 # 否则页面会被自己的 CSP 拦掉。
 [security.csp]
 # 下面两行是默认值，写出来只为示意；不改可以整段删掉。
-# img-src = ["'self'", "data:", "http:", "https:"]
-# media-src = ["'self'", "http:", "https:"]
+# img-src = ["'self'", "data:", "https://cdn.example.com"]
+# media-src = ["'self'", "https://videos.example.com"]
 

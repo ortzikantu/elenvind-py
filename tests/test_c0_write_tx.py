@@ -21,8 +21,10 @@ from pathlib import Path
 
 from tests.support import ElenvindTestCase
 
-from elenvind.core import db_base
-from elenvind.core.db_base import (
+from elenvind import db
+from elenvind.db import connection as db_connection
+from elenvind.db import transaction as db_transaction
+from elenvind.db import (
     connect,
     get_connection,
     init_db,
@@ -109,7 +111,7 @@ class WriteTransactionTests(ElenvindTestCase):
 
     def test_commit_failure_is_not_reported_as_success(self):
         """COMMIT 失败必须抛异常、回滚、释放锁 —— 绝不假装成功。"""
-        real_get_connection = db_base.get_connection
+        real_get_connection = db.get_connection
 
         class CommitAlwaysFails:
             def __init__(self, inner):
@@ -121,14 +123,14 @@ class WriteTransactionTests(ElenvindTestCase):
             def __getattr__(self, name):
                 return getattr(self._inner, name)
 
-        db_base.get_connection = lambda foreign_keys=True: CommitAlwaysFails(
+        db_transaction.get_connection = lambda foreign_keys=True: CommitAlwaysFails(
             real_get_connection(foreign_keys=foreign_keys))
         try:
             with self.assertRaises(sqlite3.OperationalError):
                 with write_tx() as conn:
                     conn.execute("INSERT INTO c0_write (tag) VALUES ('phantom')")
         finally:
-            db_base.get_connection = real_get_connection
+            db_transaction.get_connection = real_get_connection
 
         self.assertEqual(self._tags(), [])      # 没有"看不见的提交"
         with write_tx() as conn:                # 锁已释放
@@ -154,7 +156,7 @@ class WriteTransactionTests(ElenvindTestCase):
         这一条是**针对 flock 层**的证据：如果把 flock 去掉（变异测试），
         非阻塞取锁会成功，测试立刻失败。
         """
-        path = lock_path_for(db_base.DB_PATH)
+        path = lock_path_for(db_connection.DB_PATH)
         with write_tx() as conn:
             conn.execute("INSERT INTO c0_write (tag) VALUES ('scope')")
             probe = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -177,7 +179,7 @@ class WriteTransactionTests(ElenvindTestCase):
 
     def test_lock_is_held_on_the_rollback_path_too(self):
         """异常路径同样必须持锁到事务收尾（回滚+解锁在 finally 里）。"""
-        path = lock_path_for(db_base.DB_PATH)
+        path = lock_path_for(db_connection.DB_PATH)
         with self.assertRaises(ValueError):
             with write_tx() as conn:
                 conn.execute("INSERT INTO c0_write (tag) VALUES ('rollback-scope')")
@@ -197,18 +199,18 @@ class WriteTransactionTests(ElenvindTestCase):
         调到极小，于是 write_tx 的 `BEGIN IMMEDIATE` 会立刻报
         "database is locked"。要求：异常抛出、锁释放、fd 不泄漏。
         """
-        holder = sqlite3.connect(str(db_base.DB_PATH), timeout=1)
+        holder = sqlite3.connect(str(db_connection.DB_PATH), timeout=1)
         holder.isolation_level = None
         holder.execute("BEGIN IMMEDIATE")        # 非 write_tx 的连接占住写锁
-        original_timeout = db_base._BUSY_TIMEOUT_MS
-        db_base._BUSY_TIMEOUT_MS = 50            # 别让测试等默认的 5 秒
+        original_timeout = db_connection._BUSY_TIMEOUT_MS
+        db_connection._BUSY_TIMEOUT_MS = 50            # 别让测试等默认的 5 秒
         fds_before = len(os.listdir("/proc/self/fd"))
         try:
             with self.assertRaises(sqlite3.OperationalError):
                 with write_tx() as conn:
                     conn.execute("INSERT INTO c0_write (tag) VALUES ('never')")
         finally:
-            db_base._BUSY_TIMEOUT_MS = original_timeout
+            db_connection._BUSY_TIMEOUT_MS = original_timeout
             holder.rollback()
             holder.close()
         fds_after = len(os.listdir("/proc/self/fd"))
@@ -229,7 +231,7 @@ class WriteTransactionTests(ElenvindTestCase):
         """
         with write_tx() as conn:
             conn.execute("INSERT INTO c0_write (tag) VALUES ('sqlite-lock')")
-            other = sqlite3.connect(str(db_base.DB_PATH), timeout=0.05)
+            other = sqlite3.connect(str(db_connection.DB_PATH), timeout=0.05)
             other.isolation_level = None
             try:
                 with self.assertRaises(sqlite3.OperationalError) as caught:
@@ -266,10 +268,10 @@ class LockFileTests(ElenvindTestCase):
         # 注意：必须通过模块属性取当前数据库路径（测试夹具会替换 DB_PATH），
         # 直接 `from ... import DB_PATH` 拿到的是导入时的快照 —— 正是实现里
         # 刻意避免的那种"永久缓存路径"错误。
-        path = lock_path_for(db_base.DB_PATH)
+        path = lock_path_for(db_connection.DB_PATH)
         self.assertTrue(path.exists())
         # 数据库本体绝不能是锁文件
-        self.assertNotEqual(path, Path(db_base.DB_PATH))
+        self.assertNotEqual(path, Path(db_connection.DB_PATH))
         inode_before = os.stat(path).st_ino
         for _ in range(3):
             with write_tx() as conn:
@@ -280,7 +282,7 @@ class LockFileTests(ElenvindTestCase):
 
     def test_reads_are_not_blocked_by_a_held_write_lock(self):
         """读路径不参与 flock：别人持写锁时 SELECT 仍然可用（这是设计目标）。"""
-        path = lock_path_for(db_base.DB_PATH)
+        path = lock_path_for(db_connection.DB_PATH)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)

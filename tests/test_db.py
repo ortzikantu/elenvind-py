@@ -6,18 +6,19 @@ from pathlib import Path
 
 from tests.support import ElenvindTestCase
 
-from elenvind.core import db_base
-from elenvind.core.db_base import SCHEMA_VERSION, connect, init_db, migrate
-from elenvind.core.db_comment import create_comment, get_comment_by_id, get_comments_by_article
-from elenvind.core.db_login import (
+from elenvind import db
+from elenvind.db import connection as db_connection
+from elenvind.db import SCHEMA_VERSION, connect, init_db, migrate
+from elenvind.db.comment import create_comment, get_comment_by_id, get_comments_by_article
+from elenvind.db.auth import (
     cleanup_old_login_attempts,
     count_email_failures,
     count_ip_failures,
     record_login_attempt,
 )
-from elenvind.core.db_register import try_register_attempt
-from elenvind.core.db_session import create_session, delete_user_sessions, get_session_user
-from elenvind.core.db_user import (
+from elenvind.db.auth import try_register_attempt
+from elenvind.db.session import create_session, delete_user_sessions, get_session_user
+from elenvind.db.user import (
     create_user,
     delete_user,
     get_user_by_email,
@@ -63,7 +64,7 @@ class ConnectionTests(ElenvindTestCase):
         self.assertFalse(self.db_path.exists())
 
     def test_no_connection_leak_after_repeated_calls(self):
-        from elenvind.core.db_session import cleanup_expired_sessions
+        from elenvind.db.session import cleanup_expired_sessions
         self.create_user()
         for _ in range(50):
             get_user_number()
@@ -134,13 +135,13 @@ class SchemaTests(ElenvindTestCase):
 
         # 优先级是 ELENVIND_DB > config.database > 默认路径，
         # 因此要让 init_db() 作用于这个旧库，必须连环境变量一起指向它。
-        original_path = db_base.DB_PATH
+        original_path = db_connection.DB_PATH
         original_env = os.environ.get("ELENVIND_DB")
-        db_base.DB_PATH = legacy_path
+        db_connection.DB_PATH = legacy_path
         os.environ["ELENVIND_DB"] = str(legacy_path)
         try:
             init_db()
-            self.assertEqual(Path(db_base.DB_PATH), legacy_path)   # 确认打在旧库上
+            self.assertEqual(Path(db_connection.DB_PATH), legacy_path)   # 确认打在旧库上
             with connect() as check:
                 self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
                 rows = {row["content"]: row["parent_id"] for row in check.execute(
@@ -148,7 +149,7 @@ class SchemaTests(ElenvindTestCase):
                 sql = check.execute(
                     "SELECT sql FROM sqlite_master WHERE name = 'comment'").fetchone()[0]
         finally:
-            db_base.DB_PATH = original_path
+            db_connection.DB_PATH = original_path
             if original_env is None:
                 os.environ.pop("ELENVIND_DB", None)
             else:
@@ -171,7 +172,7 @@ class SchemaTests(ElenvindTestCase):
         于是老会话要么在原 expires 到期，要么在滑动窗口到期，取先到者。
         """
         import time as _time
-        from elenvind.core.db_base import _LEGACY_SESSION_DAYS
+        from elenvind.db import _LEGACY_SESSION_DAYS
 
         legacy_dir = self.tmpdir / "legacy-session"
         legacy_dir.mkdir()
@@ -205,9 +206,9 @@ class SchemaTests(ElenvindTestCase):
         conn.commit()
         conn.close()
 
-        original_path = db_base.DB_PATH
+        original_path = db_connection.DB_PATH
         original_env = os.environ.get("ELENVIND_DB")
-        db_base.DB_PATH = legacy_path
+        db_connection.DB_PATH = legacy_path
         os.environ["ELENVIND_DB"] = str(legacy_path)
         try:
             init_db()
@@ -220,7 +221,7 @@ class SchemaTests(ElenvindTestCase):
                         for row in check.execute(
                             "SELECT token, created_at, last_seen FROM session")}
         finally:
-            db_base.DB_PATH = original_path
+            db_connection.DB_PATH = original_path
             if original_env is None:
                 os.environ.pop("ELENVIND_DB", None)
             else:
@@ -246,8 +247,8 @@ class SchemaTests(ElenvindTestCase):
     def test_migrated_legacy_session_keeps_original_deadline(self):
         """迁移后那个"还没到期"的老会话仍能通过校验，不会被凭空延长或提前踢掉。"""
         import time as _time
-        from elenvind.core.db_base import _LEGACY_SESSION_DAYS
-        from elenvind.core.db_session import get_session_user
+        from elenvind.db import _LEGACY_SESSION_DAYS
+        from elenvind.db.session import get_session_user
 
         legacy_dir = self.tmpdir / "legacy-live"
         legacy_dir.mkdir()
@@ -273,16 +274,16 @@ class SchemaTests(ElenvindTestCase):
         conn.commit()
         conn.close()
 
-        original_path = db_base.DB_PATH
+        original_path = db_connection.DB_PATH
         original_env = os.environ.get("ELENVIND_DB")
-        db_base.DB_PATH = legacy_path
+        db_connection.DB_PATH = legacy_path
         os.environ["ELENVIND_DB"] = str(legacy_path)
         try:
             init_db()
             # 默认绝对 30 天 / 滑动 15 天，7 天前创建的会话两个维度都没超
             self.assertEqual(get_session_user("live-token"), 1)
         finally:
-            db_base.DB_PATH = original_path
+            db_connection.DB_PATH = original_path
             if original_env is None:
                 os.environ.pop("ELENVIND_DB", None)
             else:
@@ -454,29 +455,31 @@ class SqlInjectionTests(ElenvindTestCase):
         self.assertEqual(get_comment_by_id(comment_id)["content"], payload)
         self.assertEqual(len(get_comments_by_article("post")), 1)
 
-    #: 允许的动态 SQL 站点（键=相对 elenvind/ 的路径，值=该文件允许出现的次数）。
-    #: 只放行"插值内容不是用户输入"的情形，每一处都必须在这里说明理由：
-    #:   core/db_base.py（3 处）
-    #:     - `PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}`：模块常量；
-    #:     - `PRAGMA user_version={int(version)}`：int() 强转后的整数；
-    #:     - `SELECT COUNT(*) FROM {table}`：表名是代码里写死的字面量。
-    #:     （SQLite 的 PRAGMA 不支持参数绑定，这两处 f-string 无法避免。）
-    #:   core/db_session.py（1 处）
-    #:     - `DELETE FROM session WHERE {' OR '.join(clauses)}`：
-    #:       拼接的是本函数内构造的常量子句，阈值全部走 params 绑定。
-    #:   core/db_user.py（1 处）
-    #:     - `UPDATE user SET {', '.join(fields)}`（update_user_profile）：
-    #:       拼接的是字面量列名（"nickname = ?" / "email = ?"），
-    #:       所有**值**都走 params 绑定；列名不来自任何外部输入。
-    #:   core/db_prune.py（1 处）
-    #:     - `DELETE FROM {table} WHERE {column} < ?`（prune）：
-    #:       表名/列名由调用方以字面量传入（如 "comment_rate"/"attempted_at"），
-    #:       阈值走 params 绑定；本模块不接受任何外部输入。
+    #: 允许的动态 SQL 站点（键=相对 elenvind/ 的路径，值=允许出现次数）。
+    #: 只放行"插值内容不是用户输入"的情形，每一处都必须在下面说明理由。
+    #: 结构迁移后这些文件位于一级 `db/` 包（旧键 `core/db*.py` 早已失效，
+    #: 导致本守卫实际上从不放行任何站点 —— 现在按真实路径登记）。
     ALLOWED_DYNAMIC_SQL = {
-        "core/db_base.py": 3,
-        "core/db_session.py": 1,
-        "core/db_user.py": 1,
-        "core/db_prune.py": 1,
+        # `PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}`：模块常量。
+        # （SQLite 的 PRAGMA 不支持参数绑定，无法避免 f-string。）
+        "db/connection.py": 1,
+        # `PRAGMA user_version={int(version)}`：int() 强转后的整数；
+        # `SELECT COUNT(*) FROM {table}`：表名是迁移代码里写死的字面量。
+        "db/migration.py": 2,
+        # `DELETE FROM session WHERE {' OR '.join(clauses)}`：
+        # 拼接的是本函数内构造的常量子句，阈值全部走 params 绑定。
+        "db/session.py": 1,
+        # `UPDATE user SET {', '.join(fields)}`（update_user_profile）：
+        # 拼接的是字面量列名（"nickname = ?" / "email = ?"），值全部走 params。
+        "db/user.py": 1,
+        # `SELECT ... WHERE ... {clause}`（_count_and_last）：
+        # 片段来自模块内 `_COUNT_SCOPES` 白名单（"any"/"email"/"ip"），
+        # 调用方只能传维度名，值全部走 params 绑定。
+        "db/auth.py": 1,
+        # `DELETE FROM {table} WHERE {column} < ?`（prune）：
+        # 表名/列名来自 `maintenance.PRUNABLE` **白名单**校验，越界直接 ValueError；
+        # 阈值走 params 绑定。（见 db/maintenance.py 的 _validate_target）
+        "db/maintenance.py": 1,
     }
 
     def test_no_sql_string_interpolation_in_source(self):
@@ -585,13 +588,13 @@ class MigrationTransactionTests(ElenvindTestCase):
         return path
 
     def _with_db(self, path, fn):
-        original_path, original_env = db_base.DB_PATH, os.environ.get("ELENVIND_DB")
-        db_base.DB_PATH = path
+        original_path, original_env = db_connection.DB_PATH, os.environ.get("ELENVIND_DB")
+        db_connection.DB_PATH = path
         os.environ["ELENVIND_DB"] = str(path)
         try:
             return fn()
         finally:
-            db_base.DB_PATH = original_path
+            db_connection.DB_PATH = original_path
             if original_env is None:
                 os.environ.pop("ELENVIND_DB", None)
             else:
@@ -611,8 +614,9 @@ class MigrationTransactionTests(ElenvindTestCase):
 
     def test_failed_migration_rolls_back_ddl_too(self):
         """迁移中途失败时，连 ALTER/CREATE 这类 DDL 也必须回滚。"""
-        from elenvind.core import db_base as module
-        from elenvind.core.db_base import migrate
+        from elenvind import db
+        from elenvind.db import migration as module
+        from elenvind.db import migrate
 
         path = self._legacy_db("rollback.db")
         before_version, _, before_count, before_sql = self._state(path)
@@ -640,7 +644,7 @@ class MigrationTransactionTests(ElenvindTestCase):
 
     def test_leftover_backup_table_refuses_to_start(self):
         """发现 *_legacy 残留必须拒绝启动，而不是继续并搁置数据。"""
-        from elenvind.core.db_base import MigrationError, SCHEMA_VERSION, init_db
+        from elenvind.db import MigrationError, SCHEMA_VERSION, init_db
 
         path = self._legacy_db("leftover.db")
         conn = sqlite3.connect(path)
@@ -672,7 +676,7 @@ class MigrationTransactionTests(ElenvindTestCase):
         self.assertEqual(count, 0)
 
     def test_normal_migration_preserves_data_and_is_idempotent(self):
-        from elenvind.core.db_base import SCHEMA_VERSION, init_db, migrate
+        from elenvind.db import SCHEMA_VERSION, init_db, migrate
 
         path = self._legacy_db("normal.db")
         self._with_db(path, init_db)
@@ -704,7 +708,8 @@ class MigrationTransactionTests(ElenvindTestCase):
         import ast
         import inspect
         import textwrap
-        from elenvind.core import db_base as module
+        from elenvind import db
+        from elenvind.db import migration as module
 
         def all_calls(source):
             tree = ast.parse(textwrap.dedent(source))
@@ -828,7 +833,7 @@ class HotQueryIndexTests(ElenvindTestCase):
         import ast
         import inspect
         import textwrap
-        from elenvind.core.db_user import get_user_by_email
+        from elenvind.db.user import get_user_by_email
 
         tree = ast.parse(textwrap.dedent(inspect.getsource(get_user_by_email)))
         literals = [node.value for node in ast.walk(tree)
@@ -856,7 +861,7 @@ class SchemaV4MigrationTests(ElenvindTestCase):
     """v4 迁移：补会话索引 + 规范化历史大写邮箱。"""
 
     def test_legacy_uppercase_emails_are_normalized(self):
-        from elenvind.core.db_base import SCHEMA_VERSION, init_db
+        from elenvind.db import SCHEMA_VERSION, init_db
 
         path = self.tmpdir / "v3.db"
         conn = sqlite3.connect(path)
@@ -890,8 +895,8 @@ class SchemaV4MigrationTests(ElenvindTestCase):
         conn.commit()
         conn.close()
 
-        original_path, original_env = db_base.DB_PATH, os.environ.get("ELENVIND_DB")
-        db_base.DB_PATH = path
+        original_path, original_env = db_connection.DB_PATH, os.environ.get("ELENVIND_DB")
+        db_connection.DB_PATH = path
         os.environ["ELENVIND_DB"] = str(path)
         try:
             init_db()
@@ -910,14 +915,14 @@ class SchemaV4MigrationTests(ElenvindTestCase):
             self.assertEqual(counts, (2, 1, 1), "迁移不得丢数据")
             self.assertIn("idx_session_user", indexes)
         finally:
-            db_base.DB_PATH = original_path
+            db_connection.DB_PATH = original_path
             if original_env is None:
                 os.environ.pop("ELENVIND_DB", None)
             else:
                 os.environ["ELENVIND_DB"] = original_env
 
     def test_migration_is_idempotent(self):
-        from elenvind.core.db_base import migrate
+        from elenvind.db import migrate
         before = self._snapshot()
         for _ in range(3):
             migrate()

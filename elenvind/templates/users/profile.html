@@ -96,6 +96,10 @@
   <details class="panel danger-zone">
     <summary><h2>{{ t('user_section_delete') }}</h2></summary>
     <p class="danger-note">{{ t('user_delete_note') }}</p>
+    <ul class="danger-note">
+      <li>{{ t('user_delete_removed') }}</li>
+      <li>{{ t('user_delete_kept', name=deleted_user_nickname) }}</li>
+    </ul>
     <form method="post" action="/user" class="field-grid">
       {{ csrf_input() }}
       <input type="hidden" name="action" value="delete_account">

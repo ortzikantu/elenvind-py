@@ -580,81 +580,209 @@ sup:target {
     padding-bottom: 0.4rem;
     border-bottom: 1px solid var(--line);
 }
+.comment-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
 .comment {
-    margin: 0.6rem 0;
-    padding: 0.8rem 1.1rem;
+    position: relative;
+    padding: 0.9rem 1.1rem 1rem;
     background: var(--card);
     border: 1px solid var(--border);
+    border-left: 3px solid var(--line);
     border-radius: var(--radius);
 }
-.comment-reply {
-    margin-left: 2rem;
-    font-size: 0.94em;
+.comment.is-redacted {
     background: var(--bg);
-    border-color: var(--line);
+    border-left-color: var(--faint);
 }
-.comment .meta {
+.comment-reply {
+    margin-left: 1.75rem;
+}
+/* 回复层级：一条短横线连到父评论（纯 CSS，不需要图片） */
+.comment-reply::before {
+    content: "";
+    position: absolute;
+    top: 1.35rem;
+    left: -1.15rem;
+    width: 0.75rem;
+    height: 1px;
+    background: var(--border);
+}
+.comment-meta {
     display: flex;
     flex-wrap: wrap;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 0.4rem 1rem;
+    align-items: center;
+    gap: 0.3rem 0.7rem;
     color: var(--muted);
     font-size: 0.8rem;
 }
+.comment-author-name {
+    color: var(--text);
+}
+.comment-author {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    color: var(--text);
+    font-size: 0.86rem;
+    font-weight: 600;
+}
+.comment-time {
+    color: var(--faint);
+}
 .comment-actions {
     display: flex;
-    align-items: center;
-    gap: 0.2rem 0.9rem;
     flex-wrap: wrap;
+    align-items: center;
+    gap: 0.15rem 0.8rem;
+    margin-left: auto;
 }
-.comment-body {
-    margin: 0.4rem 0 0;
-}
-.reply-to {
-    color: var(--faint);
-    font-size: 0.88em;
-}
-.comment-content.is-deleted {
-    text-decoration: line-through;
-    opacity: 0.75;
-}
-.comment-form {
+.comment-action-form {
     display: inline;
 }
-.comment-actions button {
-    background: none;
-    border: none;
+.comment-actions button,
+.comment-actions a {
+    margin: 0;
     padding: 0;
+    background: none;
+    border: 0;
+    border-bottom: 1px solid transparent;
     font: inherit;
-    font-size: 0.82rem;
+    font-size: 0.8rem;
     color: var(--muted);
     cursor: pointer;
-    text-decoration: underline;
-    text-decoration-color: transparent;
-    text-underline-offset: 3px;
+    text-decoration: none;
 }
-.comment-actions button:hover {
+.comment-actions button:hover,
+.comment-actions a:hover {
     color: var(--primary);
-    text-decoration-color: var(--primary);
+    border-bottom-color: currentColor;
+}
+a.edit-link {
+    color: var(--muted);
 }
 button.delete-link {
     color: var(--danger);
 }
-button.restore-link {
-    color: var(--ok);
-}
 a.reply-link {
     color: var(--primary);
-    font-size: 0.82rem;
 }
-a.reply-link:hover {
-    color: var(--primary-soft);
+.comment-body {
+    margin: 0.55rem 0 0;
+    line-height: 1.65;
+}
+.reply-to {
+    display: inline-block;
+    margin-right: 0.35rem;
+    padding: 0.05rem 0.45rem;
+    background: var(--mark);
+    color: var(--primary);
+    border-radius: 4px;
+    font-size: 0.78rem;
+}
+/* 涂黑提示语：紧跟黑块之后（"数据删除"），小而克制，不抢正文的注意力 */
+.comment-redacted-tag {
+    margin-left: 0.55rem;
+    color: var(--faint);
+    font-size: 0.75rem;
+    letter-spacing: 0;
+    vertical-align: 0.15em;
+}
+/* "涂黑"：正文在数据库里已被 U+2588 替换，这里只负责观感 —— */
+/* 实体方块 + 字距 = 一条涂黑带；禁止选中，避免看起来像可复制的文本 */
+.comment-content.is-redacted {
+    display: inline-block;
+    max-width: 100%;
+    color: var(--text);
+    letter-spacing: 0.1em;
+    line-height: 1.05;
+    overflow-wrap: anywhere;
+    user-select: none;
+    cursor: default;
+}
+.comment-empty,
+.comment-login-hint {
+    color: var(--muted);
 }
 .comments h3 {
+    margin: 0 0 0.6rem;
     color: var(--text);
-    margin: 1.8rem 0 0.6rem;
     font-size: 1.05em;
+}
+
+/* ---------- 评论输入框（发表 / 编辑复用同一个表单） ---------- */
+.comment-compose {
+    margin-top: 2rem;
+    padding: 1rem 1.15rem 1.15rem;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    scroll-margin-top: 1.5rem;
+}
+.comment-compose.is-editing {
+    border-color: var(--primary);
+}
+.compose-form textarea {
+    box-sizing: border-box;
+    max-width: none;
+    min-height: 7rem;
+    padding: 0.6rem 0.75rem;
+    line-height: 1.6;
+}
+.compose-hint {
+    margin: 0;
+    color: var(--faint);
+    font-size: 0.78rem;
+}
+.compose-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    margin-top: 0.6rem;
+}
+.compose-buttons {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+}
+.compose-cancel {
+    color: var(--muted);
+    border-bottom: 1px solid transparent;
+    font-size: 0.85rem;
+    text-decoration: none;
+}
+.compose-cancel:hover {
+    color: var(--primary);
+    border-bottom-color: currentColor;
+}
+.comment-compose button[type="submit"] {
+    margin-top: 0;
+    padding: 0.4rem 1.3rem;
+    color: #fff;
+    background: var(--primary);
+    border: 1px solid var(--primary);
+    border-radius: 6px;
+    font-weight: 600;
+}
+.comment-compose button[type="submit"]:hover {
+    color: #fff;
+    background: var(--primary-soft);
+    border-color: var(--primary-soft);
+}
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
 }
 
 /* ---------- 表单与控件 ---------- */
@@ -917,4 +1045,20 @@ button[type="submit"].btn-danger:hover {
         transition: none !important;
         animation: none !important;
     }
+}
+
+/* ---------- 主要动作按钮（评论提交等） ---------- */
+/* 放在文件末尾：通用 `button[type="submit"]` 与它同权重，靠顺序生效 */
+button.btn-primary {
+    margin-top: 0;
+    color: #fff;
+    background: var(--primary);
+    border: 1px solid var(--primary);
+    border-radius: 6px;
+    font-weight: 600;
+}
+button.btn-primary:hover {
+    color: #fff;
+    background: var(--primary-soft);
+    border-color: var(--primary-soft);
 }

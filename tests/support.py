@@ -35,7 +35,8 @@ TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("ELENVIND_DB", str(TEST_TMP_ROOT / "fallback.db"))
 
 from elenvind.core import config as config_module          # noqa: E402
-from elenvind.core import db_base                          # noqa: E402
+from elenvind import db
+from elenvind.db import connection as db_connection                          # noqa: E402
 from elenvind.core import lifespan as lifespan_module      # noqa: E402
 from elenvind.core import console as console_module        # noqa: E402
 from elenvind.modules.blog import logic as blog_logic     # noqa: E402
@@ -254,10 +255,10 @@ class AppHarness:
         就是真实的启动序列；启动失败时异常直接向上抛（不会出现"夹具断言失败
         掩盖配置错误"的情况）。
         """
-        from elenvind.app import STARTUP_HOOKS
+        from elenvind.app import STARTUP_HOOKS, prepare_database
         from elenvind.core.lifespan import startup
 
-        startup(STARTUP_HOOKS)
+        startup(STARTUP_HOOKS, prepare_database=prepare_database)
         self.started = True
 
     # ---------- HTTP ----------
@@ -351,10 +352,10 @@ class ElenvindTestCase(unittest.TestCase):
         (self.tmpdir / "custom_pages").mkdir(parents=True)
         self.db_path = self.tmpdir / "test.db"
 
-        # 每个测试独立的数据库文件：所有模块都通过 db_base.DB_PATH 取路径
-        self._original_db_path = db_base.DB_PATH
+        # 每个测试独立的数据库文件：所有模块都通过 db_connection.DB_PATH 取路径
+        self._original_db_path = db_connection.DB_PATH
         self._original_db_env = os.environ.get("ELENVIND_DB")
-        db_base.DB_PATH = self.db_path
+        db_connection.DB_PATH = self.db_path
         os.environ["ELENVIND_DB"] = str(self.db_path)
 
         # 内容目录也隔离，避免读到真实 articles/custom_pages（setUp 已建好）
@@ -379,7 +380,7 @@ class ElenvindTestCase(unittest.TestCase):
 
     def tearDown(self):
         lifespan_module.SKIP_CONFIG_LOAD["value"] = False
-        db_base.DB_PATH = self._original_db_path
+        db_connection.DB_PATH = self._original_db_path
         if self._original_db_env is None:
             os.environ.pop("ELENVIND_DB", None)
         else:
@@ -395,11 +396,11 @@ class ElenvindTestCase(unittest.TestCase):
         pages_logic._file_stats = None
         # 机会式清理的"上次清理时间"是模块级内存状态：不重置的话，
         # 前一个用例刚清理过会让后一个用例的清理被节流跳过（顺序耦合）。
-        from elenvind.core.db_prune import reset_state as reset_prune_state
+        from elenvind.db.maintenance import reset_state as reset_prune_state
         reset_prune_state()
         from elenvind.core.templating import reset_environment
         reset_environment()
-        from elenvind.core.db_user import _invalidate_user_count
+        from elenvind.db.user import _invalidate_user_count
         _invalidate_user_count()
         _remove_tmpdir(self.tmpdir)
 
@@ -487,7 +488,7 @@ class ElenvindTestCase(unittest.TestCase):
     def create_user(self, nickname="Alice", email="alice@example.com",
                     password="correct horse battery", is_admin=False):
         """直接建用户，返回 (user_id, password)。"""
-        from elenvind.core.db_user import create_user
+        from elenvind.db.user import create_user
         from elenvind.core.security import hash_password
 
         user_id = create_user(nickname, email, hash_password(password))

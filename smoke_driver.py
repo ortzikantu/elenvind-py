@@ -27,7 +27,8 @@ import uuid
 from http.cookiejar import CookieJar
 from pathlib import Path
 
-from elenvind.core import db_base
+from elenvind import db
+from elenvind.db import connection as db_connection
 from elenvind.core.config import ROOT, config, load_config, validate_config, apply_runtime_config
 
 # 不使用 tempfile.mkdtemp：Windows 上它给出的目录权限仅创建者可写，
@@ -46,7 +47,8 @@ import json
 import os
 
 from elenvind.core import config as config_module
-from elenvind.core import db_base
+from elenvind import db
+from elenvind.db import connection as db_connection
 from elenvind.core import lifespan as lifespan_module
 
 with open(os.environ["ELENVIND_SMOKE_CONFIG"], "r", encoding="utf-8") as handle:
@@ -55,15 +57,15 @@ with open(os.environ["ELENVIND_SMOKE_CONFIG"], "r", encoding="utf-8") as handle:
 config_module.load_config()
 config_module.config.update(overrides)
 os.environ["ELENVIND_DB"] = overrides["database"]
-db_base.DB_PATH = overrides["database"]
 config_module.validate_config()
 config_module.apply_runtime_config()
 # 让 startup() 沿用注入的配置（否则它会重读仓库 config.toml 覆盖临时路径）
 lifespan_module.SKIP_CONFIG_LOAD["value"] = True
 
-from elenvind.app import app as _app            # noqa: E402
+from elenvind.app import STARTUP_HOOKS, app as _app, prepare_database   # noqa: E402
 
-lifespan_module.startup()
+# 数据库启动（路径解析 → 建表/迁移 → 清理）由装配层提供，与生产入口一致
+lifespan_module.startup(STARTUP_HOOKS, prepare_database=prepare_database)
 application = _app
 '''
 
@@ -148,7 +150,7 @@ def prepare_config():
         encoding="utf-8")
     (TMP / "custom_pages" / "about.md").write_text("About **page**.", encoding="utf-8")
     os.environ["ELENVIND_DB"] = overrides["database"]
-    db_base.DB_PATH = Path(overrides["database"])
+    db_connection.DB_PATH = Path(overrides["database"])
     validate_config()
     apply_runtime_config()
     return overrides
@@ -409,7 +411,7 @@ def run_checks(server):
     import sqlite3
     absolute_days = int(config.get("session_absolute_days", 30))
     idle_days = int(config.get("session_idle_days", 15))
-    db_file = db_base.DB_PATH
+    db_file = db_connection.DB_PATH
     conn = sqlite3.connect(db_file)
     conn.row_factory = sqlite3.Row
     try:
@@ -448,7 +450,7 @@ def run_checks(server):
     # 回复评论：点"回复"会带 ?reply_to=N 重新打开文章页
     # （回归：这里曾因取单条评论时缺 user 列而 500）
     import sqlite3
-    conn = sqlite3.connect(db_base.DB_PATH)
+    conn = sqlite3.connect(db_connection.DB_PATH)
     root_id = conn.execute("SELECT id FROM comment").fetchone()[0]
     conn.close()
     status, body, _ = fetch(opener, "GET", f"/article/smoke?reply_to={root_id}")
@@ -470,17 +472,38 @@ def run_checks(server):
 
     # 删评论
     import sqlite3
-    conn = sqlite3.connect(db_base.DB_PATH)
+    conn = sqlite3.connect(db_connection.DB_PATH)
     comment_id = conn.execute("SELECT id FROM comment").fetchone()[0]
     conn.close()
+    # 编辑评论（复用同一个输入框：编辑端点 + 预填的 GET 视图）
+    status, body, _ = fetch(opener, "GET", f"/article/smoke?edit={comment_id}")
+    import re as _re
+    _ta = _re.search(r"<textarea[^>]*>(.*?)</textarea>", body, _re.S)
+    check("编辑视图预填正文",
+          'name="content"' in body and _ta is not None
+          and _ta.group(1).strip() == "hello from smoke test",
+          f"status={status} textarea={(_ta.group(1)[:40] if _ta else None)!r}")
+    status, _, _ = fetch(opener, "POST", f"/article/smoke/comment/edit/{comment_id}",
+                         {"csrf_token": token, "content": "edited by smoke"})
+    check("编辑评论 302", status == 302, status)
+    status, body, _ = fetch(opener, "GET", "/article/smoke")
+    check("编辑后正文已更新",
+          "edited by smoke" in body and "hello from smoke test" not in body, status)
+
+    # 删评论 = 永久涂黑（原文从数据库里消失，且没有恢复入口）
     status, _, _ = fetch(opener, "POST", f"/article/smoke/comment/delete/{comment_id}",
                          {"csrf_token": token})
     check("删评论 302", status == 302, status)
     status, body, _ = fetch(opener, "GET", "/article/smoke")
-    check("删除后打码/划线", "is-deleted" in body)
+    check("删除后涂黑", "is-redacted" in body and "edited by smoke" not in body, status)
+    conn = sqlite3.connect(db_connection.DB_PATH)
+    stored = conn.execute("SELECT content FROM comment WHERE id = ?",
+                          (comment_id,)).fetchone()[0]
+    conn.close()
+    check("库里原文已被涂黑替换", set(stored) == {"\u2588"}, repr(stored[:8]))
     status, _, _ = fetch(opener, "POST", f"/article/smoke/comment/restore/{comment_id}",
                          {"csrf_token": token})
-    check("恢复评论 302", status == 302, status)
+    check("恢复入口已移除", status in (404, 405), status)
 
     # 改密 → 强制重新登录
     status, _, headers = fetch(opener, "POST", "/user",

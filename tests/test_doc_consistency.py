@@ -33,7 +33,7 @@ def read(relative):
 class SessionLifetimeDocsTests(ElenvindTestCase):
     def test_documented_session_days_match_code(self):
         """文档里写的绝对/空闲天数必须是代码里的默认值。"""
-        from elenvind.core.db_session import DEFAULT_ABSOLUTE_DAYS, DEFAULT_IDLE_DAYS
+        from elenvind.db.session import DEFAULT_ABSOLUTE_DAYS, DEFAULT_IDLE_DAYS
 
         combined = read("docs/CONFIGURATION.md") + read("docs/OPS_GUIDE.md")
         self.assertIn(str(DEFAULT_ABSOLUTE_DAYS), combined,
@@ -254,8 +254,21 @@ class ConfigParityTests(ElenvindTestCase):
             f"config.toml 独有 {sorted(only_real)}；"
             f"config.example.toml 独有 {sorted(only_example)}")
 
-    def test_explicit_csp_directives_equal_code_defaults(self):
-        """config.toml 显式写出的 CSP 指令不得比代码默认更宽松。"""
+    #: 默认值里的"通配"标记：被替换成显式主机属于**收窄**，允许
+    WILDCARDS = ("http:", "https:")
+
+    def test_explicit_csp_directives_never_widen_the_defaults(self):
+        """config.toml 显式写出的 CSP 指令只能收窄，不能放开。
+
+        允许两种形态：
+
+        1. 与代码默认**完全一致**；
+        2. **主机 allowlist**：把默认里的 `http:` / `https:` 通配替换成具体
+           origin（如 `https://cdn.example.com`），其余保持默认。
+
+        禁止：裸 `http:` / `https:` / `*`（那等于允许任意第三方资源 ——
+        访问者的 IP/UA 会交给对方），或删掉默认里已有的限制。
+        """
         from elenvind.core.security import DEFAULT_CSP_DIRECTIVES
 
         configured = (tomllib.loads(read("config.toml"))
@@ -266,10 +279,22 @@ class ConfigParityTests(ElenvindTestCase):
             with self.subTest(directive=name):
                 expected = tuple(DEFAULT_CSP_DIRECTIVES[name])
                 actual = tuple(values) if isinstance(values, list) else (values,)
-                self.assertEqual(
-                    set(actual), set(expected),
-                    f"config.toml 的 {name} = {actual} 与代码默认 {expected} 不同"
-                    "（放宽 CSP 请显式在文档里说明，而不是顺手改配置）")
+                if set(actual) == set(expected):
+                    continue
+                removed = set(expected) - set(actual)
+                added = [value for value in actual if value not in expected]
+                self.assertTrue(
+                    removed <= set(self.WILDCARDS),
+                    f"{name} 删掉了默认里的限制 {sorted(removed)}（只能收窄，不能放开）")
+                for value in added:
+                    self.assertRegex(
+                        str(value), r"^https?://[A-Za-z0-9.-]+$",
+                        f"{name} 新增了非具体主机的来源 {value!r}："
+                        "请写显式主机（https://cdn.example.com），不要用 http:/https:/*")
+                for value in actual:
+                    self.assertTrue(
+                        str(value) not in ("*", "'unsafe-eval'"),
+                        f"{name} 出现了通配来源 {value!r}")
 
 
 class MediaSrcQuotingTests(ElenvindTestCase):

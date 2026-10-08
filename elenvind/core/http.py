@@ -262,15 +262,13 @@ class Request:
         return headers
 
     def invalidate_session_cookie(self):
-        """作废本次请求的会话：清服务端会话 + 让浏览器 Cookie 立即过期。
+        """让浏览器 Cookie 立即过期（**不碰数据库**）。
 
-        这也是模块侧"我只想让这个会话失效"的**唯一**入口 ——
+        HTTP 层只负责"告诉浏览器丢掉它"；服务端会话行的删除由调用方通过
+        `core.session.logout_user/invalidate_user_sessions(store=…)` 完成 ——
+        core.http 不认识 db。这也是模块侧"我只想让这个会话失效"的唯一入口：
         模块不拼 Cookie、不 import SESSION_COOKIE。
         """
-        from .session import delete_session
-
-        if self.session_token:
-            delete_session(self.session_token)
         self.session_token = None
         self.user = None
         self._session_cookie_dirty = False

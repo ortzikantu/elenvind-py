@@ -360,7 +360,7 @@ class ClientIpTrustTests(ElenvindTestCase):
         self.assertIn("Too many failed attempts from this address", blocked.text,
                       "伪造 XFF 前缀让攻击者每个请求换一个 IP，从而绕过 IP 限流")
         # 落库的 IP 必须是真实客户端，不是攻击者自选的地址
-        from elenvind.core.db_base import connect
+        from elenvind.db import connect
         with connect() as conn:
             rows = {row["ip"] for row in conn.execute(
                 "SELECT ip FROM login_attempts WHERE email = ?", ("rotate@example.com",))}

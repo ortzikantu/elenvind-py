@@ -33,22 +33,22 @@ from ...core.content import (
     parse_document,
     sort_key,
 )
-from ...core.db_comment import (
+from ...db.comment import (
     get_comment_by_id,
     get_comments_by_article,
-    restore_comment,
-    soft_delete_comment,
+    redact_comment,
+    update_comment_content,
 )
-from ...core.db_comment import (
+from ...db.comment import (
     comment_depth as _core_comment_depth,
 )
-from ...core.db_comment import (
+from ...db.comment import (
     flatten_comment_tree,
 )
-from ...core.db_comment_rate import try_post_comment
+from ...db.comment_rate import try_post_comment
 from ...core.markdown import render_markdown
 from ...core.security import is_admin, is_admin_id
-from ...core.utils import escape_html, format_date
+from ...core.utils import escape_html, format_date, format_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -300,7 +300,7 @@ def _max_comments_per_article() -> int:
 def build_comment_rows(slug: str, user, *, max_length: int):
     """把评论行组装成模板可直接渲染的结构（权限判断在模块里完成）。
 
-    树展开委托 `core.db_comment.flatten_comment_tree` —— 那里是唯一定义，
+    树展开委托 `db.comment.flatten_comment_tree` —— 那里是唯一定义，
     带防环与"不可达评论补根"处理（否则坏数据里的环会让评论从页面上消失）。
     """
     comments = get_comments_by_article(slug)
@@ -321,21 +321,30 @@ def build_comment_rows(slug: str, user, *, max_length: int):
         if user is not None:
             is_owner = user["id"] == row["user_id"]
             if not row["is_deleted"]:
+                # 编辑只给作者本人：管理员可以涂黑别人的话，但不该改写别人的话
+                if is_owner:
+                    actions.append({"url": f"/article/{slug}?edit={row['id']}#comment-form",
+                                    "method": "get", "action": "edit", "css": "edit-link",
+                                    "label_key": "comment_edit"})
                 if admin or is_owner:
                     actions.append({"url": f"/article/{slug}/comment/delete/{row['id']}",
-                                    "action": "delete", "css": "delete-link"})
-            elif admin:
-                actions.append({"url": f"/article/{slug}/comment/restore/{row['id']}",
-                                "action": "restore", "css": "restore-link"})
+                                    "method": "post", "action": "delete",
+                                    "css": "delete-link",
+                                    "label_key": "comment_delete"})
         reply_url = (f"/article/{slug}?reply_to={row['id']}#comments"
                      if user is not None and depth < depth_limit else "")
 
+        css = "comment" if depth <= 1 else "comment comment-reply"
+        if row["is_deleted"]:
+            css += " is-redacted"
         rows.append({
             "id": row["id"],
+            "css": css,
             "depth": depth,
             "author": author,
             "badge": badge,
-            "created": row["created_at"],
+            # 展示格式与文章页一致：库里存 ISO，界面上给人看的永远是 YYYY-MM-DD HH:MM
+            "created": format_datetime(row["created_at"]),
             "is_deleted": bool(row["is_deleted"]),
             "content": _comment_content(row, admin),
             "reply_to": _reply_label(parent, deleted_nickname) if parent else "",
@@ -346,8 +355,15 @@ def build_comment_rows(slug: str, user, *, max_length: int):
 
 
 def _author_label(row, deleted_nickname: str) -> str:
+    """评论区作者标签。
+
+    隐私：**已注销用户不显示 `#user_id`**。`user` 行按逻辑删除保留（评论归属、
+    审计需要），但把稳定 id 印在公开页面上等于给"已删除账号"留了可关联的把手
+    —— 同一 id 的历史评论、`created_at`、甚至注册顺序都能被串起来。
+    活跃用户仍然显示 id（社区语义需要，且他们本来就公开活动）。
+    """
     if row["user_deleted"]:
-        return f"{deleted_nickname} (#{row['user_id']})"
+        return deleted_nickname
     return f"{row['nickname'] or 'Unknown'} (#{row['user_id']})"
 
 
@@ -373,21 +389,30 @@ def _normalize_newlines(text: str) -> str:
 #   - 先换行 -> `<br>` 会被后面的转义变成 `&lt;br&gt;`，页面上就会看到字面量
 # 任何时候都不要把 Markup() 用在未转义的 `row["content"]` 上。
 def _comment_content(row, admin: bool):
-    """评论正文：已删除对访客打码，对管理员原文加删除线。返回 Markup。"""
+    """评论正文。返回 Markup。
+
+    **已删除的评论不再有"原文"可分角色展示**：删除时正文已经在数据库里被
+    黑块替换（见 `db.comment.redact_comment`），所以这里对管理员与访客
+    一视同仁地渲染黑块。`admin` 仍然保留在签名里（调用方语义不变），
+    但不再影响已删除评论的呈现 —— 这正是"不可恢复"的含义。
+    """
     raw = row["content"]
-    if row["is_deleted"] and not admin:
-        block_len = len(_normalize_newlines(raw))
-        return Markup(f'<span class="comment-content">{"█" * block_len}</span>')
+    if row["is_deleted"]:
+        # 双重保险：删除时正文已经在库里被涂黑（不可恢复），但渲染**不信任**
+        # 库里的内容 —— 万一存在"标了已删除却没涂黑"的历史/外部写入行，
+        # 这里按长度重新生成黑块，原文也不会被渲染出去。
+        length = len(_normalize_newlines(raw))
+        return Markup(f'<span class="comment-content is-redacted">'
+                      f'{"█" * min(length, 400)}</span>')
     text = escape_html(raw)
     text = _normalize_newlines(text).replace("\n", "<br>")
-    css = "comment-content is-deleted" if row["is_deleted"] else "comment-content"
-    return Markup(f'<span class="{css}">{text}</span>')
+    return Markup(f'<span class="comment-content">{text}</span>')
 
 
 def comment_depth(comment) -> int:
     """沿 parent_id 回溯算层级（顶层 = 1）。
 
-    实现在 `core.db_comment.comment_depth`——那是**层级计算的唯一定义**，
+    实现在 `db.comment.comment_depth`——那是**层级计算的唯一定义**，
     写入侧的 `try_post_comment` 也调用它（在事务内校验深度），
     因此渲染与写入不可能算出不同的层级。这里只是按模块的习惯
     补上配置里的 max_depth 并转发，保持既有调用点与测试不变。
@@ -430,12 +455,31 @@ def post_comment(slug: str, user_id: int, client_ip: str, content: str, reply_to
     return outcome, messages.get(outcome, "")
 
 
-def remove_comment(comment_id: int):
-    soft_delete_comment(comment_id)
+def remove_comment(comment_id: int) -> int:
+    """删除评论 = **永久涂黑**（正文在数据库里被黑块替换，不可恢复）。
+
+    为什么不是彻底 DELETE：`parent_id` 链会断，被删评论的整棵子树要么消失、
+    要么变成孤儿。"涂黑"是"保留结构、销毁内容"的方案 —— 读者的观感是
+    "这里原本有一段话，现在被涂掉了"，而不是"评论凭空少了"。
+    """
+    return redact_comment(comment_id)
 
 
-def restore_comment_by_id(comment_id: int):
-    restore_comment(comment_id)
+def edit_comment(comment_id: int, content: str):
+    """编辑评论正文（权限由路由校验）。返回 (outcome, message)。
+
+    与发表评论共用同一套校验：非空、长度上限。已涂黑的评论不可编辑
+    （`update_comment_content` 的 WHERE 会拒绝，返回 0 行）。
+    """
+    content = (content or "").strip()
+    max_length = default_max_length()
+    if not content:
+        return "empty", "Content cannot be empty"
+    if len(content) > max_length:
+        return "too_long", "Content too long"
+    if not update_comment_content(comment_id, content):
+        return "redacted", "Comment is redacted"
+    return "ok", ""
 
 
 def default_max_length() -> int:

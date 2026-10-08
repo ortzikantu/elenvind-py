@@ -24,7 +24,6 @@ Route 通过声明使用：
 """
 from __future__ import annotations
 
-from .db_user import get_user_by_email, update_user_password
 from .security import (
     admin_id,
     hash_password,
@@ -75,28 +74,31 @@ BAD_CREDENTIALS = "bad_credentials"
 NEEDS_REHASH = "needs_rehash"
 
 
-def verify_credentials(email: str, password: str):
-    """校验邮箱+密码。
+def verify_credentials(user, password: str):
+    """校验一个**已经取出**的用户行的密码。纯函数：不查库、不写库。
 
-    返回 (user_row | None, ok: bool, rehashed: bool)。
-    - 账号不存在与密码错误返回同样的 (None, False, False)，调用方应给一致提示；
-    - 登录成功且哈希需要升级时**透明 rehash**，不影响本次登录结果；
-    - 计时侧信道：账号不存在时也执行一次等量哈希校验（见 view 层调用点）。
+    返回 `(ok: bool, rehashed_hash: str | None)`：
+
+    - `user is None`（账号不存在）→ `(False, None)`：调用方必须自己执行一次
+      等量哈希校验（`security.dummy_verify`）来抹平计时差异，并给出一致提示；
+    - 密码错误 → `(False, None)`；
+    - 成功且哈希参数需要升级 → `(True, 新哈希)`：**落库由调用方决定**
+      （core 不认识 db；rehash 是优化，失败也不影响本次登录）。
+
+    这样拆分之后，"谁去写数据库"这件事只发生在装配层与 modules，
+    `core` 里不再出现任何持久化调用。
     """
-    user = get_user_by_email(email)
     if user is None:
-        return None, False, False
+        return False, None
     stored = user["password"]
     if not verify_password(password, stored):
-        return None, False, False
-    rehashed = False
-    if password_needs_rehash(stored):
-        try:
-            update_user_password(user["id"], hash_password(password))
-            rehashed = True
-        except Exception:      # noqa: BLE001 - 升级失败不影响本次登录
-            rehashed = False
-    return user, True, rehashed
+        return False, None
+    if not password_needs_rehash(stored):
+        return True, None
+    try:
+        return True, hash_password(password)
+    except Exception:          # noqa: BLE001 - 升级失败不影响本次登录
+        return True, None
 
 
 def check_permission(request, requirement: str) -> bool:

@@ -35,6 +35,25 @@ _lock = threading.Lock()
 _last_prune: dict[str, float] = {}
 
 
+#: **允许清理的 (表名, 时间列)** 白名单。
+#: 动态标识符（表名/列名不能走参数绑定）只允许来自这里：
+#: 调用方传入其它组合会直接 `ValueError`，而不是把外部字符串拼进 SQL。
+PRUNABLE = frozenset({
+    ("login_attempts", "attempted_at"),
+    ("register_attempts", "attempted_at"),
+    ("comment_rate", "attempted_at"),
+})
+
+
+def _validate_target(table: str, column: str) -> None:
+    """只接受白名单内的表/列组合（防 SQL 注入的"标识符"面）。"""
+    if (table, column) not in PRUNABLE:
+        raise ValueError(
+            f"prune() 不接受 {table!r}.{column!r}：只允许 "
+            f"{sorted({t for t, _ in PRUNABLE})} 的 "
+            f"{sorted({c for _, c in PRUNABLE})} 列（见 PRUNABLE 白名单）")
+
+
 def due(table: str, interval_seconds: int = DEFAULT_PRUNE_INTERVAL) -> bool:
     """距上次清理是否已超过间隔；是则**占用**这一轮（避免并发重复清理）。"""
     now = time.time()
@@ -63,9 +82,10 @@ def prune(table: str, column: str, days: int,
     **在另一个 write_tx() 块内调用会立刻触发重入守卫**。清理失败只记日志、
     不向上抛：这是"顺手的维护工作"，不该让业务写入失败（既有的容错语义）。
     """
+    _validate_target(table, column)
     if not due(table, interval_seconds):
         return 0
-    from .db_base import write_tx
+    from .transaction import write_tx
 
     try:
         with write_tx() as conn:

@@ -13,7 +13,7 @@ def register(router):
     @router.route("/admin", methods=["GET"], auth="required", permission="admin")
     def admin_home(request):
         from ...core.config import config
-        from ...core.db_user import get_user_number
+        from ...db.user import get_user_number
 
         return html(render_template("admin/index.html", {
             "admin": {

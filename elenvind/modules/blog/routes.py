@@ -11,7 +11,7 @@ import logging
 from ...core.auth import require_owner
 from ...core.config import config
 from ...core.context import current_lang
-from ...core.db_comment import get_comment_by_id
+from ...db.comment import get_comment_by_id
 from ...core.http import Forbidden, NotFound, html, redirect
 from ...core.i18n import t
 from ...core.security import is_admin
@@ -115,19 +115,28 @@ def register(router, *, render_not_found):
         comment = _authorized_comment(request, slug, comment_id, admin_only=False)
         if not comment["is_deleted"]:
             logic.remove_comment(comment["id"])
-            # 审核动作留痕（软删除可恢复，因此这是审计记录而不是"删除公告"）
-            logger.info("Comment soft-deleted: id=%s slug=%s by user_id=%s",
+            # 涂黑**不可逆**：日志只记录动作，绝不记录正文
+            logger.info("Comment redacted: id=%s slug=%s by user_id=%s",
                         comment["id"], slug, request.user["id"])
         return redirect(f"/article/{slug}#comments")
 
-    @router.route("/article/<slug>/comment/restore/<comment_id>", methods=["POST"],
+    @router.route("/article/<slug>/comment/edit/<comment_id>", methods=["POST"],
                   auth="required")
-    def restore_comment(request, slug, comment_id):
-        comment = _authorized_comment(request, slug, comment_id, admin_only=True)
+    def edit_comment(request, slug, comment_id):
+        """编辑自己的评论（复用同一个输入框，见 _comment_form）。"""
+        comment = _authorized_comment(request, slug, comment_id, admin_only=False)
+        if not require_owner(current_user(request), comment):
+            # 管理员可以涂黑，但不能改写别人的话（与按钮集合保持一致）
+            raise Forbidden("Forbidden")
         if comment["is_deleted"]:
-            logic.restore_comment_by_id(comment["id"])
-            logger.info("Comment restored: id=%s slug=%s by admin user_id=%s",
-                        comment["id"], slug, request.user["id"])
+            return _article_error(request, slug,
+                                  t(current_lang(), "comment_edit_redacted"), status=400)
+        outcome, message = logic.edit_comment(comment["id"],
+                                              request.form.get("content", ""))
+        if outcome != "ok":
+            return _article_error(request, slug, message, status=400)
+        logger.info("Comment edited: id=%s slug=%s user_id=%s",
+                    comment["id"], slug, request.user["id"])
         return redirect(f"/article/{slug}#comments")
 
     return router
@@ -153,6 +162,47 @@ def _comment_section(request, slug):
         "max_comment_length": max_len,
         "reply_to_value": str(reply_to or ""),
         "reply_to_message": reply_to_message,
+        "comment_form": _comment_form(request, slug, user, reply_to),
+    }
+
+
+def _comment_form(request, slug, user, reply_to):
+    """评论输入框上下文：发表与**编辑复用同一个表单**（Zero-JS）。
+
+    编辑按钮是个普通链接 `?edit=<id>#comment-form`：服务端把同一个 textarea
+    预填成待编辑正文、action 指向编辑端点，并给出"取消"链接。因此既不需要
+    前端脚本，也不需要第二个表单（这正是用户要的"复用下面的输入框"）。
+    """
+    lang = current_lang()
+    edit_id = _safe_int(request.arg("edit"))
+    editing = None
+    if edit_id and user is not None:
+        candidate = get_comment_by_id(edit_id)
+        if (candidate and candidate["article_slug"] == slug
+                and not candidate["is_deleted"] and require_owner(user, candidate)):
+            editing = candidate
+    if editing is not None:
+        return {
+            "action": f"/article/{slug}/comment/edit/{editing['id']}",
+            "title": t(lang, "comment_edit_title"),
+            "submit": t(lang, "comment_edit_save"),
+            "content": editing["content"],
+            "reply_to": "",
+            "editing": True,
+            "css": "comment-compose is-editing",
+            "cancel_url": f"/article/{slug}#comments",
+            "cancel_label": t(lang, "comment_edit_cancel"),
+        }
+    return {
+        "action": f"/article/{slug}/comment",
+        "title": t(lang, "comment_post_title"),
+        "submit": t(lang, "comment_submit"),
+        "content": "",
+        "reply_to": str(reply_to or ""),
+        "editing": False,
+        "css": "comment-compose",
+        "cancel_url": f"/article/{slug}#comments" if reply_to else "",
+        "cancel_label": t(lang, "comment_edit_cancel"),
     }
 
 

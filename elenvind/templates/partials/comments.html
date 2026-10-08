@@ -1,49 +1,71 @@
-{# 评论区：数据（含权限判断与展示文本）由模块准备成 comment_rows，
+{# 评论区：数据（权限判断、展示文本、样式类）由模块准备成 comment_rows，
    模板只负责排版。author / reply_to 是纯文本（Jinja 自动转义），
    content 是模块产出的 Markup（已转义并保留换行）。 #}
 <section class="comments" id="comments">
   <h2>{{ t('comment_comments', total=comment_total) }}</h2>
 
   {% if comment_rows %}
-    {% for row in comment_rows %}
-      <div class="{{ 'comment' if row.depth <= 1 else 'comment comment-reply' }}">
-        <div class="meta">
-          <span>{{ row.author }}{% if row.badge %} <span class="badge-admin">{{ row.badge }}</span>{% endif %} · {{ row.created }}</span>
-          <div class="comment-actions">
-            {% for action in row.actions %}
-              <form method="post" action="{{ action.url }}" class="comment-form">
-                {{ csrf_input() }}
-                <button type="submit" class="{{ action.css }}">
-                  {%- if action.action == 'delete' %}{{ t('comment_delete') }}{% else %}{{ t('comment_restore') }}{% endif -%}
-                </button>
-              </form>
-            {% endfor %}
-            {% if row.reply_url %}
-              <a class="reply-link" href="{{ row.reply_url }}">{{ t('comment_reply') }}</a>
-            {% endif %}
+    <div class="comment-list">
+      {% for row in comment_rows %}
+        <article class="{{ row.css }}">
+          <div class="comment-meta">
+            <span class="comment-author">
+              <span class="comment-author-name">{{ row.author }}</span>
+              {% if row.badge %}<span class="badge-admin">{{ row.badge }}</span>{% endif %}
+            </span>
+            <span class="comment-time">{{ row.created }}</span>
+            <div class="comment-actions">
+              {% for action in row.actions %}
+                {% if action.method == 'post' %}
+                  <form method="post" action="{{ action.url }}" class="comment-action-form">
+                    {{ csrf_input() }}
+                    <button type="submit" class="{{ action.css }}">{{ t(action.label_key) }}</button>
+                  </form>
+                {% else %}
+                  <a class="{{ action.css }}" href="{{ action.url }}">{{ t(action.label_key) }}</a>
+                {% endif %}
+              {% endfor %}
+              {% if row.reply_url %}
+                <a class="reply-link" href="{{ row.reply_url }}">{{ t('comment_reply') }}</a>
+              {% endif %}
+            </div>
           </div>
-        </div>
-        <p class="comment-body">
-          {%- if row.reply_to %}<span class="reply-to">{{ row.reply_to }} </span>{% endif -%}
-          {{ row.content }}
-        </p>
-      </div>
-    {% endfor %}
+          <p class="comment-body">
+            {%- if row.reply_to %}<span class="reply-to">{{ row.reply_to }}</span> {% endif -%}
+            {{ row.content }}{% if row.is_deleted %}<span class="comment-redacted-tag">{{ t('comment_redacted') }}</span>{% endif %}
+          </p>
+        </article>
+      {% endfor %}
+    </div>
   {% else %}
-    <p>{{ t('comment_none') }}</p>
+    <p class="comment-empty">{{ t('comment_none') }}</p>
   {% endif %}
 </section>
 
 {% if user %}
-  <h3>{{ t('comment_post_title') }}</h3>
-  <form method="post" action="/article/{{ article.slug }}/comment">
-    {{ csrf_input() }}
-    <input type="hidden" name="reply_to" value="{{ reply_to_value }}">
-    {% if reply_to_message %}<p>{{ reply_to_message }}</p>{% endif %}
-    <textarea name="content" rows="4" required maxlength="{{ max_comment_length }}"
-              placeholder="{{ t('comment_placeholder') }}"></textarea>
-    <button type="submit">{{ t('comment_submit') }}</button>
-  </form>
+  <section class="{{ comment_form.css }}" id="comment-form">
+    <h3>{{ comment_form.title }}</h3>
+    {% if reply_to_message %}<p class="compose-hint">{{ reply_to_message }}</p>{% endif %}
+    <form method="post" action="{{ comment_form.action }}" class="compose-form">
+      {{ csrf_input() }}
+      {% if not comment_form.editing %}
+        <input type="hidden" name="reply_to" value="{{ comment_form.reply_to }}">
+      {% endif %}
+      <label class="visually-hidden" for="comment-content">{{ t('comment_placeholder') }}</label>
+      <textarea id="comment-content" name="content" rows="5" required
+                maxlength="{{ max_comment_length }}"
+                placeholder="{{ t('comment_placeholder') }}">{{ comment_form.content }}</textarea>
+      <div class="compose-footer">
+        <span class="compose-hint">{{ t('comment_form_hint', max=max_comment_length) }}</span>
+        <div class="compose-buttons">
+          {% if comment_form.cancel_url %}
+            <a class="compose-cancel" href="{{ comment_form.cancel_url }}">{{ comment_form.cancel_label }}</a>
+          {% endif %}
+          <button type="submit" class="btn-primary">{{ comment_form.submit }}</button>
+        </div>
+      </div>
+    </form>
+  </section>
 {% else %}
-  <p>{{ t('comment_login_hint') }}</p>
+  <p class="comment-login-hint">{{ t('comment_login_hint') }}</p>
 {% endif %}

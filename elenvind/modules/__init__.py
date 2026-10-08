@@ -18,7 +18,7 @@
   例如 seo 的文章条目来自 `blog.sitemap_articles`；
 - 模块不 import 装配层（`elenvind.app` / `elenvind.wsgi`）取全局对象；
 - 模块不直接开数据库连接、不执行 SQL：走 Core 的 `db_*` 业务 API，
-  写操作最终进入 `core.db_base.write_tx()`；
+  写操作最终进入 `db.write_tx()`；
 - 每个模块的公开入口是 `routes.register(router, ...)`（参数按需，不强制统一形状）；
 - `__init__.py` 只写文档，不做副作用导入 —— 本包是纯命名空间。
 

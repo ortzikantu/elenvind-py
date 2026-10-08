@@ -160,41 +160,47 @@ class WriteTransactionLogTests(_LogCaptureMixin, ElenvindTestCase):
     """写事务明细：正常提交 DEBUG，慢事务 WARNING，回滚留痕。"""
 
     def test_commit_logs_row_count_and_duration_at_debug(self):
-        from elenvind.core import db_base
+        from elenvind import db
+        from elenvind.db import connection as db_connection
+        from elenvind.db import transaction as db_transaction
 
         logs = self.capture_logs()
-        with db_base.write_tx() as conn:
+        with db.write_tx() as conn:
             conn.execute("INSERT INTO user (nickname, email, password, created_at) "
                          "VALUES (?, ?, ?, ?)", ("Tx", "tx@example.com", "x", "2026-01-01"))
         lines = logs.lines("Write transaction committed:")
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("1 row(s) changed", lines[0])
         self.assertIn("ms", lines[0])
-        self.assertIn(str(db_base.DB_PATH), lines[0], "要能看出写的是哪个库")
+        self.assertIn(str(db_connection.DB_PATH), lines[0], "要能看出写的是哪个库")
         self.assertEqual(logs.levels("Write transaction committed:"), {"DEBUG"})
 
     def test_slow_transaction_is_warned(self):
-        from elenvind.core import db_base
+        from elenvind import db
+        from elenvind.db import connection as db_connection
+        from elenvind.db import transaction as db_transaction
 
         logs = self.capture_logs()
-        original = db_base._SLOW_WRITE_SECONDS
-        db_base._SLOW_WRITE_SECONDS = 0.01        # 不必真的睡 1 秒
+        original = db_transaction._SLOW_WRITE_SECONDS
+        db_transaction._SLOW_WRITE_SECONDS = 0.01        # 不必真的睡 1 秒
         try:
-            with db_base.write_tx() as conn:
+            with db.write_tx() as conn:
                 conn.execute("INSERT INTO user (nickname, email, password, created_at) "
                              "VALUES (?, ?, ?, ?)", ("Slow", "slow@example.com", "x", "2026-01-01"))
                 time.sleep(0.05)
         finally:
-            db_base._SLOW_WRITE_SECONDS = original
+            db_transaction._SLOW_WRITE_SECONDS = original
         self.assertEqual(logs.levels("Write transaction slow:"), {"WARNING"})
         self.assertNotIn("Write transaction committed:", logs.text())
 
     def test_rollback_is_logged_at_debug(self):
-        from elenvind.core import db_base
+        from elenvind import db
+        from elenvind.db import connection as db_connection
+        from elenvind.db import transaction as db_transaction
 
         logs = self.capture_logs()
         with self.assertRaises(RuntimeError):
-            with db_base.write_tx() as conn:
+            with db.write_tx() as conn:
                 conn.execute("INSERT INTO user (nickname, email, password, created_at) "
                              "VALUES (?, ?, ?, ?)", ("Gone", "gone@example.com", "x", "2026-01-01"))
                 raise RuntimeError("business failure")
@@ -319,9 +325,15 @@ class AuditEventLogTests(_LogCaptureMixin, ElenvindTestCase):
         self.assertEqual(len(created), 1, created)
 
         comment_id = self._comment_id("audit-post")
+        self.app.request("POST", f"/article/audit-post/comment/edit/{comment_id}",
+                         form={"csrf_token": auth["csrf"], "content": "edited"},
+                         cookies=auth)
+        self.assertEqual(logs.levels(f"Comment edited: id={comment_id}"), {"INFO"})
         self.app.request("POST", f"/article/audit-post/comment/delete/{comment_id}",
                          form={"csrf_token": auth["csrf"]}, cookies=auth)
-        self.assertEqual(logs.levels(f"Comment soft-deleted: id={comment_id}"), {"INFO"})
+        # 删除 = 涂黑（不可逆）：日志只记录动作，不含正文
+        self.assertEqual(logs.levels(f"Comment redacted: id={comment_id}"), {"INFO"})
+        self.assertEqual(logs.lines("content="), [], "日志里不应出现评论正文")
 
     def test_rejected_login_is_a_warning_that_never_contains_the_email(self):
         self.register_user("limit@example.com", "password-123", "Limit")
@@ -341,7 +353,7 @@ class AuditEventLogTests(_LogCaptureMixin, ElenvindTestCase):
     # ---------- 便捷查询 ----------
 
     def _comment_id(self, slug):
-        from elenvind.core.db_comment import get_comments_by_article
+        from elenvind.db.comment import get_comments_by_article
         return get_comments_by_article(slug)[0]["id"]
 
 

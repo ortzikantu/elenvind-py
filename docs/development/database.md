@@ -6,6 +6,26 @@
 
 ---
 
+## 0. `elenvind/db/` 是什么
+
+一级包，**项目唯一的 SQLite 边界**（`core` 与 `modules` 都不允许 `import sqlite3`、
+不允许执行 SQL、不允许提交事务 —— 有 AST 守卫）：
+
+| 模块 | 职责 |
+|---|---|
+| `connection` | 数据库路径（由装配层 `configure()` 注入）、锁文件、只读 `connect()`、连接级 PRAGMA |
+| `transaction` | `write_tx()`：唯一写入口（flock → BEGIN IMMEDIATE → commit/rollback → unlock） |
+| `migration` | schema 定义、`PRAGMA user_version` 逐级迁移、`init_db()` |
+| `user` / `session` / `comment` / `comment_rate` / `auth` / `maintenance` | 各数据领域的读写 API |
+
+**依赖方向**：`db` 只依赖标准库，不认识 `core`、不认识 `modules`、不处理 HTTP/Cookie/模板。
+它需要的一切都由装配层注入：
+
+```python
+db.configure(resolve_db_path())          # 数据库路径（app 解析 config/env）
+db.session.set_limits_provider(...)      # 会话窗口（app 读 config 后传入）
+```
+
 ## 1. 两条入口
 
 | 入口 | 用途 | 语义 |
@@ -14,7 +34,7 @@
 | `with write_tx() as conn:` | **唯一合法写入口**（INSERT / UPDATE / DELETE / DDL） | 跨进程排他锁 → 连接 → `BEGIN IMMEDIATE` → 业务 SQL → 提交/回滚 → 关连接 → 解锁 |
 
 ```python
-from elenvind.core.db_base import connect, write_tx
+from elenvind.db import connect, write_tx
 
 with connect() as conn:                      # 读
     row = conn.execute("SELECT ... WHERE id = ?", (user_id,)).fetchone()
@@ -215,7 +235,7 @@ grep "Database:" logs/app.log | tail -3             # 库路径 / schema 版本 
 | `db_session` | `create_session`、`get_session_user`（读+刷新，单事务）、`delete_session`、`delete_user_sessions`、`cleanup_expired_sessions` |
 | `db_login` | `record_login_attempt`、`count_email_failures`、`count_ip_failures`、`count_global_recent_failures`、`clear_login_attempts`、`cleanup_old_login_attempts` |
 | `db_register` | `try_register_attempt`（原子限流）、`cleanup_old_attempts` |
-| `db_comment` | `get_comments_by_article`、`get_comment_by_id`、`create_comment`、`soft_delete_comment`、`restore_comment`、`comment_depth`、`flatten_comment_tree` |
+| `db.comment` | `get_comments_by_article`、`get_comment_by_id`、`create_comment`、**`redact_comment`（涂黑，不可逆）**、**`update_comment_content`（编辑）**、`comment_depth`、`flatten_comment_tree` |
 | `db_comment_rate` | `try_post_comment`（限流 + 深度 + 插入，同一事务）、`cleanup_old_comment_attempts` |
 | `db_prune` | `prune`（机会式清理，**独立写事务**）、`due`、`reset_state` |
 

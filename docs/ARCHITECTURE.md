@@ -1,8 +1,8 @@
 # 架构总览
 
 > **适用读者**：要改这个代码库的人（新模块、新能力、review、接手维护）。
-> **一句话**：Gunicorn / WSGI → Composition Root → Modules → Core → SQLite，
-> 依赖方向单向，所有业务写入经过 `write_tx()`。
+> **一句话**：Gunicorn / WSGI → Composition Root →（Core / db / Modules）→ SQLite，
+> 依赖方向单向；SQLite 只出现在 `elenvind/db/`，所有业务写入经过 `write_tx()`。
 
 ---
 
@@ -26,29 +26,53 @@ Repository / Unit of Work、应用层队列 / writer 进程 / 重试框架、插
 ## 2. 分层与依赖方向
 
 ```
-                   Gunicorn（sync worker）× N
+                  Gunicorn（sync worker）× N
                               │  WSGI: environ, start_response
                               ▼
     Application / Composition Root
-      elenvind/wsgi.py        生产入口：startup(STARTUP_HOOKS) → application
-      elenvind/app.py         装配：路由注册顺序、错误页、模块间注入、启动钩子
+      elenvind/wsgi.py        生产入口：startup(STARTUP_HOOKS, prepare_database) → application
+      elenvind/app.py         装配：数据库路径与启动、路由注册顺序、错误页、
+                              会话 store 注入、模块间注入、启动钩子
                               │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+    core/                 db/                  modules/
+    运行时基座            持久化基座            业务功能
+    （不认识 db、         （唯一 SQLite 边界；   （可依赖 core 与 db；
+      不认识 modules）      不认识 core/modules）   模块之间零 import）
+        │                     │                     │
+        └─────────────────────┴─────────────────────┘
                               ▼
-    Modules   elenvind/modules/{blog, pages, auth, users, admin, seo, system}
-                              │   只依赖 Core；**模块之间零 import**
-                              ▼
-    Core      elenvind/core/**  技术基座：不认识任何业务模块，也不 import 装配层
-                              │
-                              ▼
-    SQLite（WAL）  ← 读：connect()     写：write_tx()（唯一入口）
+                         SQLite（WAL）
+                              ▲
+              读：db.connect()   写：db.write_tx()（唯一入口）
+```
+
+```
+elenvind/
+  app.py       组合入口
+  wsgi.py      生产入口
+  core/        运行时基座：config · http · routing · security · session · csrf ·
+               auth · templating · markdown · content · context · i18n · lifespan ·
+               logging_config · console · utils · assets · version
+  db/          持久化基座：connection · transaction · migration · user · session ·
+               comment · comment_rate · auth · maintenance
+  modules/     业务模块：blog · pages · auth · users · admin · seo · system
+  templates/   Jinja2 模板
+  static/      静态资源
 ```
 
 ### 依赖规则（全部由测试守卫）
 
 | 规则 | 守卫 |
 |---|---|
-| Core ↛ Modules、Core ↛ Application | `tests/test_architecture.py::LayerDirectionTests` |
-| Modules ↛ Application | 同上 |
+| **Core ↛ db**、Core ↛ Modules、Core ↛ Application | `test_core_only_depends_on_itself` |
+| **db ↛ core**、db ↛ Modules、db ↛ Application（db 只依赖标准库） | `test_db_is_independent` |
+| 只有 `db/` 可以 `import sqlite3` | `test_only_db_imports_sqlite3` |
+| 只有 `db/` 可以执行 SQL / 提交或回滚事务 | `test_sql_and_transactions_stay_inside_db` |
+| `BEGIN IMMEDIATE` 只出现在 `db/transaction.py` | `test_begin_immediate_only_in_the_transaction_module` |
+| db 不处理 HTTP / Cookie / 模板 | `test_db_does_not_handle_http_or_templates` |
+| Modules ↛ Application | `test_modules_do_not_import_the_composition_root` |
 | Module A ↛ Module B | `test_modules_do_not_import_each_other`（零例外，无允许清单） |
 | 模块级 import 图无环；Modules 层（含延迟 import）无环 | `ImportCycleTests` |
 | Core 既有的"延迟 import 环"不增加 | `test_core_lazy_import_cycles_do_not_grow`（棘轮） |
@@ -149,33 +173,41 @@ environ, start_response
 | 路由与静态资源 | `routing`、`assets` |
 | 会话 / Cookie / CSRF / 认证授权 | `session`、`security`、`csrf`、`auth` |
 | 模板与内容格式 | `templating`、`content`、`markdown`、`i18n`、`context` |
-| 数据库（连接 / 写协调 / 迁移 / 数据访问 API） | `db_base`（`connect()` / `write_tx()`）、`db_user`、`db_session`、`db_login`、`db_register`、`db_comment`、`db_comment_rate`、`db_prune` |
 | 启动关闭 / 日志 / 工具 | `lifespan`、`logging_config`、`utils` |
 
-### 为什么 `db_*.py`（业务表的数据访问）在 Core
+**数据库相关的一切都在 `elenvind/db/`**（一级包，见 §7）：`connection`（路径/锁文件/只读
+连接）、`transaction`（`write_tx()` 唯一写入口）、`migration`（schema 与 `user_version`
+迁移）、`user`、`session`、`comment`、`comment_rate`、`auth`（登录/注册流水）、
+`maintenance`（机会式清理）。
 
-它们是**应用唯一的数据访问 API**，而 C0 的写协调边界必须集中：写入口只有
-`write_tx()`，迁移与建表也必须在同一个边界内。把访问层拆进模块会立刻产生
-"每个模块各写一份连接/事务"的诱惑，C0 也就守不住了。
+### 为什么有独立的 `db/` 层（而不是把 sqlite 代码留在 core）
 
-判定标准（"什么该进 Core"）：
+`core/` 是"项目专属运行时基座"，`db/` 是"持久化基座"。分开的三个理由：
+
+1. **唯一 SQLite 边界**：`import sqlite3`、SQL 执行、`BEGIN`/`COMMIT`、schema 迁移
+   全部收在 `db/`，守卫测试保证 core 与 modules 里不会出现这些（越界即变红）；
+2. **core 不再随持久化代码膨胀**：core 只保留 HTTP/安全/模板/配置这类运行时机制；
+3. **依赖方向干净**：`core ↛ db`。core 需要数据库信息时由装配层**注入**：
+   会话持久化注入 `store=db`（`core.session.load_user(request, store=…)`）、
+   用户总数注入 provider（`core.context.set_user_count_provider`）、
+   数据库启动注入 `prepare_database`（`core.lifespan.startup(..., prepare_database=)`）。
+
+判定标准（"什么该进 Core / db / modules"）：
 
 | 情况 | 放哪 |
 |---|---|
-| 与业务无关的通用机制（HTTP、路由、安全、模板、数据库基础设施） | **Core** |
-| 多个模块共用的**格式/协议原语**（例：`core.content` 的 TOML 文档头 + slug 校验，被 blog 与 pages 共用） | **Core** |
-| 只服务某一个业务的具体规则（文章索引、评论树、登录流程、sitemap 组装） | **模块** |
+| 与业务无关的运行时机制（HTTP、路由、安全、模板、配置、会话语义） | **core** |
+| 任何 SQLite 相关实现（连接、锁、事务、schema、迁移、各表读写） | **db** |
+| 多个模块共用的**格式/协议原语**（例：`core.content` 的 TOML 文档头 + slug 校验） | **core** |
+| 只服务某一个业务的具体规则（文章索引、评论树、登录流程、sitemap 组装） | **modules** |
 | 只是"看起来通用"但只有一处用 | **留在用它的模块**，不要提前抽象 |
-
-**Core 里不得出现业务规则**：例如文章解析策略、评论权限树、注册流程、限流阈值策略
-（阈值读配置、判定在事务内，属于数据与安全基础设施，保留在 Core 的 `db_*`）。
 
 ---
 
 ## 7. 数据写入路径（C0 概览）
 
 ```
-module（业务） ──► core 的 db_* API ──► write_tx()
+module（业务） ──► db 的领域 API（db.user/db.comment/…）──► write_tx()
                                           ├─ flock(LOCK_EX) on <db>.write.lock
                                           ├─ 打开连接（PRAGMA foreign_keys / busy_timeout）
                                           ├─ BEGIN IMMEDIATE
@@ -185,8 +217,8 @@ module（业务） ──► core 的 db_* API ──► write_tx()
                                           └─ 释放 flock（无论异常/键盘中断/被 SIGKILL）
 ```
 
-- **读**：`with connect() as conn:`（只读，不参与 flock）。
-- **写**：`with write_tx() as conn:`（唯一合法入口；模块不得自己开连接或 `BEGIN`）。
+- **读**：`with db.connect() as conn:`（只读，不参与 flock）。
+- **写**：`with db.write_tx() as conn:`（唯一合法入口；模块不得自己开连接或 `BEGIN`）。
 - **迁移/建表**：同样在 `write_tx()` 内，多 worker 并发启动由 flock 串行化。
 
 契约细节、锁文件规则、"保证什么/不保证什么"、可观测性与迁移机制见
@@ -199,9 +231,9 @@ module（业务） ──► core 的 db_* API ──► write_tx()
 改代码时若破坏其中任何一条，都会有测试变红或部署语义变化：
 
 1. `elenvind/wsgi.py` 暴露 `application`，且是**同步** WSGI callable。
-2. Core 不认识任何业务模块；模块不认识装配层；模块之间零 import。
+2. Core 不认识 db、不认识业务模块；db 不认识 core/modules；模块之间零 import。
 3. 每个模块可独立 `import`（无隐含导入顺序）。
-4. 业务写入只能通过 `write_tx()`；`connect()` 只用于读。
+4. 业务写入只能通过 `db.write_tx()`；`db.connect()` 只用于读；SQL 只出现在 `db/`。
 5. 锁文件由数据库路径派生、永不删除、多 worker 得到同一路径、不同库得到不同路径。
 6. 安全能力（CSRF / Cookie / 密码 / 安全头 / 请求限制 / 会话）只在 Core 实现一次。
 7. 安全响应头对**每个**响应生效，包括 404 / 403 / 500。

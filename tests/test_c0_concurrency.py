@@ -21,8 +21,10 @@ from pathlib import Path
 
 from tests.support import ElenvindTestCase
 
-from elenvind.core import db_base
-from elenvind.core.db_base import connect, lock_path_for, write_tx
+from elenvind import db
+from elenvind.db import connection as db_connection
+from elenvind.db import migration as db_migration
+from elenvind.db import connect, lock_path_for, write_tx
 
 try:                                    # fcntl 只在 POSIX 上存在
     import fcntl
@@ -72,7 +74,7 @@ LEGACY_SCHEMA_V1 = """
 
 def _child_setup(db_path):
     os.environ["ELENVIND_DB"] = str(db_path)
-    db_base.DB_PATH = Path(db_path)
+    db_connection.DB_PATH = Path(db_path)
 
 
 def _prepare_tables():
@@ -92,7 +94,7 @@ def _prepare_tables():
 def _child_prepare_tables(db_path, results):
     _child_setup(db_path)
     try:
-        db_base.init_db()
+        db.init_db()
         _prepare_tables()
         results.put(("ok", "prepared"))
     except Exception as error:                       # noqa: BLE001 - 上报给父进程
@@ -170,16 +172,17 @@ def _child_init_db(db_path, results, non_idempotent=False):
     try:
         if non_idempotent:
             # 故意登记一个**非幂等**迁移：谁跑第二次就会 "table c0_once already exists"
-            target = db_base.SCHEMA_VERSION + 1
+            target = db.SCHEMA_VERSION + 1
 
             def _probe_migration(conn):
                 conn.execute("CREATE TABLE c0_once (n INTEGER)")
                 conn.execute("INSERT INTO c0_once (n) VALUES (1)")
 
-            db_base._MIGRATIONS[target] = _probe_migration
-            db_base.SCHEMA_VERSION = target
-        db_base.init_db()
-        results.put(("ok", db_base.SCHEMA_VERSION))
+            db_migration._MIGRATIONS[target] = _probe_migration
+            # 必须改**定义模块**的值：db.SCHEMA_VERSION 只是再导出的副本
+            db_migration.SCHEMA_VERSION = target
+        db.init_db()
+        results.put(("ok", db.SCHEMA_VERSION))
     except Exception as error:                       # noqa: BLE001
         results.put(("error", f"{type(error).__name__}: {error}"))
 
@@ -342,20 +345,20 @@ class ConcurrencyTests(ElenvindTestCase):
         self._join(processes)
         self._collect(results, len(processes))
 
-        had = db_base.DB_PATH
-        db_base.DB_PATH = fresh
+        had = db_connection.DB_PATH
+        db_connection.DB_PATH = fresh
         try:
             version = self._query("PRAGMA user_version")[0][0]
             tables = {row["name"] for row in
                       self._query("SELECT name FROM sqlite_master WHERE type='table'")}
             leftover = [name for name in tables if name.endswith("_legacy")]
-            self.assertEqual(version, db_base.SCHEMA_VERSION)
+            self.assertEqual(version, db.SCHEMA_VERSION)
             self.assertTrue({"user", "session", "comment", "login_attempts",
                              "register_attempts", "comment_rate"} <= tables)
             self.assertEqual(leftover, [])
             self.assertEqual(self._integrity(), "ok")
         finally:
-            db_base.DB_PATH = had
+            db_connection.DB_PATH = had
 
     def test_concurrent_init_on_a_legacy_database_preserves_data(self):
         legacy = self.tmpdir / "legacy-concurrent.db"
@@ -372,8 +375,8 @@ class ConcurrencyTests(ElenvindTestCase):
         self._join(processes)
         self._collect(results, len(processes))
 
-        had = db_base.DB_PATH
-        db_base.DB_PATH = legacy
+        had = db_connection.DB_PATH
+        db_connection.DB_PATH = legacy
         try:
             version = self._query("PRAGMA user_version")[0][0]
             comments = self._query("SELECT COUNT(*) FROM comment")[0][0]
@@ -381,13 +384,13 @@ class ConcurrencyTests(ElenvindTestCase):
                       self._query("SELECT name FROM sqlite_master WHERE type='table'")}
             comment_sql = self._query(
                 "SELECT sql FROM sqlite_master WHERE name = 'comment'")[0][0] or ""
-            self.assertEqual(version, db_base.SCHEMA_VERSION)
+            self.assertEqual(version, db.SCHEMA_VERSION)
             self.assertEqual(comments, 2, "迁移丢了评论数据")
             self.assertEqual([name for name in tables if name.endswith("_legacy")], [])
             self.assertIn("ON DELETE SET NULL", " ".join(comment_sql.upper().split()))
             self.assertEqual(self._integrity(), "ok")
         finally:
-            db_base.DB_PATH = had
+            db_connection.DB_PATH = had
 
     def test_non_idempotent_migration_runs_exactly_once(self):
         """并发启动时，非幂等迁移只能被执行一次（第二次会直接建表失败）。"""
@@ -401,15 +404,15 @@ class ConcurrencyTests(ElenvindTestCase):
         self._join(processes)
         self._collect(results, len(processes))      # 任何一个进程重复执行都会报错
 
-        had = db_base.DB_PATH
-        db_base.DB_PATH = fresh
+        had = db_connection.DB_PATH
+        db_connection.DB_PATH = fresh
         try:
             rows = self._query("SELECT COUNT(*) FROM c0_once")[0][0]
             self.assertEqual(rows, 1, "非幂等迁移被重复执行了")
             self.assertEqual(self._query("PRAGMA user_version")[0][0],
-                             db_base.SCHEMA_VERSION + 1)
+                             db.SCHEMA_VERSION + 1)
         finally:
-            db_base.DB_PATH = had
+            db_connection.DB_PATH = had
 
     # ---------- 5. 数据库路径 → 锁文件隔离 ----------
     def test_database_paths_have_independent_locks(self):
@@ -423,7 +426,7 @@ class ConcurrencyTests(ElenvindTestCase):
         self.assertNotEqual(lock_path_for(self.db_path), lock_path_for(other))
 
         # 父进程手工持有本库的写锁，然后验证另一个库的写进程**不被牵连**
-        lock_path = lock_path_for(db_base.DB_PATH)
+        lock_path = lock_path_for(db_connection.DB_PATH)
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)

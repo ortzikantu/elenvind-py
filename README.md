@@ -59,21 +59,27 @@ Gunicorn (sync workers, WSGI)
 elenvind/wsgi.py          startup(STARTUP_HOOKS) → application  (PEP 3333)
         │
         ▼
-elenvind/app.py           Composition Root: the only place that knows both
-        │                 sides — route registration order, error pages, and the
-        ▼                 data each module gets from another module
-elenvind/modules/         blog · pages · auth · users · admin · seo · system
-        │                 (modules never import each other)
-        ▼
-elenvind/core/            config · HTTP · routing · security · session · csrf ·
-        │                 auth · templating · markdown · content · database · logging
-        ▼
-SQLite (WAL)
+elenvind/app.py           Composition Root: the only place that knows all three
+        │                 layers — db path + startup, route registration order,
+        │                 error pages, session store injection, and the data each
+        │                 module gets from another module
+        ├──────────────┬──────────────────┐
+        ▼              ▼                  ▼
+elenvind/core/   elenvind/db/       elenvind/modules/
+runtime base     persistence base   business
+(no db, no       (only SQLite       (may use core and db;
+ modules)         boundary)          never import each other)
+        └──────────────┴──────────────────┘
+                       ▼
+                 SQLite (WAL)   ← reads: db.connect()   writes: db.write_tx()
 ```
 
 | Rule | Enforced by |
 |---|---|
-| Core never imports modules or the composition root | `tests/test_architecture.py` |
+| **Core never imports db**, modules or the composition root | `tests/test_architecture.py` |
+| **db never imports core**, modules or the composition root (stdlib only) | `tests/test_architecture.py` |
+| Only `db/` may import `sqlite3`, run SQL, or commit a transaction | `tests/test_architecture.py` |
+| `BEGIN IMMEDIATE` only in `db/transaction.py` | `tests/test_architecture.py` |
 | Modules never import the composition root | `tests/test_architecture.py` |
 | Modules never import each other (collaboration is injected in `app.py`) | `tests/test_architecture.py` |
 | No import cycles (module level: zero; Core's legacy lazy cycles: ratcheted) | `tests/test_architecture.py` |
@@ -101,11 +107,13 @@ checks **no** request size — Core does all of that, once. Details:
 ### Database writes: one entry point
 
 ```python
-with write_tx() as conn:          # flock(LOCK_EX) on <db>.write.lock → BEGIN IMMEDIATE
+from elenvind import db
+
+with db.write_tx() as conn:       # flock(LOCK_EX) on <db>.write.lock → BEGIN IMMEDIATE
     conn.execute("INSERT INTO comment (...) VALUES (...)", (...))
 ```
 
-Reads use `with connect()`. Every write transaction takes a cross-process `flock` on a
+Reads use `with db.connect()`. Every write transaction takes a cross-process `flock` on a
 lock file that sits *next to* the database (`sqlite.db` → `sqlite.db.write.lock`), then
 `BEGIN IMMEDIATE`, then commits or rolls back — so multiple Gunicorn workers are safe
 without a writer process, a queue, or a retry loop. Writes are serialized; reads are not.
@@ -118,8 +126,10 @@ The full contract, its limits and what it deliberately does *not* promise:
 elenvind/
   app.py        composition root (wiring, injection, startup hooks)
   wsgi.py       production entry point
-  core/         framework: HTTP, routing, security, sessions, CSRF, templates,
-                markdown, content format, database (connect/write_tx/migrations), logs
+  core/         runtime base: HTTP, routing, security, sessions, CSRF, templates,
+                markdown, content format, config, logging
+  db/           persistence base (the only SQLite boundary): connection, write_tx,
+                migrations, and the per-table data APIs
   modules/      business: blog, pages, auth, users, admin, seo, system
   templates/    Jinja2 templates (Python prepares data, HTML lives here)
   static/       packaged assets, served by the app with URL mirroring disk
@@ -165,7 +175,7 @@ image.
 |---|---|
 | Runtime | Python standard library + Gunicorn (WSGI), synchronous business code |
 | Rendering | Jinja2 templates, server-side, Zero-JS |
-| Database | SQLite (WAL, `PRAGMA foreign_keys=ON`, `user_version` migrations) |
+| Database | SQLite in `elenvind/db/` (WAL, `PRAGMA foreign_keys=ON`, `user_version` migrations, schema v5) |
 | Write coordination | `write_tx()`: cross-process `flock` on a separate lock file + `BEGIN IMMEDIATE`; multi-worker safe, writes serialized |
 | Content | Markdown body + TOML front matter (`+++` fence), rendered by `core.markdown` |
 | Markup safety | Whitelist HTML sanitiser in `core.markdown` (stdlib `html.parser`) |
