@@ -27,6 +27,35 @@ CONFIG_PATH = ROOT / "config.toml"
 
 config = {}
 
+#: **实际**监听地址（由启动器 `run.py` 在算完 `--bind` 覆盖后写入）。
+#: 为什么需要它：`[server].host` 只是"没有命令行覆盖时"的意图，与真正 bind 的
+#: 地址可能不同；而"是否暴露在反向代理之外"的告警必须看**实际值**，否则会
+#: 假阳性（配置写 0.0.0.0 但 bind 了回环）甚至假阴性（配置写回环却 bind 了
+#: 0.0.0.0，那才是真正危险的方向）。未注入时回落配置值。
+_effective_bind = None
+
+
+def set_effective_bind(bind) -> None:
+    """启动器注入实际监听地址（`host:port`）；None = 未提供。"""
+    global _effective_bind
+    _effective_bind = str(bind).strip() if bind else None
+
+
+def effective_bind_host() -> str:
+    """实际监听地址里的 host 部分；未注入时返回空串。
+
+    支持 `0.0.0.0:6789`、`[::1]:6789`、`localhost`（无端口）三种写法。
+    """
+    if not _effective_bind:
+        return ""
+    value = _effective_bind
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end] if end != -1 else value
+    if ":" in value:
+        return value.rsplit(":", 1)[0]
+    return value
+
 
 class ConfigError(ValueError):
     """配置缺失/非法：启动阶段直接失败，不做静默兜底。"""
@@ -87,11 +116,14 @@ _FORBIDDEN_URL_CHARS = set("'\"()<>\\ \t")
 _FORBIDDEN_AUTHORITY_CHARS = set("'\"()<>\\ \t@")
 
 
-def _check_asset_url(value, name):
-    """静态资源地址：允许空、站内绝对路径（/x）或 http(s) 绝对 URL。
+def _check_asset_url(value, name, schemes=("http", "https")):
+    """静态/链接资源地址：允许空、站内绝对路径（/x）或绝对 URL。
 
     额外约束字符集（见 `_FORBIDDEN_URL_CHARS`）：这些值会进入 HTML 属性
     甚至内联 CSS 的 `url()`，必须保证无法闭合外层语法。
+
+    `schemes` 决定允许哪些协议：默认只允许 http(s)（样式表 / 图标 / hero），
+    `mailto:` 只给 `[params]` 的社交链接用（仓库自带 email 图标，就该能填邮箱）。
     """
     if value is None or str(value).strip() == "":
         return
@@ -111,9 +143,15 @@ def _check_asset_url(value, name):
                  f"{name} must not carry a scheme: {value!r}")
         return
     parsed = urlparse(text)
-    _require(parsed.scheme in ("http", "https") and bool(parsed.netloc),
-             f"{name} must be a site-relative path or an absolute http(s) URL, "
-             f"got {value!r}")
+    if parsed.scheme == "mailto":
+        _require("mailto" in schemes,
+                 f"{name} must be a site-relative path or an absolute URL, got {value!r}")
+        _require(bool(parsed.path) and "@" in parsed.path,
+                 f"{name} must be a valid mailto: address, got {value!r}")
+        return
+    _require(parsed.scheme in schemes and bool(parsed.netloc),
+             f"{name} must be a site-relative path or an absolute URL "
+             f"({'/'.join(schemes)}), got {value!r}")
     bad = sorted({ch for ch in parsed.netloc if ch in _FORBIDDEN_AUTHORITY_CHARS})
     _require(not bad, f"{name} host contains forbidden characters {bad}: {value!r}")
 
@@ -218,13 +256,23 @@ def validate_config(cfg=None):
             # 字符串形式按空白切分：既接受 "a b" 也接受单个值
             _require(_CONTROL_RE.search(value) is None,
                      f"security.csp.{name} must not contain control characters")
-            continue
-        _require(isinstance(value, list)
-                 and all(isinstance(item, str) for item in value),
-                 f"security.csp.{name} must be a list of strings or a string")
-        for item in value:
-            _require(_CONTROL_RE.search(item) is None,
-                     f"security.csp.{name} values must not contain control characters")
+            items = value.split()
+        else:
+            _require(isinstance(value, list)
+                     and all(isinstance(item, str) for item in value),
+                     f"security.csp.{name} must be a list of strings or a string")
+            for item in value:
+                _require(_CONTROL_RE.search(item) is None,
+                         f"security.csp.{name} values must not contain control characters")
+            items = list(value)
+        # `[security.csp]` 只允许**收窄**默认策略：显式写裸通配（`*`）或裸协议
+        # （`http:` / `https:`）等于把默认的"任意第三方"重新放开，甚至放得更宽，
+        # 与配置注释里的承诺相反。要放开就写明确的主机名 allowlist。
+        for item in items:
+            stripped = item.strip()
+            _require(stripped not in ("*", "http:", "https:"),
+                     f"security.csp.{name} must not contain bare {stripped!r}: "
+                     f"list explicit host(s) instead")
 
     # ----- 数据库与请求体 -----
     _require(isinstance(cfg.get("database", "sqlite.db"), str), "database must be a string path")
@@ -257,6 +305,27 @@ def validate_config(cfg=None):
     _require(isinstance(static_cfg, dict), "[static] must be a table")
     for key in ("css", "favicon", "logo", "hero"):
         _check_asset_url(static_cfg.get(key), f"static.{key}")
+
+    # ----- 页头/页脚链接（同样会进入 href / src 属性） -----
+    # 与 [static] 走**同一套** URL 字符与协议白名单，不再有"配置里这一类地址
+    # 没人校验"的口子。[params] 的社交链接额外允许 mailto:（仓库自带 email 图标）。
+    params_cfg = cfg.get("params", {})
+    _require(isinstance(params_cfg, dict), "[params] must be a table")
+    for section in ("nav", "social", "projects"):
+        entries = params_cfg.get(section) or []
+        if entries is None:
+            continue
+        _require(isinstance(entries, list),
+                 f"params.{section} must be an array of tables")
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue                    # 非法条目由渲染层忽略（与既有行为一致）
+            for key in ("url", "icon"):
+                value = entry.get(key)
+                if value is None:
+                    continue
+                _check_asset_url(value, f"params.{section}[{index}].{key}",
+                                 schemes=("http", "https", "mailto"))
 
     # ----- 内置样式表回落开关 -----
     # true（默认）：[static].css 为空时使用应用内置样式表；
@@ -292,6 +361,11 @@ def validate_config(cfg=None):
              "logging.file must be a string path")
     _check_int(logging_cfg.get("max_bytes", 10 * 1024 * 1024), "logging.max_bytes", 4096, 2 ** 40)
     _check_int(logging_cfg.get("backup_count", 5), "logging.backup_count", 0, 1000)
+    # 是否在应用内轮转日志。默认 False = 只写当前文件、由外部 logrotate 负责轮转。
+    # 为什么默认不开：多 worker 各自持有轮转句柄，同时轮转会互相截断/丢行；
+    # 单进程（或明确知道只有一个 worker）才适合开 true。
+    _require(isinstance(logging_cfg.get("rotate", False), bool),
+             "logging.rotate must be a boolean")
 
     # 说明：本应用**不需要任何签名密钥**。
     # 会话是服务端随机 token（存在 SQLite 里，客户端只拿到不可猜测的值），

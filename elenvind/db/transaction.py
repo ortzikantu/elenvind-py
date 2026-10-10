@@ -11,7 +11,7 @@ import time
 from contextlib import contextmanager
 
 from . import connection
-from .connection import _configure_connection, _write_file_lock, get_connection
+from .connection import _write_file_lock, get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ def write_tx(*, foreign_keys: bool = True, ensure_wal: bool = False):
                 except BaseException:
                     try:
                         conn.rollback()
-                    except Exception:    # noqa: BLE001 - 原始异常优先
+                    except Exception:        # 原始异常优先，回滚失败只记日志
                         logger.exception("Rollback after an error in write_tx() failed")
                     logger.debug("Write transaction rolled back after %.1f ms (path=%s)",
                                  (time.monotonic() - started) * 1000.0, connection.DB_PATH)
@@ -106,7 +106,7 @@ def write_tx(*, foreign_keys: bool = True, ensure_wal: bool = False):
             finally:
                 try:
                     conn.close()
-                except Exception:        # noqa: BLE001 - 关闭失败不应覆盖业务异常
+                except Exception:        # 关闭失败不应覆盖业务异常
                     logger.exception("Closing the write connection failed")
     finally:
         _write_depth.value = depth

@@ -20,10 +20,11 @@
 | `migration` | schema 定义、`user_version` 迁移、`init_db()` |
 | `user` | `user` 表 + 邮箱规范化 |
 | `session` | `session` 表（绝对 + 滑动过期） |
-| `comment` | `comment` 表（层级 / 树展开） |
+| `comment` | `comment` 表（层级 / 树展开 / 涂黑） |
 | `comment_rate` | 评论限流记账 + 原子写入 |
 | `auth` | `login_attempts` / `register_attempts`（认证尝试流水） |
 | `maintenance` | 机会式清理（独立写事务） |
+| `backup` | 在线一致性备份（运维入口，只读源库） |
 
 `modules` 可以 `from ...db import X` 或 `from ...db.comment import Y`；
 装配层把本包**整个**作为 store 注入给 `core.session`（`store=db`）。
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 from . import (
     auth,
+    backup,
     comment,
     comment_rate,
     connection,
@@ -44,27 +46,24 @@ from . import (
 from .auth import (
     COOLDOWN_BASE_SECONDS,
     COOLDOWN_MAX_SECONDS,
+    REGISTER_RETENTION_DAYS,
+    RETENTION_DAYS,
     cleanup_old_attempts,
-    complete_login_success,
-    reserve_login_attempt,
     cleanup_old_login_attempts,
     clear_login_attempts,
-    count_email_failures,
-    count_global_recent_failures,
-    count_ip_failures,
+    complete_login_success,
     record_login_attempt,
+    reserve_login_attempt,
     try_register_attempt,
 )
+from .backup import BackupError, backup_to
 from .comment import (
-    REDACTION_BLOCK,
-    REDACTION_MAX_BLOCKS,
-    redact_comment,
-    update_comment_content,
     comment_depth,
-    create_comment,
     flatten_comment_tree,
     get_comment_by_id,
     get_comments_by_article,
+    redact_comment,
+    update_comment_content,
 )
 from .comment_rate import cleanup_old_comment_attempts, try_post_comment
 from .connection import (
@@ -78,13 +77,7 @@ from .connection import (
     lock_path_for,
 )
 from .maintenance import prune
-from .migration import (
-    _LEGACY_SESSION_DAYS,
-    SCHEMA_VERSION,
-    MigrationError,
-    init_db,
-    migrate,
-)
+from .migration import SCHEMA_VERSION, MigrationError, init_db, migrate
 from .session import (
     DEFAULT_ABSOLUTE_DAYS,
     DEFAULT_IDLE_DAYS,
@@ -107,25 +100,64 @@ from .user import (
 )
 
 __all__ = [
-    # 子模块
-    "auth", "comment", "comment_rate", "connection", "maintenance", "migration",
-    "session", "transaction", "user",
-    # 基础设施
-    "DB_PATH", "DEFAULT_DB_PATH", "IntegrityError", "configure", "connect", "get_connection",
-    "lock_path_for", "journal_mode", "SCHEMA_VERSION", "MigrationError", "init_db", "migrate",
-    "write_tx",
-    # 领域 API
-    "COOLDOWN_BASE_SECONDS", "COOLDOWN_MAX_SECONDS",
-    "cleanup_old_attempts", "cleanup_old_login_attempts", "clear_login_attempts",
-    "complete_login_success", "reserve_login_attempt",
-    "count_email_failures", "count_global_recent_failures", "count_ip_failures",
-    "record_login_attempt", "try_register_attempt",
-    "comment_depth", "create_comment", "flatten_comment_tree", "get_comment_by_id",
-    "get_comments_by_article", "redact_comment", "update_comment_content",
-    "cleanup_old_comment_attempts", "try_post_comment",
+    "COOLDOWN_BASE_SECONDS",
+    "COOLDOWN_MAX_SECONDS",
+    "DB_PATH",
+    "DEFAULT_ABSOLUTE_DAYS",
+    "DEFAULT_DB_PATH",
+    "DEFAULT_IDLE_DAYS",
+    "REGISTER_RETENTION_DAYS",
+    "RETENTION_DAYS",
+    "SCHEMA_VERSION",
+    "BackupError",
+    "IntegrityError",
+    "MigrationError",
+    "auth",
+    "backup",
+    "backup_to",
+    "cleanup_expired_sessions",
+    "cleanup_old_attempts",
+    "cleanup_old_comment_attempts",
+    "cleanup_old_login_attempts",
+    "clear_login_attempts",
+    "comment",
+    "comment_depth",
+    "comment_rate",
+    "complete_login_success",
+    "configure",
+    "connect",
+    "connection",
+    "create_session",
+    "create_user",
+    "delete_session",
+    "delete_user",
+    "delete_user_sessions",
+    "flatten_comment_tree",
+    "get_comment_by_id",
+    "get_comments_by_article",
+    "get_connection",
+    "get_session_user",
+    "get_user_by_email",
+    "get_user_by_id",
+    "get_user_number",
+    "init_db",
+    "journal_mode",
+    "lock_path_for",
+    "maintenance",
+    "migrate",
+    "migration",
+    "normalize_email",
     "prune",
-    "DEFAULT_ABSOLUTE_DAYS", "DEFAULT_IDLE_DAYS", "cleanup_expired_sessions",
-    "create_session", "delete_session", "delete_user_sessions", "get_session_user",
-    "create_user", "delete_user", "get_user_by_email", "get_user_by_id",
-    "get_user_number", "normalize_email", "update_user_password", "update_user_profile",
+    "record_login_attempt",
+    "redact_comment",
+    "reserve_login_attempt",
+    "session",
+    "transaction",
+    "try_post_comment",
+    "try_register_attempt",
+    "update_comment_content",
+    "update_user_password",
+    "update_user_profile",
+    "user",
+    "write_tx",
 ]

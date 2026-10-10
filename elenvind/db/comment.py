@@ -1,11 +1,14 @@
 """comment 表：文章评论的读取、软删除/恢复与计数。
 
 设计说明：
-- 业务上的“删除”是**软删除**（is_deleted=1）：评论仍留在库里以便审计与恢复，
-  页面展示层负责把已删评论对普通访客打码、对管理员划线显示。
-  **没有物理删除入口**：评论一旦产生就永久保留（这也是审计前提）。
-- `parent_id` 实现楼中楼回复；一次取回整篇文章评论后在内存里组树（树算法见
-  modules/blog/logic.py 的 build_comment_rows），避免 N+1 次查询。
+- 业务上的“删除”是**涂黑**（`is_deleted=1` 且正文被黑块替换）：行本身保留，
+  这样评论树不会散架、审计线索不断；正文在同一个 UPDATE 里被覆盖，数据库里
+  不再有可恢复的副本。
+  **没有物理删除入口**：评论行一旦产生就永久保留。
+  注意：涂黑会**释放**文章配额（`db/comment_rate.try_post_comment` 只统计
+  `is_deleted = 0`），否则"打满上限"会变成该文章永久拒评。
+- `parent_id` 实现楼中楼回复；一次取回整篇文章评论后在内存里组树
+  （树算法见 `db/comment.flatten_comment_tree`），避免 N+1 次查询。
   数据库层 `parent_id` 是 ON DELETE SET NULL，因此即便父行在库外被删除，
   子评论也会自动升级为顶层而不是消失。
 - **本模块所有返回评论行的查询都带 `nickname` / `user_deleted`**（JOIN user），
@@ -13,8 +16,6 @@
 - 评论的“写入 + 限流判定”在 db_comment_rate.try_post_comment 中原子完成。
 - **读走 `connect()`，写走 `write_tx()`**（跨进程 flock + BEGIN IMMEDIATE）。
 """
-from datetime import datetime
-
 from .connection import connect
 from .transaction import write_tx
 
@@ -202,20 +203,3 @@ def flatten_comment_tree(comments):
     if leftovers:
         walk(sorted(leftovers, key=lambda row: row["id"]))
     return ordered
-
-
-def create_comment(article_slug: str, user_id: int, content: str, parent_id: int = None) -> int:
-    """写入一条评论，返回新 id（parent_id 为空表示顶层评论）。
-
-    注意：Web 流程请用 db_comment_rate.try_post_comment（带原子限流 + 深度校验）；
-    本函数保留给脚本与测试使用，**不校验深度**——它是"底层写入原语"，
-    绕开它写出的超深链由渲染侧的 `comment_depth` limit 兜底。
-    """
-    with write_tx() as conn:
-        cursor = conn.execute(
-            "INSERT INTO comment (article_slug, user_id, content, created_at, parent_id, is_deleted) "
-            "VALUES (?, ?, ?, ?, ?, 0)",
-            (article_slug, user_id, content, datetime.now().isoformat(), parent_id)
-        )
-        new_id = cursor.lastrowid
-    return new_id

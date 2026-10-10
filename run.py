@@ -23,12 +23,16 @@ Gunicorn 的 `forwarded_allow_ips`，应用自己再用**同一份**列表判定
 from __future__ import annotations
 
 import sys
+from datetime import datetime
+from pathlib import Path
 
 from elenvind.core.config import (
+    ROOT,
     ConfigError,
     apply_runtime_config,
     config,
     load_config,
+    set_effective_bind,
     validate_config,
 )
 from elenvind.core.console import banner, error, info
@@ -45,6 +49,8 @@ Elenvind — Gunicorn 启动器
   --reload            代码改动自动重载（开发用；会显著变慢）
   --preload           在 master 进程导入应用（startup 只执行一次）
   --access-log        打开访问日志（默认关闭）
+  --backup            在线备份数据库后退出（默认 backups/elenvind-<时间戳>.db）
+  --backup-to PATH    与 --backup 同用：指定备份文件路径
   --help              显示本帮助
 
 不用本脚本时：
@@ -55,7 +61,8 @@ Elenvind — Gunicorn 启动器
 def _parse_args(argv):
     """解析命令行参数；不认识/缺值的选项一律报错（不做静默忽略）。"""
     options = {"workers": None, "bind": None, "reload": False,
-               "preload": False, "access_log": False, "help": False}
+               "preload": False, "access_log": False, "help": False,
+               "backup": False, "backup_to": None}
     index = 0
     while index < len(argv):
         arg = argv[index]
@@ -68,7 +75,9 @@ def _parse_args(argv):
             options["preload"] = True
         elif arg == "--access-log":
             options["access_log"] = True
-        elif arg in ("--workers", "--bind"):
+        elif arg == "--backup":
+            options["backup"] = True
+        elif arg in ("--workers", "--bind", "--backup-to"):
             if index >= len(argv):
                 raise ValueError(f"{arg} 需要一个取值")
             value = argv[index]
@@ -80,10 +89,13 @@ def _parse_args(argv):
                     raise ValueError(f"--workers 需要整数，收到 {value!r}") from None
                 if options["workers"] < 1:
                     raise ValueError("--workers 必须 >= 1")
-            else:
+            elif arg == "--bind":
                 if ":" not in value:
                     raise ValueError(f"--bind 需要 HOST:PORT 形式，收到 {value!r}")
                 options["bind"] = value
+            else:
+                options["backup_to"] = value
+                options["backup"] = True
         else:
             raise ValueError(f"未知选项: {arg}")
     return options
@@ -98,6 +110,33 @@ def _trusted_proxies(server_config):
         trusted = []
     entries = [str(item).strip() for item in trusted if str(item).strip()]
     return ",".join(entries), entries
+
+
+def _run_backup(destination=None) -> int:
+    """`--backup` / `--backup-to`：把数据库复制成一份一致副本后退出。
+
+    备份能力在 `db.backup`（SQLite 的 backup API）：WAL 模式下裸拷贝主文件会
+    丢掉还在 `-wal` 里的事务，而 `cp` 也不是原子快照。这里不启动 Gunicorn ——
+    备份是运维动作，不该顺带起一个服务。
+    """
+    from elenvind import db  # 延迟导入：只有真的备份时才加载 db 层
+    from elenvind.app import resolve_db_path
+
+    source = resolve_db_path()
+    if destination:
+        target = Path(destination).expanduser()
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = ROOT / "backups" / f"elenvind-{stamp}.db"
+    try:
+        written = db.backup_to(target, db_path=source)
+    except db.BackupError as problem:
+        error(str(problem))
+        return 1
+    info(f"Backup written: {written}")
+    info("Restore: stop the service, move the current sqlite.db away, then put the "
+         "backup in its place (and delete any sqlite.db-wal / sqlite.db-shm).")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -121,12 +160,18 @@ def main(argv=None) -> int:
         error(f"Invalid configuration: {e}")
         return 2
 
+    if options["backup"]:
+        return _run_backup(options["backup_to"])
+
     server_config = config.get("server", {}) or {}
     host = server_config.get("host", "127.0.0.1")
     port = server_config.get("port", 6789)
     workers = options["workers"] or int(server_config.get("workers", 2) or 2)
     bind = options["bind"] or f"{host}:{port}"
     forwarded_allow_ips, trusted = _trusted_proxies(server_config)
+    # 把**实际**监听地址交给应用层：暴露告警必须看真实 bind，而不是配置意图
+    # （`--bind 0.0.0.0` 覆盖配置时，只读配置的告警会静默失效）。
+    set_effective_bind(bind)
 
     banner("=================================")
     banner("")

@@ -25,7 +25,6 @@ Route 通过声明使用：
 from __future__ import annotations
 
 from .security import (
-    admin_id,
     hash_password,
     is_admin,
     password_needs_rehash,
@@ -97,7 +96,7 @@ def verify_credentials(user, password: str):
         return True, None
     try:
         return True, hash_password(password)
-    except Exception:          # noqa: BLE001 - 升级失败不影响本次登录
+    except Exception:
         return True, None
 
 

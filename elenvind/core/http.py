@@ -26,28 +26,29 @@ import logging
 from http.client import responses as HTTP_REASONS
 from urllib.parse import parse_qs
 
-from .context import current_request
 from .security import (
     CSRF_COOKIE,
-    CSRF_MAX_AGE,
     PREFERENCE_COOKIES,
     SESSION_COOKIE,
     build_security_headers,
-    cookie_name,
-    cookie_names,
     csrf_cookie_header,
     generate_csrf_token,
     is_valid_csrf_token,
     pick_cookie,
 )
-from .utils import escape_html, get_client_ip, get_request_scheme, peer_address
+from .utils import get_client_ip, get_request_scheme, peer_address
 
 logger = logging.getLogger(__name__)
 
-#: 允许的请求方法；其余一律 405（带 Allow 头）
-ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
-#: 这些方法需要在请求对象上解析表单
-_FORM_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+#: 请求方法白名单：其余（CONNECT 等）在解析阶段直接 405。
+#: OPTIONS / TRACE 也在白名单里，但**没有任何路由声明它们**，因此会走到调度器
+#: 拿回 `405 + Allow` —— 这是刻意的：本站不实现它们，但客户端必须能读到 Allow
+#: 才能自愈（早期错误路径拿不到路由表，发不出 Allow）。
+ALLOWED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE")
+#: 语义上"带表单体"的方法。它们必须有 Content-Length，但**缺失的判定在调度器**
+#: （core/routing.py）—— 这样"路径不存在 / 方法不允许"仍优先得到 404 / 405，
+#: 而不是在半路被 411 截断。
+FORM_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 #: 表单 Content-Type
 FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 #: 默认请求体上限（1 MB）
@@ -112,11 +113,28 @@ class CsrfError(Forbidden):
 class Request:
     """一次 HTTP 请求的解析结果。由 Core 构造，模块只读消费。"""
 
-    __slots__ = ("environ", "method", "path", "query", "headers", "cookies",
-                 "raw_body", "_form", "content_type", "content_length",
-                 "client_ip", "secure", "user", "session_token", "lang",
-                 "_csrf", "_csrf_dirty", "_preferences",
-                 "_session_cookie_dirty", "_session_cookie_clear_pending")
+    __slots__ = (
+        "_csrf",
+        "_csrf_dirty",
+        "_form",
+        "_preferences",
+        "_session_cookie_clear_pending",
+        "_session_cookie_dirty",
+        "client_ip",
+        "content_length",
+        "content_type",
+        "cookies",
+        "environ",
+        "headers",
+        "lang",
+        "method",
+        "path",
+        "query",
+        "raw_body",
+        "secure",
+        "session_token",
+        "user",
+    )
 
     def __init__(self, *, environ, method, path, query, headers, cookies, raw_body,
                  form, content_type, content_length, client_ip, secure, lang,
@@ -169,7 +187,7 @@ class Request:
         form = {}
         content_type = headers.get("content-type", "")
         content_length = None
-        if method in _FORM_METHODS:
+        if method in FORM_METHODS:
             raw_body, content_length = _read_body(environ, headers)
             if raw_body:
                 mime = content_type.split(";")[0].strip().lower()
@@ -316,10 +334,12 @@ def _read_body(environ, headers):
     """按 Content-Length 严格读取请求体（同步，WSGI 输入流）。
 
     错误语义（在 Core 里只实现一次，模块不需要关心）：
-    - 缺 Content-Length（含 chunked）→ 411
-    - 长度非数字 / 负数              → 400
-    - 声明超过上限                  → 413（不读 body）
-    - 实收少于声明（截断/断开）      → 400
+    - 缺 Content-Length（含 chunked）-> 返回 `(b"", None)`，**由调度器**在确认
+      该路由确实是表单方法后才回 411（否则 `DELETE /` 这种"方法不允许"的请求
+      会得到语义错误的 411 而不是 405 + Allow）
+    - 长度非数字 / 负数              -> 400
+    - 声明超过上限                  -> 413（不读 body）
+    - 实收少于声明（截断/断开）      -> 400
 
     为什么是"循环读"而不是一次 `read(declared)`：PEP 3333 明确允许
     `wsgi.input` **短读**（一次只给一部分），一次 read 拿到的长度不可信。
@@ -330,7 +350,7 @@ def _read_body(environ, headers):
     """
     raw_length = headers.get("content-length")
     if raw_length is None:
-        raise LengthRequired("Content-Length is required")
+        return b"", None
     try:
         declared = int(raw_length)
     except (TypeError, ValueError):
@@ -460,10 +480,16 @@ def max_body_size() -> int:
 # ======================= Response =======================
 
 class Response:
-    """HTTP 响应。模块只关心 status / body / headers；Cookie 用专门 API。"""
+    """HTTP 响应。模块只关心 status / body / headers / cache_control。
 
-    __slots__ = ("status", "body", "content_type", "headers", "cookies",
-                 "cache_control")
+    **Response 上没有 Cookie API**：模块不得自己拼 Set-Cookie（那会绕过
+    `__Host-` 前缀与 HttpOnly / SameSite / Secure 策略）。会话与 CSRF Cookie
+    由 `Request.pending_cookies()` 统一下发，偏好 Cookie 由
+    `request.set_preference()` 排队。这里曾经有一套 `set_cookie()` /
+    `delete_cookie()`，没有任何调用方，只提供了一条绕过策略的旁路，已删除。
+    """
+
+    __slots__ = ("body", "cache_control", "content_type", "headers", "status")
 
     def __init__(self, body=b"", *, status=200,
                  content_type="text/html; charset=utf-8", headers=None,
@@ -474,22 +500,11 @@ class Response:
         self.body = body
         self.content_type = content_type
         self.headers = list(headers or [])
-        self.cookies = []          # [(base_name, value, max_age, http_only)]
         self.cache_control = cache_control
 
     # ---------- 构造 helper ----------
-    def set_cookie(self, name, value, *, max_age, http_only=True):
-        """排队一个 Set-Cookie（真正的头由 Core 统一拼装）。"""
-        self.cookies.append((name, value, max_age, http_only))
-        return self
-
-    def delete_cookie(self, name):
-        """让 Cookie 立即过期（含前缀兼容名）。"""
-        for candidate in cookie_names(name):
-            self.cookies.append((candidate, "", 0, True))
-        return self
-
     def with_cache_control(self, value):
+        """设置本响应的 Cache-Control（返回 self，便于链式书写）。"""
         self.cache_control = value
         return self
 
@@ -622,25 +637,12 @@ def build_headers(request: Request, response: Response, *, head_only=False):
     if cache_control:
         headers.append((b"cache-control", cache_control.encode("latin-1")))
 
-    for name, value, max_age, http_only in response.cookies:
-        headers.append(_set_cookie_header(name, value, max_age=max_age,
-                                          http_only=http_only, secure=request.is_secure()))
+    # Set-Cookie 只有**一个**来源：Request 上的待下发 Cookie（会话轮换/清除、
+    # CSRF、站内偏好）。Response 没有 Cookie API，模块无法自己拼头 —— 因此
+    # 策略（HttpOnly / SameSite / Secure / 前缀）永远只由 core.security 决定。
     headers.extend(request.pending_cookies())
     headers.extend(response.headers)
     return headers
-
-
-def _set_cookie_header(name, value, *, max_age, http_only, secure):
-    """`Response.set_cookie()` 排队的 Cookie 的构造入口。
-
-    **构造实现委托 `core.security._make_cookie`**（全项目唯一的 Set-Cookie
-    拼装点，HttpOnly / SameSite=Lax / Path=/ / 可选 Secure 的策略都在那里）。
-    这里曾经是一份逐行重复的拷贝 —— 两份策略迟早会各自漂移，
-    例如有人只给其中一处加上 `__Host-` 要求的新属性。
-    """
-    from .security import _make_cookie
-
-    return _make_cookie(name, value, secure, int(max_age), http_only=http_only)
 
 
 def send_response(start_response, request: Request, response: Response, *,
@@ -711,15 +713,11 @@ def error_response(status: int, message: str = "") -> Response:
 
 
 __all__ = [
-    "ALLOWED_METHODS", "FORM_CONTENT_TYPE", "DEFAULT_MAX_BODY_SIZE",
-    "HttpError", "BadRequest", "LengthRequired", "PayloadTooLarge",
-    "UnsupportedMediaType", "MethodNotAllowed", "Forbidden", "NotFound", "CsrfError",
-    "Request", "Response", "html", "text", "json_response", "redirect",
-    # 注意：安全头的**定义**在 core.security（BASE_SECURITY_HEADERS 也在那里），
-    # 本模块只负责把它们装到响应上，因此不再从这里 re-export。
-    "build_security_headers",
-    "build_headers", "send_response", "send_early_error", "error_response",
-    "max_body_size", "collect_headers", "status_line", "wsgi_headers",
-    "escape_html", "current_request", "cookie_name", "SESSION_COOKIE",
-    "CSRF_MAX_AGE",
+    "ALLOWED_METHODS", "DEFAULT_MAX_BODY_SIZE", "FORM_CONTENT_TYPE", "FORM_METHODS",
+    "BadRequest", "CsrfError", "Forbidden", "HttpError", "LengthRequired",
+    "MethodNotAllowed", "NotFound", "PayloadTooLarge", "Request", "Response",
+    "UnsupportedMediaType",
+    "build_headers", "build_security_headers", "collect_headers", "error_response",
+    "html", "json_response", "max_body_size", "redirect", "send_early_error",
+    "send_response", "status_line", "text", "wsgi_headers",
 ]

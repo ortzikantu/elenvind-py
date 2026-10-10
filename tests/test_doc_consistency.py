@@ -1,351 +1,176 @@
-"""文档一致性守卫：文档里的"具体断言"必须与代码一致。
+"""文档 / 配置 / 文案一致性守卫。
 
-为什么需要：本轮审计发现文档里 20+ 处与代码不符，而**没有测试会因此变红** ——
-文档漂移是静默的。这里把最容易漂、最误导人的几类断言锁住：
-
-1. 会话寿命（绝对/空闲天数）—— 写错会让运维按错误预期排查"为什么被踢"；
-2. `max_comment_depth = 0` —— 文档曾说"0 = 不限层级"，实际会拒绝启动；
-3. `admin_user_id` 的缺省/取消/非法语义；
-4. 引用的脚本路径必须真实存在（曾经写 `scripts/smoke_driver.py`，实际在根目录）；
-5. 引用的符号必须真实存在（曾经引用 `safe_css_url()` / `MAX_BODY_SIZE` / `EVMD`）；
-6. `[static]` 的默认图标/logo 与磁盘上的文件一致；
-7. 同一份 config 键不得在 `config.toml` / `config.example.toml` 之间
-   "一个有、一个没有"（结构性缺漏，而非取值不同）。
+`config.toml` 的注释写着"守卫（tests/test_doc_consistency.py）只允许'收窄'：
+拒绝裸 `http:` / `https:` / `*`"，`config.example.toml` 引用 `docs/CONFIGURATION.md`
+—— 本文件让这些承诺真的成立：配置校验、CSP 收窄、i18n 键一致、交付件存在、
+依赖声明与代码实际 import 一致、模板保持 Zero-JS。
 """
+from __future__ import annotations
+
+import ast
 import re
+import sys
 import tomllib
+import unittest
 from pathlib import Path
 
-from tests.support import PROJECT_ROOT, ElenvindTestCase
+from tests import support
+from tests.support import PROJECT_ROOT
 
-ROOT = Path(PROJECT_ROOT)
-DOCS = ("README.md", "CONTRIBUTING.md", "docs/README.md", "docs/CONFIGURATION.md",
-        "docs/DEPLOYMENT.md", "docs/OPS_GUIDE.md", "docs/ARCHITECTURE.md",
-        "docs/SECURITY.md", "docs/development/modules.md",
-        "docs/development/database.md", "docs/development/testing.md",
-        "docs/nginx.conf.example", "config.example.toml")
+TEMPLATES = PROJECT_ROOT / "elenvind" / "templates"
+PACKAGE = PROJECT_ROOT / "elenvind"
 
 
-def read(relative):
-    return (ROOT / relative).read_text(encoding="utf-8")
+def _load_toml(path: Path) -> dict:
+    with open(path, "rb") as handle:
+        return tomllib.load(handle)
 
 
-class SessionLifetimeDocsTests(ElenvindTestCase):
-    def test_documented_session_days_match_code(self):
-        """文档里写的绝对/空闲天数必须是代码里的默认值。"""
-        from elenvind.db.session import DEFAULT_ABSOLUTE_DAYS, DEFAULT_IDLE_DAYS
+class ConfigValidation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        support.ensure_application()
 
-        combined = read("docs/CONFIGURATION.md") + read("docs/OPS_GUIDE.md")
-        self.assertIn(str(DEFAULT_ABSOLUTE_DAYS), combined,
-                      "文档没有提到真实的绝对过期天数")
-        self.assertIn(str(DEFAULT_IDLE_DAYS), combined,
-                      "文档没有提到真实的空闲过期天数")
-        # 不得再出现"登录会话 7 天过期"这类旧说法
-        self.assertNotRegex(
-            combined, r"会话\s*7\s*天",
-            "文档仍在说会话 7 天过期（真实值是 30 天绝对 / 15 天空闲）")
-
-
-class MaxCommentDepthDocsTests(ElenvindTestCase):
-    #: 否定标志：出现这些说明作者正是在**否认**"0 = 不限"，属于正确表述
-    NEGATIONS = ("不是", "不会", "没有", "拒绝", "非法", "无效")
-
-    def test_docs_do_not_claim_zero_means_unlimited(self):
-        """`max_comment_depth = 0` 会拒绝启动，文档不得声称它表示不限层级。
-
-        判定在**整个文件**上做（不是单行）：说法可能写在键的说明行，也可能写在
-        紧随其后的段落里（例如"设为 `0` 表示不限制层级"单独成段），
-        只扫"含 max_comment_depth 的行"会漏掉后者。
-
-        写法很多（"设为 0 表示不限制"、"0 = 不限层级"…），所以放宽成
-        "0 附近出现 不限制/不限"；同一窗口里有"不是 / 拒绝 / 没有"等否定词时
-        跳过 —— 那正是在说明"0 不等于不限"，属于我们要的那句话。
-        """
-        pattern = re.compile(r"0[^0-9].{0,14}?不(限制|限)")
-        for name in ("docs/CONFIGURATION.md", "config.example.toml"):
-            text = read(name)
-            if "max_comment_depth" not in text:
-                # 这两个文件都必须说明这个键，缺了本身就是文档退化
-                self.fail(f"{name} 完全没有提到 max_comment_depth")
-            for lineno, line in enumerate(text.splitlines(), 1):
-                match = pattern.search(line)
-                if not match:
-                    continue
-                window = line[max(0, match.start() - 6):match.start() + 24]
-                if any(word in window for word in self.NEGATIONS):
-                    continue
-                self.fail(f"{name}:{lineno} 声称 0 表示不限层级：{line.strip()}")
-
-    def test_code_range_rejects_zero(self):
-        """与上一条互为印证：代码确实拒绝 0。"""
+    def _reject(self, **overrides):
         from elenvind.core.config import ConfigError, validate_config
-        from elenvind.core import config as config_module
 
-        saved = config_module.config.copy()
-        config_module.config.clear()
-        config_module.config.update({
-            "title": "T", "locale": "en", "max_comment_depth": 0,
-            "server": {"host": "127.0.0.1", "port": 6789},
-        })
-        try:
-            with self.assertRaises(ConfigError):
-                validate_config()
-        finally:
-            config_module.config.clear()
-            config_module.config.update(saved)
+        candidate = support.test_config(support.WORKSPACE)
+        candidate.update(overrides)
+        with self.assertRaises(ConfigError, msg=f"{overrides} must be rejected"):
+            validate_config(candidate)
 
+    def test_rejects_invalid_values(self):
+        for overrides in (
+            {"locale": "fr"},
+            {"title": "   "},
+            {"site_url": "https://example.com/"},          # 结尾斜杠
+            {"site_url": "ftp://example.com"},             # 非 http(s)
+            {"admin_user_id": 0},
+            {"admin_user_id": True},
+            {"max_length": 0},
+            {"max_comment_depth": 0},
+            {"session_absolute_days": 99999},
+            {"server": {"host": "127.0.0.1", "port": 70000, "workers": 1}},
+            {"logging": {"level": "verbose"}},
+            {"logging": {"level": "info", "rotate": "yes"}},
+            {"static": {"css": "javascript:alert(1)"}},
+            {"static": {"hero": "https://x/a.png'); background:url(//evil.test)"}},
+            {"static": {"hero": "//evil.test/a.png"}},     # 协议相对
+            {"params": {"nav": [{"name": "x", "url": "javascript:alert(1)"}]}},
+            {"params": {"social": [{"name": "x", "url": "data:text/html,x"}]}},
+            {"security": {"csp": {"script-src": ["*"]}}},          # 裸通配
+            {"security": {"csp": {"img-src": ["'self'", "http:"]}}},   # 裸协议
+            {"security": {"csp": {"bad name": ["'self'"]}}},
+            {"security": {"permissions_policy": "a=(); \r\nX-Evil: 1"}},
+        ):
+            self._reject(**overrides)
 
-class AdminUserIdDocsTests(ElenvindTestCase):
-    def test_docs_describe_the_real_admin_semantics(self):
-        """缺省 -> 1；`null` -> 无管理员；非法值 -> 拒绝启动。"""
-        text = read("docs/CONFIGURATION.md")
-        self.assertIn("admin_user_id", text)
-        # 曾经的错误说法："缺失或非法时视为无管理员"
-        self.assertNotRegex(text, r"缺失或非法时视为")
-
-    def test_removing_the_key_keeps_the_default_admin(self):
+    def test_accepts_narrowing_the_csp(self):
         from elenvind.core.config import validate_config
-        from elenvind.core import config as config_module
 
-        saved = config_module.config.copy()
-        config_module.config.clear()
-        config_module.config.update({
-            "title": "T", "locale": "en",
-            "server": {"host": "127.0.0.1", "port": 6789},
-        })
-        try:
-            validate_config()          # 缺省必须通过（取默认 1）
-        finally:
-            config_module.config.clear()
-            config_module.config.update(saved)
+        candidate = support.test_config(support.WORKSPACE)
+        candidate["security"] = dict(candidate["security"])
+        candidate["security"]["csp"] = {
+            "img-src": ["'self'", "data:", "https://cdn.example.com"],
+            "media-src": ["'self'"],
+            "object-src": False,
+        }
+        validate_config(candidate)
 
-    def test_null_means_no_admin_and_is_accepted(self):
+    def test_mailto_is_allowed_for_social_links_only(self):
         from elenvind.core.config import validate_config
-        from elenvind.core import config as config_module
 
-        saved = config_module.config.copy()
-        config_module.config.clear()
-        config_module.config.update({
-            "title": "T", "locale": "en", "admin_user_id": None,
-            "server": {"host": "127.0.0.1", "port": 6789},
-        })
-        try:
-            validate_config()
-        finally:
-            config_module.config.clear()
-            config_module.config.update(saved)
+        candidate = support.test_config(support.WORKSPACE)
+        validate_config(candidate)                          # params.social 里的 mailto:
+        self._reject(static={"favicon": "mailto:me@example.com"})
+
+    def test_shipped_configs_are_valid(self):
+        """仓库自带的 config.toml 与 config.example.toml 都必须能启动。"""
+        from elenvind.core.config import validate_config
+
+        for name in ("config.toml", "config.example.toml"):
+            validate_config(_load_toml(PROJECT_ROOT / name))
 
 
-class DocumentedPathTests(ElenvindTestCase):
-    #: 文档里出现过的、必须真实存在的路径
-    REQUIRED_PATHS = ("smoke_driver.py", "run.py", "config.example.toml",
-                      "docs/nginx.conf.example", "elenvind/static/css/style.css",
-                      "elenvind/static/imgs/favicon.ico",
-                      "elenvind/static/imgs/logo.png")
+class I18nConsistency(unittest.TestCase):
+    def test_all_languages_define_the_same_keys(self):
+        tables = {lang: _load_toml(PROJECT_ROOT / "i18n" / f"{lang}.toml")
+                  for lang in ("en", "zh", "ja")}
+        keys = {lang: set(table) for lang, table in tables.items()}
+        self.assertEqual(keys["en"], keys["zh"], "zh and en key sets differ")
+        self.assertEqual(keys["en"], keys["ja"], "ja and en key sets differ")
 
-    def test_required_paths_exist(self):
-        for relative in self.REQUIRED_PATHS:
-            with self.subTest(path=relative):
-                self.assertTrue((ROOT / relative).exists(), f"{relative} 不存在")
+    def test_every_key_used_in_code_or_templates_exists(self):
+        declared = set(_load_toml(PROJECT_ROOT / "i18n" / "en.toml"))
+        used: set[str] = set()
 
-    def test_no_reference_to_nonexistent_scripts_dir(self):
-        """曾经有三处写 `scripts/smoke_driver.py`，实际脚本在项目根。"""
-        offenders = []
-        for name in DOCS:
-            for lineno, line in enumerate(read(name).splitlines(), 1):
-                if re.search(r"scripts/\S*smoke_driver", line):
-                    offenders.append(f"{name}:{lineno}: {line.strip()}")
-        self.assertEqual(offenders, [],
-                         "文档引用了不存在的 scripts/ 路径：\n" + "\n".join(offenders))
+        # .py：用 AST 只看真正的 t(...) 调用（docstring 里的 `t("key")` 示例不算）
+        for path in PACKAGE.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id == "t"):
+                    used |= {arg.value for arg in node.args
+                             if isinstance(arg, ast.Constant) and isinstance(arg.value, str)}
 
+        # .html：模板里只有 `t('key')` 这一种形态
+        template_pattern = re.compile(r"""\bt\(\s*['"]([a-z0-9_]+)['"]""")
+        for path in TEMPLATES.rglob("*.html"):
+            used |= set(template_pattern.findall(path.read_text(encoding="utf-8")))
 
-class DocumentedSymbolTests(ElenvindTestCase):
-    #: 文档里绝对不该再出现的幽灵符号（都曾经被引用但从未存在）
-    GHOSTS = ("safe_css_url", "MAX_BODY_SIZE", "EVMD", "json_response",
-              "SESSION_DAYS")
-
-    def test_no_ghost_symbols_in_docs(self):
-        offenders = []
-        for name in DOCS:
-            for lineno, line in enumerate(read(name).splitlines(), 1):
-                for ghost in self.GHOSTS:
-                    if re.search(rf"\b{re.escape(ghost)}\b", line):
-                        offenders.append(f"{name}:{lineno}: {ghost} -> {line.strip()[:80]}")
-        self.assertEqual(offenders, [],
-                         "文档引用了不存在的符号：\n" + "\n".join(offenders))
-
-    def test_ghosts_really_do_not_exist(self):
-        """反向确认：这些名字在代码里确实没有定义（否则上一条的期望要改）。"""
-        code = "\n".join(
-            path.read_text(encoding="utf-8", errors="replace")
-            for path in (ROOT / "elenvind").rglob("*.py")
-            if "__pycache__" not in path.parts)
-        for ghost in ("safe_css_url", "MAX_BODY_SIZE", "SESSION_DAYS"):
-            with self.subTest(symbol=ghost):
-                self.assertNotRegex(code, rf"^\s*(def|class)\s+{ghost}\b", re.M)
-                self.assertNotRegex(code, rf"^{ghost}\s*=", re.M)
+        missing = sorted(used - declared)
+        self.assertEqual(missing, [], f"i18n keys referenced but not defined: {missing}")
 
 
-class StaticAssetDocsTests(ElenvindTestCase):
-    def test_documented_icon_and_logo_exist_on_disk(self):
-        """文档承诺的缺省图标/logo 必须真的在 elenvind/static/imgs/ 里。
+class Deliverables(unittest.TestCase):
+    def test_readme_and_configuration_doc_exist(self):
+        self.assertTrue((PROJECT_ROOT / "README.md").is_file())
+        self.assertTrue((PROJECT_ROOT / "docs" / "CONFIGURATION.md").is_file())
 
-        `DEFAULT_ICON_CANDIDATES` 是 **URL 路径**（如 `/imgs/favicon.ico`），
-        不是文件系统路径，因此要拼到 `STATIC_DIR` 上再判存在。
-        """
-        from elenvind.core.assets import DEFAULT_ICON_CANDIDATES, STATIC_DIR
+    def test_deployment_examples_exist(self):
+        for name in ("nginx.conf.example", "elenvind.service", "logrotate.conf"):
+            self.assertTrue((PROJECT_ROOT / "deploy" / name).is_file(), name)
 
-        for url_path in DEFAULT_ICON_CANDIDATES:
-            with self.subTest(candidate=url_path):
-                self.assertTrue((STATIC_DIR / url_path.lstrip("/")).is_file(),
-                                f"缺省图标候选不存在：{url_path}")
-        self.assertTrue((STATIC_DIR / "imgs" / "logo.png").is_file())
+    def test_requirements_cover_third_party_imports(self):
+        names: set[str] = set()
+        for path in [*PACKAGE.rglob("*.py"), PROJECT_ROOT / "run.py"]:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names |= {alias.name.split(".")[0] for alias in node.names}
+                elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                    names.add(node.module.split(".")[0])
+        third_party = {name for name in names
+                       if name not in sys.stdlib_module_names
+                       and name not in {"elenvind", "__future__"}}
+        self.assertEqual(third_party, {"gunicorn", "jinja2", "markdown", "markupsafe"},
+                         "the dependency set changed; update requirements.txt and this test")
 
-    def test_deployment_doc_lists_the_shipped_icons(self):
-        text = read("docs/DEPLOYMENT.md")
-        for icon in ("favicon.ico", "favicon.png", "logo.png", "github.svg"):
-            with self.subTest(icon=icon):
-                self.assertIn(icon, text)
-        # 不得再声称"仓库不附带图片资产"
-        self.assertNotIn("仓库不附带图片资产", text)
+        declared = {line.split("==")[0].strip().lower()
+                    for line in (PROJECT_ROOT / "requirements.txt").read_text(
+                        encoding="utf-8").splitlines() if line.strip()}
+        self.assertTrue({"gunicorn", "jinja2", "markdown", "markupsafe"} <= declared,
+                        f"requirements.txt is missing packages: {declared}")
 
+    def test_templates_stay_zero_javascript(self):
+        """CSP 声明 script-src 'none'：模板里就不该出现脚本或 javascript: URL。"""
+        for path in TEMPLATES.rglob("*.html"):
+            source = path.read_text(encoding="utf-8").lower()
+            self.assertNotIn("<script", source, f"{path.name} contains a script tag")
+            self.assertNotIn("javascript:", source, f"{path.name} contains javascript:")
 
-class ConfigParityTests(ElenvindTestCase):
-    """config.toml 与 config.example.toml 不得"结构性"缺键。
-
-    取值不同是正常的（config.toml 是站长的真实站点，example 是通用模板），
-    但**键的有无**不该无故有差异 —— 那通常意味着新加的配置项忘了写进模板。
-
-    例外：`[security.csp]` 下的指令键。`config.example.toml` 把它们写成
-    **注释形式的"默认值示意"**（不写就是代码默认），而 `config.toml` 可能
-    显式写出其中几条。因此只看"非 csp 的键"，并且额外要求：凡是 config.toml
-    显式写出的 csp 指令，其取值必须等于代码默认值（否则就是悄悄放开了 CSP）。
-    """
-
-    #: 允许只存在于某一份里的键（前缀匹配）
-    ALLOWED_ONLY_IN_REAL_PREFIXES = ("security.csp.",)
-    ALLOWED_ONLY_IN_EXAMPLE_PREFIXES = ("security.csp.",)
-
-    def _flatten(self, data, prefix=""):
-        out = {}
-        for key, value in data.items():
-            name = f"{prefix}{key}"
-            if isinstance(value, dict):
-                out.update(self._flatten(value, name + "."))
-            elif isinstance(value, list) and value and isinstance(value[0], dict):
-                out[name] = f"<{len(value)} 项>"
-            else:
-                out[name] = value
-        return out
-
-    @staticmethod
-    def _allowed(key, prefixes):
-        return any(key.startswith(prefix) for prefix in prefixes)
-
-    def test_key_sets_match_except_declared_exceptions(self):
-        real = self._flatten(tomllib.loads(read("config.toml")))
-        example = self._flatten(tomllib.loads(read("config.example.toml")))
-        only_real = {key for key in set(real) - set(example)
-                     if not self._allowed(key, self.ALLOWED_ONLY_IN_REAL_PREFIXES)}
-        only_example = {key for key in set(example) - set(real)
-                        if not self._allowed(key, self.ALLOWED_ONLY_IN_EXAMPLE_PREFIXES)}
-        self.assertEqual(
-            (sorted(only_real), sorted(only_example)), ([], []),
-            f"config.toml 独有 {sorted(only_real)}；"
-            f"config.example.toml 独有 {sorted(only_example)}")
-
-    #: 默认值里的"通配"标记：被替换成显式主机属于**收窄**，允许
-    WILDCARDS = ("http:", "https:")
-
-    def test_explicit_csp_directives_never_widen_the_defaults(self):
-        """config.toml 显式写出的 CSP 指令只能收窄，不能放开。
-
-        允许两种形态：
-
-        1. 与代码默认**完全一致**；
-        2. **主机 allowlist**：把默认里的 `http:` / `https:` 通配替换成具体
-           origin（如 `https://cdn.example.com`），其余保持默认。
-
-        禁止：裸 `http:` / `https:` / `*`（那等于允许任意第三方资源 ——
-        访问者的 IP/UA 会交给对方），或删掉默认里已有的限制。
-        """
-        from elenvind.core.security import DEFAULT_CSP_DIRECTIVES
-
-        configured = (tomllib.loads(read("config.toml"))
-                      .get("security", {}).get("csp", {}) or {})
-        for name, values in configured.items():
-            if name not in DEFAULT_CSP_DIRECTIVES:
-                continue
-            with self.subTest(directive=name):
-                expected = tuple(DEFAULT_CSP_DIRECTIVES[name])
-                actual = tuple(values) if isinstance(values, list) else (values,)
-                if set(actual) == set(expected):
-                    continue
-                removed = set(expected) - set(actual)
-                added = [value for value in actual if value not in expected]
-                self.assertTrue(
-                    removed <= set(self.WILDCARDS),
-                    f"{name} 删掉了默认里的限制 {sorted(removed)}（只能收窄，不能放开）")
-                for value in added:
-                    self.assertRegex(
-                        str(value), r"^https?://[A-Za-z0-9.-]+$",
-                        f"{name} 新增了非具体主机的来源 {value!r}："
-                        "请写显式主机（https://cdn.example.com），不要用 http:/https:/*")
-                for value in actual:
-                    self.assertTrue(
-                        str(value) not in ("*", "'unsafe-eval'"),
-                        f"{name} 出现了通配来源 {value!r}")
+    def test_no_test_referenced_by_comments_is_missing(self):
+        """注释里点名的守卫测试必须真的存在（否则又是"文档说谎"）。"""
+        referenced: set[str] = set()
+        sources = [*PACKAGE.rglob("*.py"), PROJECT_ROOT / "config.toml",
+                   PROJECT_ROOT / "config.example.toml"]
+        for path in sources:
+            text = path.read_text(encoding="utf-8")
+            referenced |= set(re.findall(r"tests/([a-z_]+\.py)", text))
+        missing = sorted(name for name in referenced
+                         if not (PROJECT_ROOT / "tests" / name).is_file())
+        self.assertEqual(missing, [], f"comments reference missing test files: {missing}")
 
 
-class MediaSrcQuotingTests(ElenvindTestCase):
-    def test_docs_do_not_show_unquoted_self(self):
-        """`"self"` 在 CSP 里匹配一个叫 self 的主机 —— 等于没放行。
-
-        文档示例曾经写成 `media-src = "self"`，照抄会得到一条静默失效的指令。
-        """
-        for name in DOCS:
-            for lineno, line in enumerate(read(name).splitlines(), 1):
-                stripped = line.strip()
-                if stripped.startswith("#") and "media-src" not in stripped:
-                    continue
-                if re.search(r'(media-src|style-src|img-src)\s*=\s*"\s*self\s*"', line):
-                    self.fail(f"{name}:{lineno} 用了未加引号的 self：{stripped}")
-
-
-class DocumentationIndexTests(ElenvindTestCase):
-    """文档索引必须列出所有文档，且所有文档都在索引里可达。
-
-    为什么需要：`docs/` 是新读者的入口。新增一篇文档却忘了挂到索引上，
-    等价于它不存在（也没人会去看）。这里把"类目完整性"变成可执行的约束。
-    """
-
-    #: 索引本身与不作为独立条目列出的示例文件
-    INDEX = "docs/README.md"
-    SKIP = ("docs/README.md", "docs/nginx.conf.example")
-
-    def _documentation_files(self):
-        return sorted(
-            path.relative_to(ROOT).as_posix()
-            for path in (ROOT / "docs").rglob("*.md"))
-
-    def test_every_doc_is_referenced_from_the_index(self):
-        index = read(self.INDEX)
-        missing = []
-        for relative in self._documentation_files():
-            if relative in self.SKIP:
-                continue
-            if Path(relative).name not in index and relative not in index:
-                missing.append(relative)
-        self.assertEqual(missing, [],
-                         "这些文档没有出现在 docs/README.md 的索引里：\n"
-                         + "\n".join(missing))
-
-    def test_all_scanned_docs_exist(self):
-        for name in DOCS:
-            with self.subTest(name=name):
-                self.assertTrue((ROOT / name).is_file(), f"{name} 不存在")
-
-    def test_index_lists_the_example_and_the_root_readme(self):
-        index = read(self.INDEX)
-        self.assertIn("nginx.conf.example", index)
-        self.assertIn("../README.md", index)
+if __name__ == "__main__":
+    unittest.main()

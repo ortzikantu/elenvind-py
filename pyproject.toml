@@ -1,0 +1,36 @@
+# 只放静态检查配置（ruff）。项目本身**不是**可安装的 Python 包：
+# 没有 [project] / [build-system]，因此这份文件不会被 pip 当成打包元数据。
+#
+#   .venv/bin/pip install ruff      # 开发工具，不属于运行时依赖
+#   .venv/bin/ruff check .
+
+[tool.ruff]
+# 中文注释与文案占宽，110 比 100 更贴近本项目的实际排版（超长 SQL 字符串除外）
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+# 只启用"真的会导致缺陷"的规则集，不追求风格洁癖：
+#   E/W   pycodestyle 的错误与告警
+#   F     pyflakes（未定义名、未用导入等）
+#   I     isort（导入顺序）
+#   B     flake8-bugbear（易错写法）
+#   C4    comprehensions
+#   SIM   flake8-simplify
+#   RUF   ruff 自有规则（`__all__` 排序、无用 noqa 等）
+#   UP    pyupgrade
+select = ["E", "W", "F", "I", "B", "C4", "SIM", "RUF", "UP"]
+
+ignore = [
+    # `datetime.now()` 不带 tz：`created_at` / `nickname_changed_at` 是既有的
+    # 本地时间字符串格式，改成 aware 会改变历史数据的语义（属于数据迁移，
+    # 不属于缺陷修复）。规则本身未启用，这里保留说明以免有人误开。
+    "DTZ005",
+    # 全角标点：本项目注释与文案以中文为主，全角括号/冒号/逗号是刻意的排版，
+    # 不是"看起来像 ASCII 的混淆字符"。
+    "RUF001", "RUF002", "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里允许 assert（ruff 默认不报）；夹具里保留较宽的防御性写法
+"tests/*" = ["BLE001"]

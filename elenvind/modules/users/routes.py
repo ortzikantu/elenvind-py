@@ -10,18 +10,10 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from ...core.config import config
 
+from ... import db
+from ...core.config import config
 from ...core.context import current_lang
-# 捕获"邮箱被他人抢先占用"要用的异常类型：由 Core 重新导出，
-# 模块不需要（也不该）import sqlite3 —— 见 Core Contract 守卫。
-from ...db import IntegrityError
-from ...db.user import (
-    delete_user,
-    get_user_by_email,
-    update_user_password,
-    update_user_profile,
-)
 from ...core.http import html, redirect
 from ...core.i18n import t
 from ...core.security import (
@@ -30,13 +22,23 @@ from ...core.security import (
     PASSWORD_MAX,
     PASSWORD_MIN,
     hash_password,
+    is_weak_password,
     verify_password,
 )
-from ... import db
 from ...core.session import invalidate_user_sessions
 from ...core.templating import render_template
-from ...db.user import normalize_email
 from ...core.utils import format_datetime
+
+# 捕获"邮箱被他人抢先占用"要用的异常类型：由 Core 重新导出，
+# 模块不需要（也不该）import sqlite3 —— 见 Core Contract 守卫。
+from ...db import IntegrityError
+from ...db.user import (
+    delete_user,
+    get_user_by_email,
+    normalize_email,
+    update_user_password,
+    update_user_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -216,5 +218,9 @@ def _change_password(request, user, lang):
         return t(lang, "auth_err_password_mismatch")
     if len(new_password) < PASSWORD_MIN or len(new_password) > PASSWORD_MAX:
         return t(lang, "auth_err_password_range")
+    # 与注册共用同一套弱口令判定（core.security.is_weak_password），
+    # 否则"注册时不许 12345678，改密时随便设"就成了绕过口。
+    if is_weak_password(new_password, email=user["email"], nickname=user["nickname"]):
+        return t(lang, "auth_err_password_weak")
     update_user_password(user["id"], hash_password(new_password))
     return None

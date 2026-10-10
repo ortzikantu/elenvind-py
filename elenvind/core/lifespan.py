@@ -84,13 +84,12 @@ def startup(hooks=(), prepare_database=None):
         log_file=logging_cfg.get("file", "logs/app.log"),
         max_bytes=logging_cfg.get("max_bytes", 10 * 1024 * 1024),
         backup_count=logging_cfg.get("backup_count", 5),
+        rotate=logging_cfg.get("rotate", False),
     )
     success("Logging configured")
-    logger.info("Log file: %s (level=%s, rotate at %s bytes, keep %s file(s))",
-                resolve_log_path(logging_cfg.get("file", "logs/app.log")),
-                str(logging_cfg.get("level", "info")).lower(),
-                logging_cfg.get("max_bytes", 10 * 1024 * 1024),
-                logging_cfg.get("backup_count", 5))
+    logger.info("Log file: %s (level=%s, rotation=%s)", resolve_log_path(
+        logging_cfg.get("file", "logs/app.log")), str(logging_cfg.get("level", "info")).lower(),
+        "in-app" if logging_cfg.get("rotate", False) else "external (logrotate)")
 
     from . import i18n
     i18n.load()

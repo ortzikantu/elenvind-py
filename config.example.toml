@@ -77,10 +77,12 @@ templates_dir = "elenvind/templates"
 use_builtin_css = true
 
 [server]
-    # 监听地址。代码缺省是 "127.0.0.1"（只让本机反代回源，最安全）。
-    # 这份模板写成 "0.0.0.0"（对外直接提供服务）—— 如果你前面挂了 Nginx，
-    # 请改回 "127.0.0.1"，否则 6789 端口会直接暴露在公网。
-    host = "0.0.0.0"
+    # 监听地址。**默认 127.0.0.1**：公开服务由 Nginx 反向代理回源，
+    # 应用端口只对本机开放（这是唯一安全且推荐的形态）。
+    # 若你确实要直连（例如内网测试、或前面没有反代），改成 "0.0.0.0"，
+    # 或用命令行临时覆盖：`python run.py --bind 0.0.0.0:6789`。
+    # 监听非回环地址时，启动日志会给出明确告警（见 elenvind/app.py）。
+    host = "127.0.0.1"
     port = 6789
     # Gunicorn worker 进程数（`python run.py` 会读它；也可用 --workers 覆盖）。
     # 2 是出厂值，个人站足够。所有写事务经过 Core 的 write_tx()（flock 跨进程
@@ -175,8 +177,13 @@ use_builtin_css = true
 [logging]
     level = "info"               # 可选值：debug, info, warning, error, critical
     file = "logs/app.log"        # 日志文件路径（相对项目根目录）
-    max_bytes = 10485760         # 10 MB
-    backup_count = 5
+    # 应用内轮转开关。默认 false = 只写当前文件、由外部 logrotate 负责轮转
+    # （多 worker 各持一个 RotatingFileHandler 时同时轮转会互相截断/丢行；
+    #  仓库的 deploy/logrotate.conf 是一份可直接用的示例）。
+    # 单 worker 或本地开发可以设 true，此时下面两项生效。
+    rotate = false
+    max_bytes = 10485760         # 10 MB（rotate = true 时生效）
+    backup_count = 5             # rotate = true 时生效
 
 ###################################################################################################
 # 安全响应头（由 Core 在响应收尾阶段统一注入，模块层不感知）

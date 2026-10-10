@@ -1,9 +1,10 @@
 # site/utils.py
 """仅使用 Python 标准库的通用辅助工具函数"""
 import html
-from datetime import datetime, date
+from datetime import date, datetime
 
 from .config import config
+
 
 def escape_html(text):
     """转义 HTML 特殊字符，防止 XSS"""
@@ -100,7 +101,7 @@ def _trusted_proxies() -> tuple:
     """
     global _TRUSTED_CACHE, _TRUSTED_SOURCE
     configured = config.get("server", {}).get("trusted_proxies")
-    if _TRUSTED_CACHE is not None and _TRUSTED_SOURCE == configured:
+    if _TRUSTED_CACHE is not None and configured == _TRUSTED_SOURCE:
         return _TRUSTED_CACHE
     if configured is None:
         resolved = ("127.0.0.1", "::1")
@@ -139,9 +140,7 @@ def format_date(value):
     """
     if value is None:
         return ""
-    if isinstance(value, datetime):
-        dt = value
-    elif isinstance(value, date):
+    if isinstance(value, (datetime, date)):
         dt = value
     elif isinstance(value, str):
         try:
@@ -150,7 +149,5 @@ def format_date(value):
             return value
     else:
         return str(value)
-    if isinstance(dt, datetime):
-        return dt.strftime("%Y-%m-%d")
-    else:  # date 对象
-        return dt.strftime("%Y-%m-%d")
+    # datetime 与 date 都有 strftime("%Y-%m-%d")，不需要分支
+    return dt.strftime("%Y-%m-%d")

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from ...core.config import ROOT, config, resolve_path
@@ -21,6 +22,10 @@ MAX_PAGE_SIZE = 512 * 1024
 
 _pages_cache = None       # slug -> Markup
 _file_stats = None
+#: 目录状态检查的最小间隔（秒）：命中缓存的 `/<slug>` 兜底请求不该每次都
+#: glob 整个 custom_pages 目录（与 blog 模块同一策略）。
+_SCAN_INTERVAL_SECONDS = 2.0
+_last_scan_at = 0.0
 
 
 def custom_pages_dir() -> Path:
@@ -64,16 +69,25 @@ def _load_pages(dir_path: Path, stats: dict):
 
 def _rescan() -> None:
     """一次性提交快照与页面缓存（失败时两者都保持不变）。"""
-    global _pages_cache, _file_stats
+    global _pages_cache, _file_stats, _last_scan_at
     directory = custom_pages_dir()
     new_stats = _get_file_stats(directory)
     new_pages = _load_pages(directory, new_stats)
     _file_stats = new_stats
     _pages_cache = new_pages
+    _last_scan_at = time.monotonic()
 
 
 def _has_changes() -> bool:
-    return _file_stats is None or _get_file_stats(custom_pages_dir()) != _file_stats
+    """目录是否需要重扫（按 `_SCAN_INTERVAL_SECONDS` 节流）。"""
+    global _last_scan_at
+    if _file_stats is None:
+        return True
+    now = time.monotonic()
+    if now - _last_scan_at < _SCAN_INTERVAL_SECONDS:
+        return False
+    _last_scan_at = now
+    return _get_file_stats(custom_pages_dir()) != _file_stats
 
 
 def get_page(slug: str):

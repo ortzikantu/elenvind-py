@@ -13,8 +13,6 @@ from __future__ import annotations
 import logging
 import time
 
-from . import connection
-from .connection import connect
 from .maintenance import prune
 from .transaction import write_tx
 
@@ -23,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 #: 登录流水保留期（天）。启动清理与运行期机会式清理共用。
 RETENTION_DAYS = 30
+#: 注册尝试流水的保留期（天）。与登录流水**分开**命名：注册限流窗口只有
+#: 一小时，留 7 天足够排查。历史上两个用途共用一个模块级 `RETENTION_DAYS`，
+#: 且第 209 行又把 30 就地覆盖成 7 —— 结果是"运行期清理按 7 天、启动清理按
+#: 30 天"的隐形不一致（同名常量有两个值）。
+REGISTER_RETENTION_DAYS = 7
 
 
 def record_login_attempt(email: str, ip: str, success: bool):
@@ -87,7 +90,7 @@ def reserve_login_attempt(email: str, ip: str, *,
                           max_global_failures: int, global_window_seconds: int,
                           cooldown_base_seconds: int = COOLDOWN_BASE_SECONDS,
                           cooldown_max_seconds: int = COOLDOWN_MAX_SECONDS,
-                          attempted_at: float = None):
+                          attempted_at: float | None = None):
     """**一个写事务**里完成三闸门判定 + 占位记账。
 
     返回 `(allowed: bool, reason: str, retry_after: int)`：
@@ -112,12 +115,10 @@ def reserve_login_attempt(email: str, ip: str, *,
             conn, "ip", (ip,), now - ip_window_seconds)
 
         # 顺序与原实现一致：global 是分布式爆破的最后闸门，先判它
-        for reason, count, limit, last, window in (
-                ("global", global_count, max_global_failures, global_last,
-                 global_window_seconds),
-                ("email", email_count, max_email_failures, email_last,
-                 email_window_seconds),
-                ("ip", ip_count, max_ip_failures, ip_last, ip_window_seconds)):
+        for reason, count, limit, last in (
+                ("global", global_count, max_global_failures, global_last),
+                ("email", email_count, max_email_failures, email_last),
+                ("ip", ip_count, max_ip_failures, ip_last)):
             if count < limit:
                 continue
             cooldown = _cooldown_seconds(count, limit, cooldown_base_seconds,
@@ -137,9 +138,9 @@ def reserve_login_attempt(email: str, ip: str, *,
     return True, "ok", 0
 
 
-def complete_login_success(email: str, ip: str, *, user_id: int = None,
-                           new_password_hash: str = None,
-                           attempted_at: float = None):
+def complete_login_success(email: str, ip: str, *, user_id: int | None = None,
+                           new_password_hash: str | None = None,
+                           attempted_at: float | None = None):
     """登录成功后的收尾（**一个写事务**）：清失败流水 + 记成功 + 可选 rehash。
 
     三件事同一事务：不会出现"失败流水清了一半 / rehash 落了但审计没落"。
@@ -158,41 +159,6 @@ def complete_login_success(email: str, ip: str, *, user_id: int = None,
     prune("login_attempts", "attempted_at", RETENTION_DAYS)
 
 
-def count_email_failures(email: str, window_seconds: int = 900) -> int:
-    """统计窗口期内指定邮箱（大小写不敏感）的失败次数。"""
-    with connect() as conn:
-        cutoff = time.time() - window_seconds
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM login_attempts WHERE success = 0 AND attempted_at > ? "
-            "AND email = ? COLLATE NOCASE",
-            (cutoff, email)
-        ).fetchone()
-    return row["cnt"] if row else 0
-
-
-def count_ip_failures(ip: str, window_seconds: int = 900) -> int:
-    """统计窗口期内指定 IP 的失败次数。"""
-    with connect() as conn:
-        cutoff = time.time() - window_seconds
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM login_attempts WHERE success = 0 AND attempted_at > ? "
-            "AND ip = ?",
-            (cutoff, ip)
-        ).fetchone()
-    return row["cnt"] if row else 0
-
-
-def count_global_recent_failures(window_seconds: int = 900) -> int:
-    """统计窗口期内全站失败次数：分布式（多 IP）爆破的最后一道闸门。"""
-    with connect() as conn:
-        cutoff = time.time() - window_seconds
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM login_attempts WHERE success = 0 AND attempted_at > ?",
-            (cutoff,)
-        ).fetchone()
-    return row["cnt"] if row else 0
-
-
 def clear_login_attempts(email: str):
     """用户登录成功后清空其失败流水（大小写不敏感），避免旧失败继续锁号。"""
     with write_tx() as conn:
@@ -204,11 +170,6 @@ def cleanup_old_login_attempts(days: int = RETENTION_DAYS):
     with write_tx() as conn:
         cutoff = time.time() - days * 86400
         conn.execute("DELETE FROM login_attempts WHERE attempted_at < ?", (cutoff,))
-
-
-RETENTION_DAYS = 7
-
-
 
 
 def try_register_attempt(ip: str, *, max_per_ip: int, window_seconds: int) -> bool:
@@ -232,11 +193,11 @@ def try_register_attempt(ip: str, *, max_per_ip: int, window_seconds: int) -> bo
                      (ip, now))
     # 写事务结束（锁已释放）之后才做机会式清理，避免 DELETE 拉长写锁持有时间；
     # 也避免在 write_tx 里再取一次锁（嵌套会触发重入守卫）。
-    prune("register_attempts", "attempted_at", RETENTION_DAYS)
+    prune("register_attempts", "attempted_at", REGISTER_RETENTION_DAYS)
     return True
 
 
-def cleanup_old_attempts(days: int = RETENTION_DAYS):
+def cleanup_old_attempts(days: int = REGISTER_RETENTION_DAYS):
     """启动时删除指定天数之前的流水，控制表体积。"""
     with write_tx() as conn:
         conn.execute("DELETE FROM register_attempts WHERE attempted_at < ?",

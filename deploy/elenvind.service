@@ -1,0 +1,57 @@
+# Elenvind systemd 单元示例
+#
+#   sudo cp deploy/elenvind.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now elenvind
+#   journalctl -u elenvind -f
+#
+# 上线前请按注释改：User/Group、WorkingDirectory、ExecStart 里的路径。
+# 建议目录结构（把代码放在 /srv/elenvind，属主为服务账号）：
+#
+#   sudo useradd --system --home /srv/elenvind --shell /usr/sbin/nologin elenvind
+#   sudo chown -R elenvind:elenvind /srv/elenvind
+#   sudo chmod 750 /srv/elenvind && sudo chmod 640 /srv/elenvind/config.toml
+
+[Unit]
+Description=Elenvind personal website (Gunicorn / WSGI)
+Documentation=file:/srv/elenvind/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=elenvind
+Group=elenvind
+WorkingDirectory=/srv/elenvind
+
+# Python 输出不缓冲，日志能实时进 journal
+Environment=PYTHONUNBUFFERED=1
+
+# 直接用启动器：它先校验配置（不合法就直接退出，不会起一个"看起来在跑"的进程）
+# 再交给 Gunicorn。worker 数也可在 --workers 覆盖 config.toml。
+ExecStart=/srv/elenvind/.venv/bin/python run.py --workers 2
+
+# 优雅重启（Gunicorn 支持 HUP）
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# ---- 加固（按需调整） ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false        # Python 解释器需要可写可执行内存（CPython 正常行为）
+ReadWritePaths=/srv/elenvind          # 需要写：sqlite.db / sqlite.db-wal / logs / backups
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

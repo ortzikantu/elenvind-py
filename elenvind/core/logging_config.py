@@ -1,4 +1,4 @@
-"""日志配置：控制台 + 轮转文件，根 logger 与 gunicorn logger 共用同一批 handler。
+"""日志配置：控制台 + 文件，根 logger 与 gunicorn logger 共用同一批 handler。
 
 要点：
 - 日志文件路径相对**项目根目录**解析（config.ROOT），与其它路径配置保持一致，
@@ -8,9 +8,12 @@
   （gunicorn 的 error/access logger 默认自带 handler，且 propagate=True）。
 - 关闭时由 shutdown_logging() 统一 flush + close（进程退出阶段调用，
   见 `elenvind/wsgi.py` 的 atexit）。
-- 多 worker 下每个 worker 各开一份 RotatingFileHandler：并发轮转在极端情况下可能
-  丢一行日志（gunicorn 自身也是这个行为），但绝不会写坏文件；日志不是数据。
+- **默认由外部 logrotate 轮转**（`WatchedFileHandler`）：多 worker 各自持有
+  `RotatingFileHandler` 句柄时，两个进程同时轮转会互相截断/丢行。只有在
+  "确定只有单个 worker"（或本地开发）时才把 `[logging].rotate` 设为 true 走
+  应用内轮转。
 """
+import contextlib
 import logging
 import logging.handlers
 import sys
@@ -44,10 +47,9 @@ def _remove_handlers(logger):
     """移除并关闭 logger 上已有的 handler（避免重复输出与文件句柄泄漏）。"""
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
-        try:
+        # close 失败不应阻断启动（例如 handler 已被外部关掉）
+        with contextlib.suppress(Exception):
             handler.close()
-        except Exception:      # pragma: no cover - close 失败不应阻断启动
-            pass
 
 
 def _quiet_noisy_loggers(level: int) -> None:
@@ -65,17 +67,31 @@ def _quiet_noisy_loggers(level: int) -> None:
 
 
 def setup_logging(level: str = "info", log_file: str = "logs/app.log",
-                  max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5):
-    """配置根日志和 gunicorn 日志，输出到控制台与轮转文件。"""
+                  max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5,
+                  rotate: bool = False):
+    """配置根日志和 gunicorn 日志，输出到控制台与文件。
+
+    `rotate=False`（默认）用 `WatchedFileHandler`：日志文件被 logrotate
+    改名/删除后会**自动重新打开**，多个 worker 共写一份也不会互相截断 —— 这是
+    Gunicorn 多进程部署下唯一安全的做法。`rotate=True` 才用应用内
+    `RotatingFileHandler`（`max_bytes` / `backup_count` 生效），适合单 worker
+    或本地开发。
+    """
     log_path = resolve_log_path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     log_level = _LEVELS.get(str(level).lower(), logging.INFO)
     formatter = logging.Formatter(_LOG_FORMAT)
 
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
-    )
+    if rotate:
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        )
+    else:
+        # 多进程安全：每次写之前检查 inode 是否还是同一个文件，被轮转后重开。
+        file_handler = logging.handlers.WatchedFileHandler(
+            log_path, encoding="utf-8"
+        )
     file_handler.setLevel(log_level)
     file_handler.setFormatter(formatter)
 
@@ -104,6 +120,6 @@ def setup_logging(level: str = "info", log_file: str = "logs/app.log",
 
 def shutdown_logging():
     """关闭全部日志 handler（进程退出时调用，确保日志落盘）。"""
-    for logger_name in (None,) + _GUNICORN_LOGGERS:
+    for logger_name in (None, *_GUNICORN_LOGGERS):
         logger = logging.getLogger() if logger_name is None else logging.getLogger(logger_name)
         _remove_handlers(logger)

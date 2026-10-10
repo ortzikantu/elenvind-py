@@ -11,15 +11,38 @@ import logging
 from ...core.auth import require_owner
 from ...core.config import config
 from ...core.context import current_lang
-from ...db.comment import get_comment_by_id
 from ...core.http import Forbidden, NotFound, html, redirect
 from ...core.i18n import t
 from ...core.security import is_admin
 from ...core.session import current_user
 from ...core.templating import render_template
+from ...db.comment import get_comment_by_id
 from . import logic
 
 logger = logging.getLogger(__name__)
+
+#: 评论失败的 outcome -> i18n key。
+#: 文案集中在 i18n（en/zh/ja），模块不再产出面向用户的英文串
+#: （否则中文站点上会冒出 `Content cannot be empty` 这类提示）。
+_COMMENT_ERROR_KEYS = {
+    "empty": "comment_err_empty",
+    "too_long": "comment_err_too_long",
+    "rate_user": "comment_err_rate_user",
+    "rate_ip": "comment_err_rate_ip",
+    "too_many": "comment_err_too_many",
+    "bad_parent": "comment_err_bad_parent",
+    "too_deep": "comment_err_too_deep",
+    "redacted": "comment_edit_redacted",
+}
+#: 这些 outcome 属于"被限流"，用 429；其余是请求本身有问题，用 400。
+_RATE_LIMITED_OUTCOMES = frozenset({"rate_user", "rate_ip", "too_many"})
+
+
+def _comment_error(request, slug, outcome):
+    """按 outcome 渲染带提示的文章页（文案走 i18n）。"""
+    key = _COMMENT_ERROR_KEYS.get(outcome, "comment_err_generic")
+    status = 429 if outcome in _RATE_LIMITED_OUTCOMES else 400
+    return _article_error(request, slug, t(current_lang(), key), status=status)
 
 
 def _safe_int(value, default=None):
@@ -61,50 +84,48 @@ def register(router, *, render_not_found):
         if raw_reply:
             reply_to = _safe_int(raw_reply)
             if reply_to is None:
-                return _article_error(request, slug, "Invalid reply target")
+                return _article_error(request, slug,
+                                      t(current_lang(), "comment_err_invalid_reply"))
             parent = get_comment_by_id(reply_to)
             # 这里只做"能给出更友好提示"的预检 + 需要父行内容的判断。
             # 权威判定在 core/db_comment_rate.try_post_comment 的事务内
             # （存在性 + 同文章 + 深度上限），即使有人绕过表单直接 POST 也拦得住。
             if not parent or parent["article_slug"] != slug:
-                return _article_error(request, slug, "Invalid reply target")
-            # 刻意**不**校验 parent["is_deleted"]：删除是软删除、可恢复，
-            # 已删除评论仍可被回复（对访客打码展示，关系链保持完整）。
+                return _article_error(request, slug,
+                                      t(current_lang(), "comment_err_invalid_reply"))
+            # 刻意**不**校验 parent["is_deleted"]：涂黑只销毁正文，评论链保持完整，
+            # 已涂黑的评论仍可被回复。
             #
             # 深度上限也刻意只在这里"顺手一提"：预检在事务外，属于 TOCTOU
             # （并发时两个请求可能都看到"还没到顶"）。真正的判定在事务内，
             # 这里提前拦只是为了少走一趟事务、并给出同样的文案。
             if logic.comment_depth(parent) + 1 > logic._max_depth():
-                return _article_error(request, slug, "Reply depth limit reached")
+                return _article_error(request, slug,
+                                      t(current_lang(), "comment_err_depth_limit"))
 
-        outcome, message = logic.post_comment(slug, user["id"], request.client_ip,
-                                              request.form.get("content", ""), reply_to)
+        outcome = logic.post_comment(slug, user["id"], request.client_ip,
+                                     request.form.get("content", ""), reply_to)
         if outcome != "ok":
             # 日志措辞保持稳定（运维手册与排障习惯依赖它）
             if outcome == "rate_user":
                 logger.warning("Comment rate limit hit (user): user_id=%s ip=%s slug=%s",
                                user["id"], request.client_ip, slug)
-                return _article_error(request, slug, message, status=429)
-            if outcome == "rate_ip":
+            elif outcome == "rate_ip":
                 logger.warning("Comment rate limit hit (ip): user_id=%s ip=%s slug=%s",
                                user["id"], request.client_ip, slug)
-                return _article_error(request, slug, message, status=429)
-            if outcome == "too_many":
+            elif outcome == "too_many":
                 logger.warning("Comment count limit hit: slug=%s", slug)
-                return _article_error(request, slug, message, status=429)
-            if outcome == "bad_parent":
+            elif outcome == "bad_parent":
                 # 走到这里说明事务内的权威校验拒绝了它（存在性/跨文章）
                 logger.warning("Comment rejected (bad parent): user_id=%s ip=%s "
                                "slug=%s parent_id=%s",
                                user["id"], request.client_ip, slug, reply_to)
-                return _article_error(request, slug, message, status=400)
-            if outcome == "too_deep":
+            elif outcome == "too_deep":
                 # 事务内的深度判定（预检在事务外，这里才是权威）
                 logger.warning("Comment rejected (too deep): user_id=%s ip=%s "
                                "slug=%s parent_id=%s",
                                user["id"], request.client_ip, slug, reply_to)
-                return _article_error(request, slug, message, status=400)
-            return _article_error(request, slug, message, status=400)
+            return _comment_error(request, slug, outcome)
         logger.info("Comment created: slug=%s user_id=%s parent_id=%s ip=%s",
                     slug, user["id"], reply_to, request.client_ip)
         return redirect(f"/article/{slug}#comments")
@@ -129,12 +150,10 @@ def register(router, *, render_not_found):
             # 管理员可以涂黑，但不能改写别人的话（与按钮集合保持一致）
             raise Forbidden("Forbidden")
         if comment["is_deleted"]:
-            return _article_error(request, slug,
-                                  t(current_lang(), "comment_edit_redacted"), status=400)
-        outcome, message = logic.edit_comment(comment["id"],
-                                              request.form.get("content", ""))
+            return _comment_error(request, slug, "redacted")
+        outcome = logic.edit_comment(comment["id"], request.form.get("content", ""))
         if outcome != "ok":
-            return _article_error(request, slug, message, status=400)
+            return _comment_error(request, slug, outcome)
         logger.info("Comment edited: id=%s slug=%s user_id=%s",
                     comment["id"], slug, request.user["id"])
         return redirect(f"/article/{slug}#comments")

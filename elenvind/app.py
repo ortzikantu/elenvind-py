@@ -94,6 +94,7 @@ def prepare_database() -> None:
         config.get("session_idle_days", db.DEFAULT_IDLE_DAYS),
     ))
     db.init_db()
+    warn_about_missing_admin()
 
     removed_sessions = db.cleanup_expired_sessions()
     db.cleanup_old_login_attempts(days=30)
@@ -112,17 +113,22 @@ _LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 
 
 def warn_on_exposed_bind() -> None:
-    """启动告警：监听非回环地址、同时信任转发头。
+    """启动告警：**实际**监听非回环地址、同时信任转发头。
 
     这种组合下，任何能连到应用端口的人都**绕过**了反向代理：
     他不会是受信代理（因此骗不到 client IP / https 判定，这层是安全的），
     但 TLS、HSTS、反代侧的限速与访问控制全都被跳过。
     这是部署配置问题，不是代码缺陷 —— 所以只告警，不拒绝启动。
+
+    host 取**实际 bind**（`run.py` 通过 `config.set_effective_bind()` 注入），
+    只在直接 `gunicorn elenvind.wsgi:application` 时才回落配置值。早期版本只读
+    `[server].host`：`--bind 0.0.0.0` 覆盖配置时告警会**静默消失**（假阴性），
+    反过来 `--bind 127.0.0.1` 时又会误报（假阳性）。
     """
-    from .core.config import config
+    from .core.config import config, effective_bind_host
 
     server = config.get("server") or {}
-    host = str(server.get("host", "127.0.0.1") or "").strip()
+    host = effective_bind_host() or str(server.get("host", "127.0.0.1") or "").strip()
     trusted = server.get("trusted_proxies") or []
     if host in _LOOPBACK_HOSTS or not trusted:
         return
@@ -131,6 +137,26 @@ def warn_on_exposed_bind() -> None:
         "reach this port bypass the reverse proxy (TLS/HSTS/edge limits). Bind to "
         "127.0.0.1 and let the proxy forward, or firewall the port.",
         host, trusted)
+
+
+def warn_about_missing_admin() -> None:
+    """启动告警：`admin_user_id` 指向不存在/已注销的用户。
+
+    管理员身份的唯一来源是配置里的那个 id；配置写错（或该账号后来注销）时结果
+    不是报错，而是**静默地没有管理员** —— 评论区被刷屏时没人能涂黑。这里在启动
+    日志里点名，避免"以为自己是管理员"（尤其新库还没注册时）。
+    """
+    from .core.security import admin_id
+
+    owner = admin_id()
+    if owner is None:
+        logger.warning("No administrator configured (admin_user_id missing, null, "
+                       "or invalid): nobody can moderate comments")
+        return
+    if db.get_user_by_id(owner) is None:
+        logger.warning("admin_user_id=%s does not match an active user: nobody can "
+                       "moderate comments. Register that account, or point "
+                       "admin_user_id at an existing user id.", owner)
 
 
 def create_app() -> App:
@@ -161,5 +187,5 @@ def create_app() -> App:
 
 app = create_app()
 
-__all__ = ["app", "create_app", "STARTUP_HOOKS", "prepare_database",
-           "resolve_db_path", "warn_on_exposed_bind"]
+__all__ = ["STARTUP_HOOKS", "app", "create_app", "prepare_database",
+           "resolve_db_path", "warn_about_missing_admin", "warn_on_exposed_bind"]

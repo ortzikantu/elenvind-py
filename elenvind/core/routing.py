@@ -25,16 +25,14 @@ from __future__ import annotations
 
 from .auth import (
     AUTHENTICATED,
-    AUTH_REQUIRED_VALUES,
     KNOWN_AUTH,
     KNOWN_PERMISSIONS,
-    NO_REQUIREMENT,
     PUBLIC,
     check_permission,
     normalize_auth,
 )
 from .csrf import requires_protection, validate_request
-from .http import HttpError, error_response, redirect
+from .http import FORM_METHODS, HttpError, error_response, redirect
 
 #: 登录页路径（认证闸门的重定向目标）
 LOGIN_PATH = "/login"
@@ -127,8 +125,17 @@ def _validate_declaration(kind: str, value, known, path: str) -> None:
 
 #: 一个已注册路由
 class Route:
-    __slots__ = ("path", "methods", "handler", "auth", "permission", "name",
-                 "fallback", "_parts", "_catch_all_at")
+    __slots__ = (
+        "_catch_all_at",
+        "_parts",
+        "auth",
+        "fallback",
+        "handler",
+        "methods",
+        "name",
+        "path",
+        "permission",
+    )
 
     def __init__(self, path, methods, handler, auth=PUBLIC, permission=None, name=None,
                  fallback=False):
@@ -298,6 +305,13 @@ class Router:
     def _run(self, route, params, request, forbidden, bad_request=None):
         """跑单个路由：安全闸门 + handler。抛出 `RouteMiss` 表示继续找下一个。"""
         try:
+            # --- 表单方法必须声明请求体长度 ---
+            # 判定放在**路由命中之后**而不是请求解析阶段：`DELETE /`
+            # （路径存在但方法不允许）应当拿到 405 + Allow，而不是半路被 411
+            # 截断。只有真的要执行表单方法时才回 411。
+            if request.method in FORM_METHODS and request.content_length is None:
+                return error_response(411, "Content-Length is required")
+
             # --- 默认 CSRF 保护：非安全方法一律校验 ---
             # 状态码用 400（与历史契约一致，也是"表单令牌无效"的常规语义）；
             # 认证/权限失败才是 403。

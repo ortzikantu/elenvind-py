@@ -165,7 +165,7 @@ class VideoDirectivePreprocessor(Preprocessor):
         # 避免两处规则不一致。）
         flags = _code_block_flags(lines)
         return [line if in_code else VIDEO_RE.sub(substitute, line)
-                for line, in_code in zip(lines, flags)]
+                for line, in_code in zip(lines, flags, strict=True)]
 
 
 class VideoDirectivePostprocessor(Postprocessor):
@@ -287,15 +287,80 @@ def escape_raw_html_outside_code(source: str) -> str:
     """把**代码区域之外**的裸 HTML 开标签转义成文本。
 
     - 只处理标签的 `<`，因此 Markdown 语法（#、*、| 等）不受影响；
-    - 代码区域（围栏与缩进代码块）内部保持原样，交给 python-markdown
-      自己转义，避免出现 `&lt;` 被二次转义成 `&amp;lt;` 的显示缺陷。
+    - 代码区域（围栏代码块、缩进代码块、**行内代码**）内部保持原样，
+      交给 python-markdown 自己转义，避免出现 `&lt;` 被二次转义成
+      `&amp;lt;` 的显示缺陷。
     """
     lines = source.split("\n")
     flags = _code_block_flags(lines)
     return "\n".join(
-        line if in_code else re.sub(r"<(?=[a-zA-Z/!?])", "&lt;", line)
-        for line, in_code in zip(lines, flags)
+        line if in_code else _escape_line(line)
+        for line, in_code in zip(lines, flags, strict=True)
     )
+
+
+#: 看起来像"标签开头"的 `<`（与逐个字符版本保持完全一致的判定）
+_TAG_START_RE = re.compile(r"<(?=[a-zA-Z/!?])")
+
+
+def _escape_line(line: str) -> str:
+    """转义一行里"代码区域之外"的裸 HTML 开标签。
+
+    行内代码（`` `…` ``）也必须跳过，否则 `` `<div>` `` 会被先转义成
+    `&lt;div&gt;`、再被 python-markdown 把 `&` 转义一次，最终在页面上显示成
+    `&lt;div&gt;` 字面量（实测缺陷：作者写的是 `<div>`，读者该看到 `<div>`）。
+    判定沿用 CommonMark：一段反引号由**同长度**的反引号串闭合，未闭合就是普通文本。
+
+    性能：没有反引号的行（绝大多数）走正则快路径，不做逐字符扫描。
+    """
+    if "`" not in line:
+        return _TAG_START_RE.sub("&lt;", line)
+    out = []
+    index = 0
+    length = len(line)
+    while index < length:
+        char = line[index]
+        if char == "`":
+            run_end = index
+            while run_end < length and line[run_end] == "`":
+                run_end += 1
+            run = run_end - index
+            close = _find_backtick_run(line, run_end, run)
+            if close == -1:
+                # 没有同长度的闭合串：按普通文本处理（CommonMark 同样如此）
+                out.append(_TAG_START_RE.sub("&lt;", line[index:run_end]))
+                index = run_end
+                continue
+            out.append(line[index:close + run])     # 代码内容原样保留
+            index = close + run
+            continue
+        if char == "<":
+            following = line[index + 1] if index + 1 < length else ""
+            if following and (following in "/!?" or "a" <= following <= "z"
+                              or "A" <= following <= "Z"):
+                out.append("&lt;")
+                index += 1
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _find_backtick_run(line: str, start: int, run: int) -> int:
+    """从 `start` 起找**长度恰为 run** 的反引号串，返回起始下标；找不到返回 -1。"""
+    index = start
+    length = len(line)
+    while index < length:
+        if line[index] != "`":
+            index += 1
+            continue
+        end = index
+        while end < length and line[end] == "`":
+            end += 1
+        if end - index == run:
+            return index
+        index = end
+    return -1
 
 
 class _Sanitizer(HTMLParser):
@@ -421,7 +486,7 @@ _converter = None
 def _build_converter() -> Markdown:
     """新建一个转换器实例（含视频指令扩展）。"""
     return Markdown(
-        extensions=_EXTENSIONS + [VideoDirectiveExtension()],
+        extensions=[*_EXTENSIONS, VideoDirectiveExtension()],
         extension_configs=_EXTENSION_CONFIGS,
         output_format="html",
         tab_length=4,

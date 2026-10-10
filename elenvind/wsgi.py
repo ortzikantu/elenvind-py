@@ -36,4 +36,4 @@ atexit.register(shutdown)
 #: WSGI callable（PEP 3333）：`gunicorn elenvind.wsgi:application`
 application = app
 
-__all__ = ["application", "app"]
+__all__ = ["app", "application"]

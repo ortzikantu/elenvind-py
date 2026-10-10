@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -33,22 +34,19 @@ from ...core.content import (
     parse_document,
     sort_key,
 )
-from ...db.comment import (
-    get_comment_by_id,
-    get_comments_by_article,
-    redact_comment,
-    update_comment_content,
-)
+from ...core.markdown import render_markdown
+from ...core.security import is_admin, is_admin_id
+from ...core.utils import escape_html, format_date, format_datetime
 from ...db.comment import (
     comment_depth as _core_comment_depth,
 )
 from ...db.comment import (
     flatten_comment_tree,
+    get_comments_by_article,
+    redact_comment,
+    update_comment_content,
 )
 from ...db.comment_rate import try_post_comment
-from ...core.markdown import render_markdown
-from ...core.security import is_admin, is_admin_id
-from ...core.utils import escape_html, format_date, format_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +61,13 @@ _articles_cache = None      # 元数据列表（新文章在前）；None 表示
 _file_stats = None          # {文件名: (mtime, size)}
 _body_cache = {}            # {绝对路径: (mtime, size, metadata, Markup)}
 _failed_stats = {}          # 解析失败的快照，用于抑制重复报错
+
+#: 目录状态检查的最小间隔（秒）。
+#: 命中缓存的普通请求不该每次都 stat 整个文章目录：实测 5000 篇文章时
+#: `GET /` 从 1ms 劣化到 35ms，而且完全匿名可达。节流后"最多每 N 秒扫一次"，
+#: 新增/修改文章最多延迟 N 秒生效（启动钩子仍然强制全量重扫）。
+_SCAN_INTERVAL_SECONDS = 2.0
+_last_scan_at = 0.0
 
 #: 正文缓存的条目上限。超出时先淘汰"已不在当前文章目录里"的条目
 #: （重命名/删除留下的死键），仍然超出才按 mtime 淘汰最旧的。
@@ -143,19 +148,28 @@ def _load_metadata(dir_path: Path, stats: dict):
 
 def _rescan() -> None:
     """重新扫描并**一次性**提交快照 + 索引 + 失败记录。"""
-    global _articles_cache, _file_stats, _failed_stats
+    global _articles_cache, _file_stats, _failed_stats, _last_scan_at
     directory = articles_dir()
     new_stats = _get_file_stats(directory)
     new_articles, new_failed = _load_metadata(directory, new_stats)
     _file_stats = new_stats
     _articles_cache = new_articles
     _failed_stats = new_failed
+    _last_scan_at = time.monotonic()
     # 索引刚刚重算过，正好知道"当前真实存在的文件"，借机淘汰正文缓存里的死键
     _evict_body_cache({str(directory / name) for name in new_stats})
 
 
 def _has_changes() -> bool:
-    return _file_stats is None or _get_file_stats(articles_dir()) != _file_stats
+    """目录是否需要重扫（按 `_SCAN_INTERVAL_SECONDS` 节流，见该常量说明）。"""
+    global _last_scan_at
+    if _file_stats is None:
+        return True
+    now = time.monotonic()
+    if now - _last_scan_at < _SCAN_INTERVAL_SECONDS:
+        return False
+    _last_scan_at = now
+    return _get_file_stats(articles_dir()) != _file_stats
 
 
 def get_articles():
@@ -422,20 +436,22 @@ def comment_depth(comment) -> int:
     return _core_comment_depth(comment, max_depth=_max_depth())
 
 
-def post_comment(slug: str, user_id: int, client_ip: str, content: str, reply_to):
-    """写入评论（限流与插入在同一事务内）。返回 (outcome, message)。"""
+def post_comment(slug: str, user_id: int, client_ip: str, content: str, reply_to) -> str:
+    """写入评论（限流与插入在同一事务内）。返回 outcome 字符串。
+
+    outcome ∈ {ok, empty, too_long, rate_user, rate_ip, too_many, bad_parent,
+    too_deep}。**这里不产出任何面向用户的文案** —— 文案由 HTTP 层用 i18n 取
+    （`modules/blog/routes.py` 的 `_COMMENT_ERROR_KEYS`），否则中文站点上会出现
+    硬编码英文提示（实测过）。
+    """
     limits = _comment_limits()
     content = content.strip()
-    try:
-        max_length = int(config.get("max_length", 1000))
-    except (TypeError, ValueError):
-        max_length = 1000
     if not content:
-        return "empty", "Content cannot be empty"
-    if len(content) > max_length:
-        return "too_long", "Content too long"
+        return "empty"
+    if len(content) > default_max_length():
+        return "too_long"
 
-    outcome = try_post_comment(
+    return try_post_comment(
         slug, user_id, client_ip, content, parent_id=reply_to,
         max_per_user=limits["max_per_user"], max_per_ip=limits["max_per_ip"],
         window_seconds=limits["window_seconds"],
@@ -443,16 +459,6 @@ def post_comment(slug: str, user_id: int, client_ip: str, content: str, reply_to
         created_at=datetime.now().isoformat(),
         max_depth=_max_depth(),
     )
-    messages = {
-        "rate_user": "Too many comments. Please slow down.",
-        "rate_ip": "Too many comments from this address. Please slow down.",
-        "too_many": "This article has reached the comment limit.",
-        # 父评论不存在或不属于本文：可能是手动改了表单，或原评论已被清掉
-        "bad_parent": "The comment you are replying to no longer exists.",
-        # 回复层级已达上限：模板不再显示回复按钮，但 reply_to 可以手工构造
-        "too_deep": "Replies to this comment have reached the maximum depth.",
-    }
-    return outcome, messages.get(outcome, "")
 
 
 def remove_comment(comment_id: int) -> int:
@@ -465,21 +471,21 @@ def remove_comment(comment_id: int) -> int:
     return redact_comment(comment_id)
 
 
-def edit_comment(comment_id: int, content: str):
-    """编辑评论正文（权限由路由校验）。返回 (outcome, message)。
+def edit_comment(comment_id: int, content: str) -> str:
+    """编辑评论正文（权限由路由校验）。返回 outcome 字符串。
 
-    与发表评论共用同一套校验：非空、长度上限。已涂黑的评论不可编辑
+    outcome ∈ {ok, empty, too_long, redacted}；与发表评论共用同一套校验
+    （非空、长度上限），文案同样由 HTTP 层取。已涂黑的评论不可编辑
     （`update_comment_content` 的 WHERE 会拒绝，返回 0 行）。
     """
     content = (content or "").strip()
-    max_length = default_max_length()
     if not content:
-        return "empty", "Content cannot be empty"
-    if len(content) > max_length:
-        return "too_long", "Content too long"
+        return "empty"
+    if len(content) > default_max_length():
+        return "too_long"
     if not update_comment_content(comment_id, content):
-        return "redacted", "Comment is redacted"
-    return "ok", ""
+        return "redacted"
+    return "ok"
 
 
 def default_max_length() -> int:

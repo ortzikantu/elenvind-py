@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import re
 import tomllib
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 MARKER = "+++"
 #: slug 白名单：[A-Za-z0-9._-]，禁止 "." / ".." / 点开头
@@ -159,14 +159,14 @@ def sort_key(metadata: dict):
 
 
 #: 无日期 / 解析失败时使用的排序键（aware，可与其余 key 比较）。
-_EPOCH_UTC = datetime.min.replace(tzinfo=timezone.utc)
+_EPOCH_UTC = datetime.min.replace(tzinfo=UTC)
 
 
 def as_utc(value: datetime) -> datetime:
     """把 datetime 归一化成 UTC aware；无时区的按 UTC 解释。"""
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def validate_slug(slug: str) -> bool:

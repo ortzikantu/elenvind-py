@@ -28,9 +28,15 @@ from .security import SESSION_MAX_AGE
 DEFAULT_ABSOLUTE_DAYS = 30
 
 __all__ = [
-    "DEFAULT_ABSOLUTE_DAYS", "SESSION_MAX_AGE", "session_cookie_max_age",
-    "load_user", "current_user", "rotate_session", "login_user", "logout_user",
+    "DEFAULT_ABSOLUTE_DAYS",
+    "SESSION_MAX_AGE",
+    "current_user",
     "invalidate_user_sessions",
+    "load_user",
+    "login_user",
+    "logout_user",
+    "rotate_session",
+    "session_cookie_max_age",
 ]
 
 

@@ -10,15 +10,10 @@ from __future__ import annotations
 import logging
 from urllib.parse import quote
 
+from ... import db
 from ...core.auth import verify_credentials
 from ...core.config import config
 from ...core.context import current_lang
-# 捕获"邮箱已存在"要用的异常类型：由 Core 重新导出，模块不需要（也不该）
-# import sqlite3 —— 见 Core Contract 守卫。
-from ...db import IntegrityError
-from ... import db
-from ...db.auth import complete_login_success, reserve_login_attempt, try_register_attempt
-from ...db.user import create_user, get_user_by_email, update_user_password
 from ...core.http import html, redirect, safe_next_path
 from ...core.i18n import t
 from ...core.security import (
@@ -28,10 +23,21 @@ from ...core.security import (
     PASSWORD_MIN,
     dummy_verify,
     hash_password,
+    is_weak_password,
 )
 from ...core.session import login_user, logout_user
 from ...core.templating import render_template
-from ...db.user import normalize_email
+
+# 捕获"邮箱已存在"要用的异常类型：由 Core 重新导出，模块不需要（也不该）
+# import sqlite3 —— 见 Core Contract 守卫。
+from ...db import IntegrityError
+from ...db.auth import (
+    complete_login_success,
+    record_login_attempt,
+    reserve_login_attempt,
+    try_register_attempt,
+)
+from ...db.user import create_user, get_user_by_email, normalize_email
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +123,9 @@ def register(router):
         if retry_after:
             # 被限流时明确告诉客户端还要等多久（不再是一句模糊的"稍后再试"）
             response.headers.append((b"Retry-After", str(int(retry_after)).encode("ascii")))
-        return response
+        # 页面上带 CSRF 令牌：绝不允许共享缓存留一份给别人复用（no-cache 允许
+        # 304 复用旧正文，no-store 才是"别存"）。
+        return response.with_cache_control("no-store")
 
     @router.route("/register", methods=["GET", "POST"])
     def register(request):
@@ -135,7 +143,7 @@ def register(router):
             "message": message, "message_kind": "error",
             "limits": input_limits(),
             "next_path": next_path,
-        }))
+        })).with_cache_control("no-store")
 
     @router.route("/logout", methods=["GET"])
     def logout_confirm(request):
@@ -145,7 +153,7 @@ def register(router):
         状态变更）。真正的退出由下面的 POST + CSRF 完成。
         未登录时（或会话已失效）也走到这里，页面渲染"你已退出登录"。
         """
-        return html(render_template("auth/logout.html", {}))
+        return html(render_template("auth/logout.html", {})).with_cache_control("no-store")
 
     @router.route("/logout", methods=["POST"], auth="required")
     def logout(request):
@@ -196,6 +204,21 @@ def _try_login(request, email, password, lang):
         1. 一次**短写事务**：三闸门判定 + 占位记账（并发不可能超发）
         2. 释放 SQLite 写锁，再做昂贵的 scrypt 校验（不占锁）
         3. 成功 → 一次短写事务收尾（清失败流水 + 审计 + 可选 rehash）
+
+    **闸门只约束"错误的凭据"，绝不阻断正确的凭据。**
+
+    早期实现是"闸门命中就立刻返回"，而失败流水唯一的清空入口又是"登录成功"
+    —— 于是 5 个请求就能把任意已知邮箱锁死最长 24 小时，受害者拿着正确密码
+    也进不来，站内也没有解锁入口（自锁死闭环）。现在即使闸门命中也会**照常
+    校验密码**：
+
+    - 密码正确 → 放行并由 `complete_login_success()` 清空该邮箱的失败流水，
+      等于当场自解封；
+    - 密码错误 → 才按闸门返回冷却提示，并**补记**这次失败（否则闸门期内
+      "拒绝即不记账"会把计数冻住，攻击者能用固定等待时间无限试探）。
+
+    代价：闸门期内的错误尝试仍要付一次 scrypt（约 240ms）。这本来就是爆破
+    需要支付的单价，换来的是"合法用户永远不会被锁在门外"。
     """
     ip = request.client_ip or "unknown"
     limits = login_limits()
@@ -213,11 +236,6 @@ def _try_login(request, email, password, lang):
         max_global_failures=limits["max_global_failures"],
         global_window_seconds=limits["global_window_seconds"],
     )
-    if not allowed:
-        # 三个闸门都记 WARNING：它们是"有人在爆破"的唯一信号来源
-        logger.warning("Login blocked (%s failure limit): ip=%s retry_after=%ss",
-                       reason, ip, retry_after)
-        return _lock_message(lang, reason, retry_after), retry_after
 
     # 2) 写锁已释放，才做密码校验（scrypt 约 240ms，不能让写锁陪着等）
     user = get_user_by_email(email)
@@ -227,12 +245,25 @@ def _try_login(request, email, password, lang):
         complete_login_success(email, ip, user_id=user["id"],
                                new_password_hash=rehashed_hash)
         login_user(request, user["id"], store=db)   # 轮换会话 + 写 Cookie（store 注入）
-        logger.info("Login succeeded: user_id=%s ip=%s", user["id"], ip)
+        if not allowed:
+            logger.warning("Login succeeded despite the %s gate (valid credentials); "
+                           "failure history cleared: user_id=%s ip=%s",
+                           reason, user["id"], ip)
+        else:
+            logger.info("Login succeeded: user_id=%s ip=%s", user["id"], ip)
         return None, 0
 
     # 账号不存在时也做一次等量哈希校验，弱化计时侧信道（Core 之外只此一处）
     if user is None:
         dummy_verify(password)
+
+    if not allowed:
+        record_login_attempt(email, ip, success=False)
+        # 三个闸门都记 WARNING：它们是"有人在爆破"的唯一信号来源
+        logger.warning("Login blocked (%s failure limit): ip=%s retry_after=%ss",
+                       reason, ip, retry_after)
+        return _lock_message(lang, reason, retry_after), retry_after
+
     # 失败无需再记账：第 1 步的占位就是这次失败
     logger.info("Login failed: ip=%s", ip)
     return _message(lang, "auth_err_creds"), 0
@@ -258,6 +289,8 @@ def _try_register(request, lang):
         return _message(lang, "auth_err_password_range")
     if password != confirm:
         return _message(lang, "auth_err_password_mismatch")
+    if is_weak_password(password, email=email, nickname=nickname):
+        return _message(lang, "auth_err_password_weak")
 
     limits = register_limits()
     if not try_register_attempt(request.client_ip or "unknown",

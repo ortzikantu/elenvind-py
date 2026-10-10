@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
-import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -36,10 +35,8 @@ def configure(db_path=None) -> Path:
     现在路径解析属于装配层（`elenvind/app.py`），db 只接受**已经解析好**的路径。
     """
     global DB_PATH
-    if db_path is None:
-        DB_PATH = Path(os.environ.get("ELENVIND_DB", str(DEFAULT_DB_PATH)))
-    else:
-        DB_PATH = Path(db_path)
+    DB_PATH = (Path(os.environ.get("ELENVIND_DB", str(DEFAULT_DB_PATH)))
+               if db_path is None else Path(db_path))
     return DB_PATH
 
 

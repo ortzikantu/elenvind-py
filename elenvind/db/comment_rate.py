@@ -21,9 +21,9 @@
 """
 import time
 
-from .transaction import write_tx
 from .comment import comment_depth
 from .maintenance import prune
+from .transaction import write_tx
 
 RETENTION_DAYS = 7
 
@@ -83,8 +83,13 @@ def try_post_comment(article_slug: str, user_id: int, ip: str, content: str,
         if ip_count >= max_per_ip:
             conn.rollback()
             return "rate_ip"
+        # 配额只统计**仍然展示中**的评论（涂黑即释放名额）。
+        # 涂黑之所以保留行，是为了不拆散评论树；但把已涂黑的行算进配额，
+        # 就等于"上限 = 该文章永久停止接受评论"——管理员也救不回来
+        # （全项目没有任何 DELETE 评论的路径）。所以这里必须排除 is_deleted=1。
         article_count = conn.execute(
-            "SELECT COUNT(*) FROM comment WHERE article_slug = ?", (article_slug,)
+            "SELECT COUNT(*) FROM comment WHERE article_slug = ? AND is_deleted = 0",
+            (article_slug,)
         ).fetchone()[0]
         if article_count >= max_per_article:
             conn.rollback()

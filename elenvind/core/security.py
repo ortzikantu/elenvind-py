@@ -75,6 +75,51 @@ PASSWORD_MAX = 128
 NICKNAME_MAX = 50
 EMAIL_MAX = 254
 
+#: 一眼就能猜到的口令（小写比对）。只挡"最常被扫中的那批"，
+#: 刻意不做强度评分、不引入字典文件 —— 那会把个人站变成密码策略研究项目。
+#: 真正的防线是 scrypt 成本 + 登录失败限流，这里只是把"弱口令注册"这个
+#: 低门槛入口关掉（例如 `12345678`、`password`）。
+WEAK_PASSWORDS = frozenset({
+    "123456", "1234567", "12345678", "123456789", "1234567890", "123123",
+    "111111", "11111111", "000000", "88888888", "666666", "5201314",
+    "password", "password1", "passw0rd", "p@ssw0rd", "qwerty", "qwerty123",
+    "abc123", "a123456", "aa123456", "admin", "admin123", "administrator",
+    "root", "toor", "letmein", "welcome", "monkey", "dragon", "sunshine",
+    "princess", "football", "baseball", "master", "shadow", "superman",
+    "trustno1", "changeme", "iloveyou", "woaini", "woaini1314", "elenvind",
+})
+
+
+def is_weak_password(password, *, email=None, nickname=None) -> bool:
+    """口令是否"明显不该被接受"。注册与改密共用**同一套**判定。
+
+    刻意保持最小、可预测，只做四条确定性检查（长度策略由 PASSWORD_MIN/MAX
+    在调用方负责）：
+
+    1. 命中常见弱口令表；
+    2. 单一字符重复（`aaaaaaaa`、`11111111`）；
+    3. 纯数字（`12345678`）；
+    4. 与邮箱用户名部分或昵称完全相同（忽略大小写与首尾空白）。
+
+    不做的事：不查在线泄露库、不要求大小写数字符号混合、不做长度加码——
+    那会把"个人博客的评论账号"变成负担，收益却有限。
+    """
+    text = str(password or "")
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered in WEAK_PASSWORDS:
+        return True
+    if len(set(text)) == 1:
+        return True
+    if text.isdigit():
+        return True
+    if email:
+        local = str(email).split("@")[0].strip().lower()
+        if local and lowered == local:
+            return True
+    return bool(nickname) and lowered == str(nickname).strip().lower()
+
 # ----- 密码哈希参数（本机 benchmark 结果：scrypt N=2^15, r=8, p=1 ≈ 240 ms/次） -----
 SCRYPT_N = 2 ** 15           # CPU/内存代价主参数
 SCRYPT_R = 8                 # 块大小
@@ -241,7 +286,7 @@ def is_valid_csrf_token(token) -> bool:
 # 静默回退会把权限悄悄授予一个意料之外的账号。
 def admin_id():
     """返回当前配置的管理员用户 id；未配置/非法时返回 None。"""
-    from .config import config   # 延迟导入：本模块导入期不依赖 config 加载状态
+    from .config import config  # 延迟导入：本模块导入期不依赖 config 加载状态
     value = config.get("admin_user_id")
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return None
@@ -298,14 +343,13 @@ def clear_cookie_headers(secure: bool = False, base: str = SESSION_COOKIE,
     """返回让该 Cookie 立即过期的全部 Set-Cookie 头。
 
     启用 __Host- 前缀后会同时清理旧的无前缀 Cookie，避免切换配置时残留旧值。
+
+    这是**唯一**的"清除 Cookie"入口：`Request.invalidate_session_cookie()`
+    交给它、`pending_cookies()` 交给它。模块不拼 Set-Cookie，也不需要
+    "只清一个名字"的简化版（曾经有 `clear_session_cookie()`，没有任何调用方，
+    已删除——两份清 Cookie 的实现迟早漂移）。
     """
     return [_make_cookie(name, "", secure, 0, http_only=http_only) for name in cookie_names(base)]
-
-
-
-def clear_session_cookie(secure: bool = False, base: str = SESSION_COOKIE) -> tuple:
-    """让客户端会话 Cookie 立即过期（登出/删号/改密后使用，单个头）。"""
-    return _make_cookie(cookie_name(base), "", secure, 0)
 
 
 # ----- 安全响应头（全项目唯一定义处） -----
@@ -488,11 +532,6 @@ def csrf_cookie_header(token: str, secure: bool = False, max_age: int = CSRF_MAX
                        base: str = CSRF_COOKIE) -> tuple:
     """下发或续期 CSRF Cookie。"""
     return _make_cookie(cookie_name(base), token, secure, max_age)
-
-
-def theme_cookie_header(value: str, secure: bool = False, max_age: int = THEME_MAX_AGE) -> tuple:
-    """下发主题偏好 Cookie（仅接受 light/dark，调用方需先校验）。"""
-    return _make_cookie(THEME_COOKIE, value, secure, max_age)
 
 
 #: 站内偏好登记表：**唯一**定义"有哪些偏好 Cookie、有效期多久、允许什么值"。

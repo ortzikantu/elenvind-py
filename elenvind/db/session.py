@@ -17,6 +17,7 @@
 阈值来自 config.toml（`session_absolute_days` / `session_idle_days`），
 设为 0 表示该维度不过期——那会显著放大 token 泄露的风险，站长需自行权衡。
 """
+import math
 import secrets
 import time
 
@@ -27,6 +28,12 @@ DEFAULT_ABSOLUTE_DAYS = 30
 DEFAULT_IDLE_DAYS = 15
 
 DAY_SECONDS = 86400
+
+#: 滑动过期刷新的最小间隔（秒）。
+#: 窗口以"天"计，秒级精度毫无意义；而不节流的话，**任何**带会话 Cookie 的请求
+#: （包括每一个静态资源）都会取一次跨进程写锁并提交一次 WAL —— 那既是吞吐上限，
+#: 也是一条"单个已登录用户即可独占全局写锁"的放大面。
+LAST_SEEN_REFRESH_SECONDS = 300
 
 #: 生效窗口（由装配层按 config.toml 注入；db 不读配置）
 _LIMITS = {"absolute_days": DEFAULT_ABSOLUTE_DAYS, "idle_days": DEFAULT_IDLE_DAYS}
@@ -71,12 +78,9 @@ def _is_expired(row, absolute_days: int, idle_days: int, now: float) -> bool:
     last_seen = _as_timestamp(row["last_seen"])
     if created_at is None or last_seen is None:
         return True
-    if absolute_days and now - created_at >= absolute_days * DAY_SECONDS:
-        return True
-    if idle_days and now - last_seen >= idle_days * DAY_SECONDS:
-        return True
-    return False
-
+    expired_absolute = bool(absolute_days) and now - created_at >= absolute_days * DAY_SECONDS
+    expired_idle = bool(idle_days) and now - last_seen >= idle_days * DAY_SECONDS
+    return expired_absolute or expired_idle
 
 def _as_timestamp(value):
     """把时间戳列转成 float；不可用时返回 None（调用方按"已过期"处理）。
@@ -95,7 +99,7 @@ def _as_timestamp(value):
             return None
     else:
         return None
-    if candidate != candidate or candidate in (float("inf"), float("-inf")):
+    if math.isnan(candidate) or candidate in (float("inf"), float("-inf")):
         return None                                   # NaN / ±inf
     return candidate
 
@@ -119,13 +123,13 @@ def get_session_user(token: str):
     """按 token 查会话所属用户 id；过期会话顺手删除并视为未登录。
 
     有效访问会刷新 `last_seen`（滑动窗口）——这正是"常用设备不被踢"的来源。
+    刷新按 `LAST_SEEN_REFRESH_SECONDS` 节流：窗口是"天"级的，没必要每个请求
+    都写一次库（见该常量的说明）。
 
     为什么**整段**放在 `write_tx()` 里（而不是"先 connect 读、再 write_tx 写"）：
     这是"读取 + 业务判断 + 写入"的复合操作，判定（是否过期、要不要续期）与
     相应的写入必须处于同一临界区，否则判断依据可能在两者之间被别的进程改掉。
-    代价是带会话 Cookie 的请求会取一次写锁 —— 这是**既有设计**（滑动过期要写
-    `last_seen`）决定的，不是这次改动引入的；没有会话 Cookie 的匿名请求
-    在第一行就返回，完全不碰数据库。
+    匿名请求（没有会话 Cookie）在第一行就返回，完全不碰数据库。
     """
     if not token:
         return None
@@ -141,7 +145,9 @@ def get_session_user(token: str):
         if _is_expired(row, absolute_days, idle_days, now):
             conn.execute("DELETE FROM session WHERE token = ?", (token,))
             return None
-        conn.execute("UPDATE session SET last_seen = ? WHERE token = ?", (now, token))
+        last_seen = _as_timestamp(row["last_seen"])
+        if last_seen is None or now - last_seen >= LAST_SEEN_REFRESH_SECONDS:
+            conn.execute("UPDATE session SET last_seen = ? WHERE token = ?", (now, token))
         return row["user_id"]
 
 

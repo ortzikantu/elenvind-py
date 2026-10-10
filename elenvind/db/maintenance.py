@@ -90,10 +90,12 @@ def prune(table: str, column: str, days: int,
     try:
         with write_tx() as conn:
             cursor = conn.execute(
-                f"DELETE FROM {table} WHERE {column} < ?",       # noqa: S608 - 表名/列名是代码内字面量
+                # 表名/列名只可能来自 PRUNABLE 白名单（见 _validate_target），
+                # 不是外部字符串拼接；参数走占位符。
+                f"DELETE FROM {table} WHERE {column} < ?",
                 (time.time() - days * 86400,))
             removed = cursor.rowcount or 0
-    except Exception:                                             # noqa: BLE001
+    except Exception:                                             # 清理失败只记日志
         logger.exception("Opportunistic prune of %s failed (ignored)", table)
         return 0
     if removed:

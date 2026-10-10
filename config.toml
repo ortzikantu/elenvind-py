@@ -145,8 +145,12 @@ use_builtin_css = true
 [logging]
     level = "info"               # 可选值：debug, info, warning, error, critical
     file = "logs/app.log"        # 日志文件路径（相对项目根目录）
-    max_bytes = 10485760         # 10 MB
-    backup_count = 5
+    # 应用内轮转开关。默认 false = 只写当前文件、由外部 logrotate 负责轮转
+    # （多 worker 各持一个 RotatingFileHandler 时同时轮转会互相截断/丢行）。
+    # 单 worker 或本地开发可以设 true，此时下面的 max_bytes / backup_count 生效。
+    rotate = false
+    max_bytes = 10485760         # 10 MB（rotate = true 时生效）
+    backup_count = 5             # rotate = true 时生效
 
 ###################################################################################################
 # 安全响应头（Core 在响应收尾阶段统一注入，模块层不感知）

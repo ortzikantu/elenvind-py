@@ -33,7 +33,7 @@ def create_user(nickname: str, email: str, password_hash: str) -> int:
     见 `get_user_by_email`），如果写入侧漏了一处，就会存进大写邮箱并导致
     查不到 —— 把不变式收在唯一的写入原语里，调用方就不可能漏。
     """
-    
+
     with write_tx() as conn:
         cursor = conn.execute(
             "INSERT INTO user (nickname, email, password, created_at, nickname_changed_at) "
@@ -59,7 +59,7 @@ def get_user_by_email(email: str):
     因此这里的入参先转小写、再用 BINARY 比较即可命中索引
     （实测 `SEARCH user USING INDEX sqlite_autoindex_user_1 (email=?)`）。
     """
-    
+
     with connect() as conn:
         return conn.execute(
             "SELECT * FROM user WHERE email = ? AND is_deleted = 0",
@@ -85,7 +85,7 @@ def update_user_profile(user_id: int, nickname=None, email=None):
 
     传 `None` 表示"这一项不改"。返回是否实际更新了行。
     """
-    
+
     fields = []
     params = []
     if nickname is not None:

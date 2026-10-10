@@ -6,11 +6,8 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
-import time
 
 from . import connection
-from .connection import connect, get_connection
 from .transaction import write_tx
 
 logger = logging.getLogger(__name__)
@@ -64,7 +61,8 @@ _SCHEMA_STATEMENTS = (
         success INTEGER NOT NULL DEFAULT 0
     )
     """,
-    "CREATE INDEX IF NOT EXISTS idx_login_attempts_email ON login_attempts(email COLLATE NOCASE, attempted_at)",
+    "CREATE INDEX IF NOT EXISTS idx_login_attempts_email "
+    "ON login_attempts(email COLLATE NOCASE, attempted_at)",
     "CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip, attempted_at)",
     # 注册尝试流水：公开注册的 IP 维度限流
     """
@@ -239,7 +237,7 @@ def _migrate_to_3(conn):
 def _table_row_count(conn, table: str) -> int:
     try:
         return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-    except Exception:                                  # noqa: BLE001
+    except Exception:
         return 0
 
 

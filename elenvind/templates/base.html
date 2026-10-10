@@ -1,7 +1,7 @@
 {# 全站基础布局：所有页面模板都 extends 本文件。
    Python 只准备数据，HTML 全部在这里。 #}
 <!DOCTYPE html>
-<html lang="{{ lang }}"{% if request and request.cookies.get('theme') in ('light', 'dark') %} data-theme="{{ request.cookies.get('theme') }}"{% endif %}>
+<html lang="{{ lang }}"{% if theme in ('light', 'dark') %} data-theme="{{ theme }}"{% endif %}>
   <head>
     <meta charset="utf-8">
     <title>{% block title %}{{ site_title }}{% endblock %}</title>

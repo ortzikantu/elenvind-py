@@ -1,272 +1,162 @@
-<img src="elenvind/static/imgs/logo.png" align="right" alt="Logo designed by Hao Wu" width="120" height="120">
+# Elenvind
 
-<h2>Elenvind</h2> 
+一个只用 **Python 标准库 + Gunicorn + SQLite + Jinja2 + Markdown** 构建的个人博客/网站服务。
 
-A Personal Website Server
+设计约束（项目的"宪法"）：
 
-> *Elen síla lúmenn' omentielvo.*
-
-## Zero-JS, Zero-Bullshit
-
-- 100% functional without JavaScript.
-- 100% free of tracking and advertising.
-- A blog, a comment thread and a few static pages — and nothing you have to babysit.
-
-A standard-library-first, **synchronous WSGI** SSR web app on **Gunicorn + SQLite**.
-`requirements.txt` pins Gunicorn, Jinja2 and Markdown — no ORM, no DI, no plugin
-system, no build step, no asyncio, no writer queue.
-
----
-
-## Quick start
-
-```bash
-git clone https://codeberg.org/ortzikantu/elenvind.git elenvind-py
-cd elenvind-py
-
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-cp config.example.toml config.toml    # at minimum: site_url, title, [static] URLs
-python run.py
-```
-
-Requires **Python 3.11+** (`tomllib` in the standard library). `python run.py`
-validates `config.toml` once, refuses to start on a typo (with a reason), then serves
-the site with Gunicorn. There is nothing to generate, no key to paste anywhere, and
-exactly **one** optional environment variable: `ELENVIND_DB` (override the SQLite
-path, e.g. to isolate staging from production). You never *need* it.
-
-Production equivalent — same app, same config:
-
-```bash
-gunicorn --workers 2 --bind 127.0.0.1:6789 elenvind.wsgi:application
-# or, to get config.toml's host/port/workers + trusted-proxy wiring:
-python run.py --workers 2
-```
-
-Behind Nginx: copy `docs/nginx.conf.example`, drop in the paths, add TLS (`certbot`),
-put it under systemd, back up with `sqlite3 sqlite.db ".backup …"` (WAL mode — never
-raw-copy the file). Step-by-step: [Deployment Guide](docs/DEPLOYMENT.md).
-
-## Architecture: modules do business, Web Core does Web security
-
-```
-Gunicorn (sync workers, WSGI)
-        │
-        ▼
-elenvind/wsgi.py          startup(STARTUP_HOOKS) → application  (PEP 3333)
-        │
-        ▼
-elenvind/app.py           Composition Root: the only place that knows all three
-        │                 layers — db path + startup, route registration order,
-        │                 error pages, session store injection, and the data each
-        │                 module gets from another module
-        ├──────────────┬──────────────────┐
-        ▼              ▼                  ▼
-elenvind/core/   elenvind/db/       elenvind/modules/
-runtime base     persistence base   business
-(no db, no       (only SQLite       (may use core and db;
- modules)         boundary)          never import each other)
-        └──────────────┴──────────────────┘
-                       ▼
-                 SQLite (WAL)   ← reads: db.connect()   writes: db.write_tx()
-```
-
-| Rule | Enforced by |
-|---|---|
-| **Core never imports db**, modules or the composition root | `tests/test_architecture.py` |
-| **db never imports core**, modules or the composition root (stdlib only) | `tests/test_architecture.py` |
-| Only `db/` may import `sqlite3`, run SQL, or commit a transaction | `tests/test_architecture.py` |
-| `BEGIN IMMEDIATE` only in `db/transaction.py` | `tests/test_architecture.py` |
-| Modules never import the composition root | `tests/test_architecture.py` |
-| Modules never import each other (collaboration is injected in `app.py`) | `tests/test_architecture.py` |
-| No import cycles (module level: zero; Core's legacy lazy cycles: ratcheted) | `tests/test_architecture.py` |
-| Modules never touch SQLite, never re-implement security | `tests/test_core_contract.py` |
-| All writes go through `write_tx()` | `tests/test_core_contract.py`, `tests/test_c0_*.py` |
-
-Adding a page is just a route — security is applied by the dispatcher, not by you:
-
-```python
-@router.route("/hello", methods=["GET"])
-def hello(request):
-    return html(render_template("hello.html", {"greeting": "Hello"}))
-
-@router.route("/settings", methods=["POST"], auth="required")          # anonymous → 403
-def settings(request): ...
-
-@router.route("/admin", methods=["GET"], auth="required", permission="admin")
-def admin_home(request): ...
-```
-
-A module writes **no** CSRF code, sets **no** cookies, adds **no** security headers and
-checks **no** request size — Core does all of that, once. Details:
-[Architecture](docs/ARCHITECTURE.md) · [Module Development Guide](docs/development/modules.md).
-
-### Database writes: one entry point
-
-```python
-from elenvind import db
-
-with db.write_tx() as conn:       # flock(LOCK_EX) on <db>.write.lock → BEGIN IMMEDIATE
-    conn.execute("INSERT INTO comment (...) VALUES (...)", (...))
-```
-
-Reads use `with db.connect()`. Every write transaction takes a cross-process `flock` on a
-lock file that sits *next to* the database (`sqlite.db` → `sqlite.db.write.lock`), then
-`BEGIN IMMEDIATE`, then commits or rolls back — so multiple Gunicorn workers are safe
-without a writer process, a queue, or a retry loop. Writes are serialized; reads are not.
-The full contract, its limits and what it deliberately does *not* promise:
-[Database & C0 write coordination](docs/development/database.md).
-
-## Project layout
+- **标准库为绝对核心**，第三方依赖只有 4 个：`gunicorn`、`Jinja2`、`Markdown`、`MarkupSafe`；
+- 单体、单机、单库（SQLite），多 worker 通过 `flock` + `BEGIN IMMEDIATE` 串行化写事务；
+- 不引入中间件框架 / ORM / 前端构建链：Zero-JS，服务端渲染；
+- 分层单向依赖：`app（装配）→ modules（业务）→ db（持久化）`、`core（运行时基座）`，
+  依赖方向由 `tests/test_architecture.py` 强制。
 
 ```
 elenvind/
-  app.py        composition root (wiring, injection, startup hooks)
-  wsgi.py       production entry point
-  core/         runtime base: HTTP, routing, security, sessions, CSRF, templates,
-                markdown, content format, config, logging
-  db/           persistence base (the only SQLite boundary): connection, write_tx,
-                migrations, and the per-table data APIs
-  modules/      business: blog, pages, auth, users, admin, seo, system
-  templates/    Jinja2 templates (Python prepares data, HTML lives here)
-  static/       packaged assets, served by the app with URL mirroring disk
-articles/       your Markdown posts          custom_pages/  your standalone pages
-i18n/           zh/en/ja message tables      docs/          the handbook
-config.toml     your site (validated at startup)
+  app.py        装配点（唯一同时认识 core / db / modules 的地方）
+  wsgi.py       WSGI 入口：gunicorn elenvind.wsgi:application
+  core/         运行时基座：HTTP 边界、路由、会话、CSRF、安全头、Markdown、模板、i18n
+  db/           持久化基座：唯一允许 import sqlite3 与执行 SQL 的地方
+  modules/      业务模块：auth / users / admin / blog / pages / seo / system
+  templates/    Jinja2 模板
+  static/       内置静态资源（图标、样式表）
+articles/       文章（TOML front matter + Markdown）
+custom_pages/   自定义页面（纯 Markdown，文件名即路由）
+i18n/           界面文案（en / zh / ja）
+deploy/         Nginx / systemd / logrotate 示例
+tests/          标准库 unittest 测试（含架构守卫）
 ```
 
-## Styling: bring your own, or use the built-in one
-
-| `[static].css` | `use_builtin_css` | What you get |
-|---|---|---|
-| set | any | your URL (site-relative path or CDN) |
-| empty | `true` (default) | the **default** stylesheet, served by the app at `/css/style.css` |
-| empty | `false` | no `<link>` at all — you handle styling yourself |
-
-So a fresh clone typesets itself with zero Nginx. The built-in sheet is zero-JS,
-variable-driven, has `prefers-color-scheme` *and* `data-theme` dark modes, and is
-covered by a drift guard (`tests/test_styles.py`) that fails if a template uses a class
-the sheet doesn't define. `style.example.css` at the repo root is a copy of it.
-
-`elenvind/static/` is exposed at `/` with **URL mirroring disk**
-(`/css/style.css` → `elenvind/static/css/style.css`): dropping a file in is all it takes.
-Files are read per request (edit → refresh, no restart) and served with `ETag` +
-`Cache-Control: public, max-age=86400`.
-
-| Directory | Convention | Config key | Default URL |
-|---|---|---|---|
-| `elenvind/static/css/` | stylesheets | `[static].css` when empty | `/css/style.css` |
-| `elenvind/static/imgs/` | images | `[static].favicon` when empty | `/imgs/favicon.ico`/`.png` |
-| anything else under `elenvind/static/` | fonts, icons, … | — | by relative path |
-
-**Security boundary:** the resolved path must stay inside `elenvind/static/`; hidden
-files/directories are 404; `../`, `%2e%2e`, backslashes and symlinks pointing outside
-are rejected. These assets are **public** by design — never put private content here.
-Your own `logo`, `hero` and social icons can stay on Nginx/CDN via plain URLs; when
-they're empty the element simply isn't rendered, so a fresh clone never shows a broken
-image.
-
-## What it is made of
-
-| Concern | Choice |
-|---|---|
-| Runtime | Python standard library + Gunicorn (WSGI), synchronous business code |
-| Rendering | Jinja2 templates, server-side, Zero-JS |
-| Database | SQLite in `elenvind/db/` (WAL, `PRAGMA foreign_keys=ON`, `user_version` migrations, schema v5) |
-| Write coordination | `write_tx()`: cross-process `flock` on a separate lock file + `BEGIN IMMEDIATE`; multi-worker safe, writes serialized |
-| Content | Markdown body + TOML front matter (`+++` fence), rendered by `core.markdown` |
-| Markup safety | Whitelist HTML sanitiser in `core.markdown` (stdlib `html.parser`) |
-| Sessions | Server-side random tokens in SQLite (not JWT), absolute + idle expiry |
-| Passwords | `hashlib.scrypt`, self-describing hashes, transparent rehash on login |
-| CSRF | Double-submit cookie, enforced in one dispatcher gate |
-| AuthZ | Declarative `auth="required"` / `permission="admin"` on the route |
-| Cache | In-process file-snapshot caches for articles and custom pages |
-| Security headers | Injected by Core on every response (including 404/500) — modules never set them |
-| Observability | One access-log line per request, audit events for auth/comment changes, DEBUG write-transaction detail |
-
-Nothing derives from a shared secret: sessions are opaque random values stored
-server-side, CSRF is a double-submit cookie, passwords are self-describing scrypt
-hashes. That is why there is no signing key to manage.
-
-## Security defaults
-
-Core appends these on the way out — a module just returns a `Response`:
-
-| Header | Default |
-|---|---|
-| `Content-Security-Policy` | `default-src 'self'; script-src 'none'; style-src 'self' 'unsafe-inline'; …` |
-| `X-Content-Type-Options` | `nosniff` |
-| `Referrer-Policy` | `strict-origin-when-cross-origin` |
-| `Permissions-Policy` | camera/microphone/geolocation/payment/usb/… all `()` |
-| `Strict-Transport-Security` | only when **configured on** *and* the request is HTTPS |
-
-HTTPS is detected from `X-Forwarded-Proto` **only** when the direct peer is listed in
-`[server].trusted_proxies` (default: loopback) — the same list `run.py` hands to
-Gunicorn's `forwarded_allow_ips`, so there is exactly one source of truth. Client IPs
-are resolved by walking `X-Forwarded-For` from the right, past trusted hops, so a client
-cannot forge its own address and slip past the IP rate limits.
-
-Threat model, every control and the reasoning behind them (including why `style-src`
-keeps `'unsafe-inline'`):
-[Security](docs/SECURITY.md) · [Configuration](docs/CONFIGURATION.md#security-安全响应头).
-
-## Documentation
-
-Everything in Chinese, because we're classy like that. Start at the
-**[documentation index](docs/README.md)**; the map:
-
-| | Document | What it is for |
-|---|---|---|
-| 🚀 | [Deployment Guide](docs/DEPLOYMENT.md) | systemd, Nginx, HTTPS, backups, upgrade |
-| ⚙️ | [Configuration Guide](docs/CONFIGURATION.md) | every knob in `config.toml`, with defaults |
-| 🧱 | [Architecture](docs/ARCHITECTURE.md) | layers, dependency rules, request pipeline, module map |
-| 🔐 | [Security](docs/SECURITY.md) | threat model, controls, proxy trust, headers, logging red lines |
-| 🧩 | [Module Development Guide](docs/development/modules.md) | how to add a module (the intended DX) |
-| 🗄️ | [Database & C0](docs/development/database.md) | `write_tx()`, lock file, migrations, limits |
-| 🧪 | [Testing](docs/development/testing.md) | suites, guards, how to run and extend them |
-| 🛠️ | [Ops Guide](docs/OPS_GUIDE.md) | day-2: content, users, comments, logs, limits, FAQ |
-| 📄 | [Nginx Config Example](docs/nginx.conf.example) | copy, paste, adjust, ship |
-| 🤝 | [Contributing](CONTRIBUTING.md) | patch workflow, style rules, pre-flight checklist |
-
-## Tests
-
-Standard-library `unittest`, no extra dependencies, temp DB and temp content dirs only —
-your real `sqlite.db` and `articles/` are never touched.
+## 快速开始
 
 ```bash
-python -m unittest discover -s tests -t .        # everything (~140s, 790+ tests)
-python -m unittest tests.test_architecture -v    # layering guards
-python -m unittest tests.test_core_contract -v   # security contract guards
-python -m unittest tests.test_c0_concurrency -v  # real multi-process write coordination
-python smoke_driver.py                           # boots real Gunicorn, 61 end-to-end checks
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp config.example.toml config.toml     # 至少改 site_url 与 admin_user_id
+.venv/bin/python run.py                # 默认 127.0.0.1:6789
 ```
 
-They cover the HTTP body parser, CSRF, sessions, auth, comments, the article/page
-caches, SEO, config validation, the Markdown renderer + sanitiser (plus a seeded fuzz
-harness), the **Core Contract**, the **architecture guards**, real multi-process
-`write_tx()` coordination (including `SIGKILL` recovery and concurrent migrations), and
-an end-to-end cold start. What each suite is for: [Testing](docs/development/testing.md).
+首次启动会自动建库、建表、迁移，并在 `logs/app.log` 里记账。第一个注册的账号
+是 `admin_user_id` 指向的用户（默认 1）——**先注册自己的账号**，或把
+`admin_user_id` 改成你的 id、把 `registration_enabled` 先设为 `false`。
 
-## License
-
-This project is licensed under the [GPL-3.0-or-later](LICENSE) license.
-
----
-
-No PRs, please.  
-Patches only.  
-Test it.  
-Commit it.  
-Generate one with `git format-patch`.  
-Then mail it to me.  
-
-Workflow, style rules and the pre-flight checklist live in
-[CONTRIBUTING.md](CONTRIBUTING.md):
+常用启动参数：
 
 ```bash
-git format-patch -1            # the latest commit
-git format-patch origin/main   # everything not yet pushed
+.venv/bin/python run.py --workers 2          # 覆盖 worker 数
+.venv/bin/python run.py --bind 0.0.0.0:6789  # 临时对外（仅内网测试）
+.venv/bin/python run.py --preload            # master 里导入应用（startup 只跑一次）
+.venv/bin/python run.py --reload             # 开发：代码改动自动重载
 ```
+
+## 生产部署（Nginx 反向代理）
+
+**应用只监听 127.0.0.1**，由 Nginx 终结 TLS 并回源。理由与后果：
+
+- 应用端口一旦可从公网直连，TLS/HSTS/边缘限速全部被绕过（启动日志会告警）；
+- 反向代理还负责挡**慢连接**：Gunicorn 的 `sync` worker 只有 2 个，
+  2 个"声明了 Content-Length 却不发正文"的连接就能让整站停摆到 worker 超时（30s）。
+  Nginx 侧的 `client_body_timeout` / `client_header_timeout` / `limit_conn` 是必需的。
+
+```bash
+sudo cp deploy/elenvind.service /etc/systemd/system/
+sudo cp deploy/logrotate.conf /etc/logrotate.d/elenvind
+sudo systemctl daemon-reload && sudo systemctl enable --now elenvind
+```
+
+Nginx 配置见 `deploy/nginx.conf.example`（含 `proxy_hide_header Server`、限流与超时）。
+配套的 `config.toml` 建议：
+
+```toml
+site_url = "https://your.domain"     # robots/sitemap 的绝对地址唯一来源
+[server]
+host = "127.0.0.1"
+port = 6789
+cookie_prefix = true                  # 全程 HTTPS 时启用 __Host- 前缀
+[security]
+hsts_enabled = true
+```
+
+## 备份与恢复
+
+```bash
+.venv/bin/python run.py --backup                    # → backups/elenvind-<时间戳>.db
+.venv/bin/python run.py --backup-to /srv/backups/x.db
+```
+
+备份走 SQLite 的在线 backup API（WAL 模式下 `cp sqlite.db` 会丢掉还在 `-wal`
+里的事务），并默认做 `PRAGMA quick_check`；失败会删掉半成品并返回非零退出码。
+放进 cron 即可：
+
+```cron
+0 4 * * * cd /srv/elenvind && .venv/bin/python run.py --backup >> logs/backup.log 2>&1
+```
+
+恢复：停服 → 把当前 `sqlite.db` 挪走 → 用备份替换 → **删除 `sqlite.db-wal` 与
+`sqlite.db-shm`** → 启动。
+
+## 测试
+
+```bash
+.venv/bin/python -m unittest discover -s tests -t . -v     # 全部
+.venv/bin/python -m unittest tests.test_auth_lockout -v    # 单个模块
+```
+
+测试只用标准库 `unittest`，**不会碰仓库里的 `config.toml` / `sqlite.db` / `logs/`**
+（配置由夹具注入，数据库与日志落在临时目录）。覆盖：
+
+| 文件 | 守什么 |
+|---|---|
+| `test_architecture.py` | 依赖方向、`sqlite3`/`jinja2`/`markdown` 只能在允许的层、写 SQL 只能在 db |
+| `test_core_contract.py` | Markdown 净化、CSRF、回跳地址、静态资源穿越、请求 framing、安全头 |
+| `test_comments.py` | 评论转义、深度硬约束、配额（涂黑即释放）、越权 |
+| `test_auth_lockout.py` | **登录闸门不得阻断正确凭据**、会话轮换/节流、口令策略 |
+| `test_logging_proxy.py` | 日志不含凭据/查询串、XFF/XFP 只在受信对端生效、Host 头不投毒 |
+| `test_doc_consistency.py` | 配置校验（含 CSP 只许收窄）、i18n 三语一致、交付件与依赖声明 |
+| `test_styles.py` | 模板/代码用到的 class 必须都在内置样式表里 |
+
+静态检查（可选，仅开发工具，不是运行时依赖）：
+
+```bash
+.venv/bin/ruff check .        # 配置见 pyproject.toml
+```
+
+## 配置
+
+全部配置项与语义见 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)。几个要点：
+
+- 配置只在**启动时**加载一次并整体校验，非法配置直接拒绝启动（不会跑到某个页面才 500）；
+- 路径类配置一律相对**项目根目录**解析，与启动时的 cwd 无关；
+- 不需要任何签名密钥：会话是服务端随机 token，CSRF 是双提交 Cookie，密码是 scrypt 自描述哈希。
+
+## 安全模型（一页速览）
+
+- **会话**：32 字节随机 token 存服务端表，Cookie `HttpOnly` + `SameSite=Lax` + （HTTPS 时）`Secure`，
+  可选 `__Host-` 前缀；登录轮换（防会话固定），改密/删号清空全部会话；绝对 30 天 + 滑动 15 天双过期。
+- **CSRF**：双提交 Cookie，调度器对所有非安全方法**默认**校验，模块不写一行 CSRF 代码。
+- **XSS**：Jinja 自动转义 + Markdown 白名单净化（裸 HTML 转义、协议白名单、危险标签连内容丢弃）。
+- **注入**：所有 SQL 参数化；动态标识符只来自代码内白名单。
+- **路径穿越**：静态资源经 `resolve()` 后必须仍在内置目录之下，且拒绝隐藏路径。
+- **开放重定向**：回跳地址只接受站内路径（拒绝 `//`、反斜杠、TAB/控制字符）。
+- **代理信任**：`X-Forwarded-For` / `X-Forwarded-Proto` 只在直连对端属于
+  `[server].trusted_proxies` 时采信，且取最右非受信跳。
+- **Host 头**：绝对地址只来自 `site_url` 配置，绝不从请求推导。
+- **限流**：登录（邮箱 / IP / 全站三闸门 + 渐进冷却）、注册（IP）、评论（用户 / IP / 单篇配额）。
+  **闸门只约束错误凭据**：正确密码永远不会被限流挡住（回归测试见 `test_auth_lockout.py`）。
+- **日志**：访问日志不记查询串、请求体、Cookie 与凭据，非打印字符一律转义。
+
+## 排障
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 登录提示"稍后再试" | 触发登录闸门。**用正确密码仍可登录**；错误密码需等 `Retry-After` 秒。想立刻清空某邮箱的失败流水：`sqlite3 sqlite.db "DELETE FROM login_attempts WHERE email='x@y';"` |
+| 表单提交返回 400 | CSRF 令牌与 Cookie 不匹配（页面开太久 / 清过 Cookie）。刷新页面重试即可，页面会给出提示 |
+| 返回 413 | 请求体超过 `max_body_size`（默认 1 MB） |
+| 返回 411 | 表单方法没带 `Content-Length`（多为自写客户端） |
+| 文章/页面改了不生效 | 内容缓存最多 2 秒节流；也可重启或等待自动重扫（日志会记 "Article directory changed"） |
+| 评论提示"已达上限" | 该文章未涂黑评论达到 `max_comments_per_article`；管理员涂黑旧评论即可释放名额 |
+| 启动报"检测到上次迁移未完成" | 数据库里残留 `*_legacy` 表：先备份再按提示处理，绝不静默继续 |
+| 非回环地址监听告警 | 你 bind 到了 `0.0.0.0` 且信任转发头：请改回 `127.0.0.1` 并让反代回源，或给端口加防火墙 |
+
+## 许可
+
+见 [LICENSE](LICENSE)。

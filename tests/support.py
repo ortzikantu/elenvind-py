@@ -1,563 +1,352 @@
-"""测试公共设施：WSGI 调用夹具、临时数据库、响应解析。
+"""测试夹具：临时工作区（配置 / 数据库 / 日志 / 内容）+ WSGI 直调助手。
 
-设计原则：
-- 不依赖任何第三方测试包，只用标准库 unittest。
-- 每个测试用例使用独立的临时数据库与临时内容目录，绝不触碰项目根的真实数据。
-- 通过直接调用 WSGI 可调用对象（elenvind.app.app）来跑"端到端"请求：
-  自己拼 environ、自己收 `start_response`，与 gunicorn 传给应用的语义一致，
-  因此无需启动 HTTP 服务器也能覆盖 HTTP 层、路由、CSRF、会话与渲染的完整链路。
+设计要点（为什么这样搭）：
 
-不做的事：这里**不**模拟 gunicorn 的逐跳头过滤、连接复用等行为 ——
-那些属于服务器，不属于应用；夹具只验证"应用交给 WSGI 服务器的东西"。
+- **不启动 Gunicorn**：直接调用 `elenvind.app.app(environ, start_response)`，
+  走的是与生产完全相同的那条流水线（请求解析 → 会话 → 路由 → 安全头 → Cookie），
+  但完全没有端口、进程与超时的不确定性。
+- **不读仓库里的 config.toml**：`core.lifespan.SKIP_CONFIG_LOAD` 是测试专用开关
+  （生产路径永远为 False），配置由本模块注入，`validate_config()` 照常执行 ——
+  因此测试同时验证了"这套配置是合法的"。
+- **一切可写的东西都落在 `tempfile.mkdtemp()` 里**：数据库、日志、文章、页面。
+  运行测试不会碰仓库里的任何文件（`config.toml`、`sqlite.db`、`logs/` 都不动）。
+- 应用与工作区在整个测试进程里**只启动一次**（`ensure_application()` 幂等）；
+  用例之间用 `reset_database()` 清表隔离。
 """
-import io
-import os
-import shutil
-import sys
-import unittest
-import uuid
-from pathlib import Path
-from urllib.parse import urlencode
+from __future__ import annotations
 
-# 保证可以从项目根导入 elenvind 包
+import io
+import logging
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import urllib.parse
+from pathlib import Path
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
+if str(PROJECT_ROOT) not in sys.path:                     # 允许 `python -m unittest`
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# 临时工作区：放测试数据库与临时内容目录。
-# 默认落在项目根下的 .testtmp/（系统临时目录在受限沙箱里可能不可写），
-# 每个测试自建子目录、tearDown 时删除。
-TEST_TMP_ROOT = Path(os.environ.get("ELENVIND_TEST_TMP", str(PROJECT_ROOT / ".testtmp")))
-TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+#: 测试用文章：两个（覆盖首页排序与文章页），内容里的 `<` 会被 markdown 层转义
+ARTICLES = {
+    "2026-01-01-first.md": (
+        '+++\ntitle = "First Post"\ndate = 2026-01-01T00:00:00+00:00\n'
+        'authors = ["Tester"]\n+++\n\nFirst body with `code` and **bold**.\n'
+    ),
+    "2026-01-02-second.md": (
+        '+++\ntitle = "Second Post"\ndate = 2026-01-02T00:00:00+00:00\n+++\n\nSecond body.\n'
+    ),
+}
+PAGES = {"about.md": "# About\n\nHello from a custom page.\n"}
 
-# 兜底：测试进程内任何一次 init_db() 都必须落到 .testtmp 下，
-# 绝不能因为某个测试没走 ElenvindTestCase.setUp 就写到项目根的真实 sqlite.db。
-os.environ.setdefault("ELENVIND_DB", str(TEST_TMP_ROOT / "fallback.db"))
-
-from elenvind.core import config as config_module          # noqa: E402
-from elenvind import db
-from elenvind.db import connection as db_connection                          # noqa: E402
-from elenvind.core import lifespan as lifespan_module      # noqa: E402
-from elenvind.core import console as console_module        # noqa: E402
-from elenvind.modules.blog import logic as blog_logic     # noqa: E402
-from elenvind.modules.pages import logic as pages_logic   # noqa: E402
-
-# 静音启动横幅/彩色日志：测试输出只保留 unittest 的结果
-_NOOP = lambda *args, **kwargs: None
-for _name in ("success", "error", "warning", "info", "banner"):
-    setattr(lifespan_module, _name, _NOOP)
-    setattr(console_module, _name, _NOOP)
+ARTICLE_SLUG = "2026-01-01-first"
+MISSING_SLUG = "no-such-slug"
 
 
-class StreamInput:
-    """可控的 `wsgi.input` 替身。
+class Workspace:
+    """一个隔离的临时工作区。"""
 
-    PEP 3333 允许输入流**短读**（一次只给一部分），也允许它给不出任何数据
-    （客户端断开）。这两种行为在真实服务器上都出现过，因此这里可以精确模拟：
+    def __init__(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="elenvind-tests-"))
+        self.articles = self.root / "articles"
+        self.pages = self.root / "pages"
+        self.articles.mkdir()
+        self.pages.mkdir()
+        for name, text in ARTICLES.items():
+            (self.articles / name).write_text(text, encoding="utf-8")
+        for name, text in PAGES.items():
+            (self.pages / name).write_text(text, encoding="utf-8")
+        self.db = self.root / "sqlite.db"
+        self.log = self.root / "app.log"
 
-    - `data`：可读的字节总量；读到末尾后 `read()` 返回 `b""`（EOF）；
-    - `max_per_read`：单次 `read()` 最多返回多少字节（模拟短读）；
-    - `always_empty`：永远返回 `b""`（"声明了长度却一个字节都不给"）。
+
+def test_config(workspace: Workspace) -> dict:
+    """注入 `core.config.config` 的配置：与 config.example.toml 同构且更严格。
+
+    刻意把限流阈值调小（锁定 3 次、评论配额 3 条、评论深度 3 层），
+    这样"上限行为"可以在几次请求内被验证，而不必灌 1000 条数据。
     """
+    return {
+        "locale": "en",
+        "title": "Elenvind Test",
+        "copyright": "Tester",
+        "site_url": "https://test.invalid",
+        "admin_user_id": 1,
+        "admin_badge": "ADMIN",
+        "deleted_user_nickname": "Gone",
+        "max_length": 1000,
+        "max_comment_depth": 3,
+        "max_comments_per_article": 50,
+        "registration_enabled": True,
+        "session_absolute_days": 30,
+        "session_idle_days": 15,
+        "max_body_size": 8192,
+        "database": str(workspace.db),
+        "articles_dir": str(workspace.articles),
+        "custom_pages_dir": str(workspace.pages),
+        "templates_dir": str(PROJECT_ROOT / "elenvind" / "templates"),
+        "use_builtin_css": True,
+        "server": {
+            "host": "127.0.0.1",
+            "port": 6789,
+            "workers": 1,
+            "trusted_proxies": ["127.0.0.1", "::1"],
+            "cookie_prefix": False,
+        },
+        "pagination": {"per_page": 6},
+        "comment_limits": {"max_per_user": 100, "max_per_ip": 100, "window_seconds": 60},
+        "login_limits": {
+            "max_email_failures": 3, "email_window_seconds": 86400,
+            "max_ip_failures": 100, "ip_window_seconds": 900,
+            "max_global_failures": 1000, "global_window_seconds": 900,
+        },
+        "register_limits": {"max_per_ip": 10000, "window_seconds": 1},
+        "static": {"css": "", "favicon": "", "logo": "", "hero": ""},
+        "logging": {
+            "level": "info", "file": str(workspace.log),
+            "max_bytes": 1048576, "backup_count": 1, "rotate": True,
+        },
+        "security": {
+            "csp_enabled": True, "hsts_enabled": True, "hsts_max_age": 300,
+            "hsts_include_subdomains": False, "permissions_policy": "",
+            "csp": {},
+        },
+        "params": {
+            "intro": "hello",
+            "nav": [{"name": "About", "url": "/about"}],
+            "social": [{"name": "Mail", "url": "mailto:me@test.invalid", "icon": ""}],
+            "projects": [{"name": "Elenvind", "url": "https://example.test",
+                          "description": "base"}],
+        },
+    }
 
-    def __init__(self, data=b"", *, max_per_read=None, always_empty=False):
-        self.data = data
-        self.offset = 0
-        self.max_per_read = max_per_read
-        self.always_empty = always_empty
 
-    def read(self, size=-1):
-        if self.always_empty:
-            return b""
-        if size is None or size < 0:
-            size = len(self.data) - self.offset
-        if self.max_per_read is not None:
-            size = min(size, self.max_per_read)
-        chunk = self.data[self.offset:self.offset + size]
-        self.offset += len(chunk)
-        return chunk
+WORKSPACE: Workspace | None = None
+APP = None
 
 
+def ensure_application():
+    """幂等地准备临时工作区并完成一次 `startup()`，返回 WSGI callable。"""
+    global WORKSPACE, APP
+    if APP is not None:
+        return APP
+    WORKSPACE = Workspace()
+    os.environ["ELENVIND_DB"] = str(WORKSPACE.db)
 
-def _remove_tmpdir(tmpdir, *, attempts=5):
-    """删除用例临时目录；失败时**看得见**，并顺带清理同级的陈旧目录。
+    from elenvind.core import config as config_module
+    from elenvind.core import lifespan
 
-    为什么不用 `shutil.rmtree(..., ignore_errors=True)`：
-    Windows 上若还有 sqlite 句柄没释放，rmtree 会抛
-    `PermissionError: [WinError 32] ... being used by another process`，
-    而 `ignore_errors=True` 把它彻底吞掉 —— 于是"清理失败"会安静地
-    累积成几百个残留目录，谁也不知道清理逻辑什么时候坏掉的。
-    改成：先重试几次（句柄释放有微小延迟），仍失败就打印到 stderr。
+    lifespan.SKIP_CONFIG_LOAD["value"] = True
+    config_module.config.clear()
+    config_module.config.update(test_config(WORKSPACE))
 
-    另外顺手清掉 `.testtmp/` 下的**其它**目录：如果某次运行是被强杀的
-    （中断、超时、崩溃），tearDown 根本没机会跑，那些目录会一直留着。
-    每个用例开始时自愈一次，残留就不会无限增长。
-    """
-    import sys as _sys
-    import time as _time
+    from elenvind.app import STARTUP_HOOKS, app, prepare_database
 
-    for attempt in range(attempts):
-        try:
-            shutil.rmtree(tmpdir)
-            break
-        except FileNotFoundError:
-            break
-        except OSError as exc:
-            if attempt == attempts - 1:
-                print(f"[test-harness] could not remove {tmpdir}: {exc}",
-                      file=_sys.stderr)
-                break
-            _time.sleep(0.05 * (attempt + 1))
+    lifespan.startup(STARTUP_HOOKS, prepare_database=prepare_database)
+    # 让测试输出保持干净：控制台 handler 只保留严重错误（**文件** handler 仍然是
+    # 配置里的 info 级别，test_logging_proxy 断言的是文件内容）。
+    for handler in logging.getLogger().handlers:
+        if not isinstance(handler, logging.FileHandler):
+            handler.setLevel(logging.CRITICAL)
+    APP = app
+    return APP
 
-    # 自愈：清掉父目录下**明显早已废弃**的陈旧目录（跳过当前这个）。
-    #
-    # 只删 mtime 超过 10 分钟的：如果有人用 `--parallel` 之类跑并发测试，
-    # 兄弟目录可能正被另一个进程使用，凭"名字像 case-"就删会破坏它。
-    # 正常一次 tearDown 到下一次测试开始是毫秒级，10 分钟只会命中
-    # "上次运行被强杀（中断/超时/崩溃）留下的孤儿"。
-    parent = Path(tmpdir).parent
-    if not parent.name.startswith(".testtmp"):
-        return
-    import time as _time
 
-    cutoff = _time.time() - 600
+def reset_database() -> None:
+    """清空全部业务表与限流流水（用例之间隔离）。"""
+    ensure_application()
+    from elenvind.db import maintenance
+
+    conn = sqlite3.connect(WORKSPACE.db)
     try:
-        for sibling in parent.iterdir():
-            if sibling == Path(tmpdir) or not sibling.is_dir():
-                continue
-            if not sibling.name.startswith("case-"):
-                continue
-            try:
-                if sibling.stat().st_mtime > cutoff:
-                    continue
-            except OSError:
-                continue
-            shutil.rmtree(sibling, ignore_errors=True)
-    except OSError:
-        pass
+        for table in ("login_attempts", "register_attempts", "comment_rate",
+                      "comment", "session", "user"):
+            conn.execute(f"DELETE FROM {table}")     # 表名是代码内字面量
+        conn.commit()
+    finally:
+        conn.close()
+    maintenance.reset_state()
 
 
-def build_environ(method, path, *, query_string="", headers=(), body=b"",
-                  host="example.com", scheme="https", peer=("127.0.0.1", 44321),
-                  stream=None):
-    """按 PEP 3333 造一个 environ（gunicorn 的填法）。
+def reload_content() -> None:
+    """强制重扫文章 / 页面（绕过 2 秒扫描节流）。"""
+    from elenvind.modules.blog import logic as blog_logic
+    from elenvind.modules.pages import logic as pages_logic
 
-    - 请求头：`CONTENT_TYPE` / `CONTENT_LENGTH` 走独立键，其余 `HTTP_*`；
-    - `wsgi.input`：默认是 `body` 的 BytesIO，可用 `stream` 替换
-      （见 `StreamInput`，用于短读/截断/空读等边界）。
+    blog_logic.load_articles()
+    pages_logic.load_pages()
+
+
+def query(sql: str, args=()):
+    """直接查临时库（仅测试使用；生产代码只能走 db 包）。"""
+    ensure_application()
+    conn = sqlite3.connect(WORKSPACE.db)
+    try:
+        return conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+
+
+def live_config() -> dict:
+    """当前生效的配置字典（用例可临时改，务必在 finally 里恢复）。"""
+    from elenvind.core.config import config
+
+    ensure_application()
+    return config
+
+
+class Result:
+    """一次直调的结果（状态码 / 响应头 / 响应体 / 新增 Cookie）。"""
+
+    def __init__(self, status: str, headers, body: bytes) -> None:
+        self.raw_status = status
+        self.status = int(str(status).split(" ", 1)[0])
+        self.headers = list(headers)
+        self.body = body
+        self.cookies: dict[str, str] = {}
+        for name, value in self.headers:
+            if name.lower() == "set-cookie":
+                head = value.split(";", 1)[0]
+                key, _, val = head.partition("=")
+                self.cookies[key.strip()] = val.strip()
+
+    def header(self, name, default=None):
+        for key, value in self.headers:
+            if key.lower() == name.lower():
+                return value
+        return default
+
+    def all_headers(self, name):
+        return [value for key, value in self.headers if key.lower() == name.lower()]
+
+    def text(self) -> str:
+        return self.body.decode("utf-8", "replace")
+
+
+def request(method: str, path: str, *, form=None, body: bytes | None = None,
+            headers=None, cookies=None, ip: str = "127.0.0.1",
+            scheme: str = "http", content_length: bool = True,
+            declared_length: int | None = None) -> Result:
+    """向应用直调一个请求。
+
+    - `content_length=False`：完全不声明长度（表单方法 → 411 契约）；
+    - `declared_length=N`：声明一个与实际 body 不同的长度（截断 → 400 契约）。
     """
-    raw_query = (query_string.decode("latin-1")
-                 if isinstance(query_string, (bytes, bytearray))
-                 else str(query_string))
+    app = ensure_application()
+    if "?" in path:
+        path, _, query_string = path.partition("?")
+    else:
+        query_string = ""
+
+    payload = b""
+    content_type = ""
+    if form is not None:
+        payload = urllib.parse.urlencode(form).encode("utf-8")
+        content_type = "application/x-www-form-urlencoded"
+    elif body is not None:
+        payload = body
+        content_type = "application/octet-stream"
+
     environ = {
-        "REQUEST_METHOD": method,
+        "REQUEST_METHOD": method.upper(),
         "SCRIPT_NAME": "",
         "PATH_INFO": path,
-        "QUERY_STRING": raw_query,
-        "SERVER_NAME": host,
-        "SERVER_PORT": "443" if scheme == "https" else "80",
+        "QUERY_STRING": query_string,
+        "SERVER_NAME": "testserver",
+        "SERVER_PORT": "80",
         "SERVER_PROTOCOL": "HTTP/1.1",
-        "REMOTE_ADDR": peer[0] if peer else "",
+        "REMOTE_ADDR": ip,
+        "HTTP_HOST": "testserver",
         "wsgi.version": (1, 0),
         "wsgi.url_scheme": scheme,
-        "wsgi.input": stream if stream is not None else io.BytesIO(body),
+        "wsgi.input": io.BytesIO(payload),
         "wsgi.errors": io.StringIO(),
         "wsgi.multithread": False,
         "wsgi.multiprocess": True,
         "wsgi.run_once": False,
     }
-    for name, value in headers:
-        key = str(name).upper().replace("-", "_")
-        if key in ("CONTENT_TYPE", "CONTENT_LENGTH"):
-            environ[key] = str(value)
-        else:
-            environ["HTTP_" + key] = str(value)
-    return environ
+    if content_length:
+        environ["CONTENT_LENGTH"] = str(
+            len(payload) if declared_length is None else declared_length)
+    if content_type:
+        environ["CONTENT_TYPE"] = content_type
+    for name, value in (headers or {}).items():
+        environ["HTTP_" + name.upper().replace("-", "_")] = value
+    if cookies:
+        environ["HTTP_COOKIE"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
-
-def call_wsgi(app, environ) -> "Response":
-    """调用一个 WSGI callable，返回解析好的 `Response`。
-
-    自己收 `start_response`：因此这里验证的正是"应用交给 WSGI 服务器的东西"。
-    """
     captured = {}
 
     def start_response(status, response_headers, exc_info=None):
-        if "status" in captured and exc_info is None:
-            raise AssertionError("start_response called twice")
         captured["status"] = status
-        captured["headers"] = list(response_headers)
-        return lambda data: None
+        captured["headers"] = response_headers
 
-    result = app(environ, start_response)
-    try:
-        raw_body = b"".join(result)
-    finally:
-        close = getattr(result, "close", None)
-        if close is not None:
-            close()
-
-    status_text = str(captured.get("status", "500 Internal Server Error"))
-    status = int(status_text.split(" ", 1)[0])
-    resp_headers = [(str(key).encode("latin-1"), str(value).encode("latin-1"))
-                    for key, value in captured.get("headers", [])]
-    return Response(status, resp_headers, raw_body)
+    chunks = app(environ, start_response)
+    result = Result(captured.get("status", "500 Internal Server Error"),
+                    captured.get("headers", []), b"".join(chunks))
+    if not cookies:
+        return result
+    return result
 
 
-class Response:
-    """WSGI 响应的解析结果。"""
+class Session:
+    """带 Cookie 罐的测试客户端（自动携带会话 / CSRF，自动合并 Set-Cookie）。"""
 
-    def __init__(self, status, headers, body):
-        self.status = status
-        self.headers = headers                  # list[(bytes, bytes)]
-        self.body = body                        # bytes
+    def __init__(self, **options) -> None:
+        self.cookies: dict[str, str] = {}
+        self.options = options
 
-    def header(self, name: str):
-        """按名字取响应头（同名返回最后一个），不存在返回 None。"""
-        wanted = name.lower().encode("latin-1")
-        found = None
-        for key, value in self.headers:
-            if key.lower() == wanted:
-                found = value.decode("latin-1")
-        return found
+    # ---------- 基础 ----------
+    def get(self, path: str, **kwargs) -> Result:
+        return self._call("GET", path, **kwargs)
 
-    def headers_all(self, name: str):
-        wanted = name.lower().encode("latin-1")
-        return [value.decode("latin-1") for key, value in self.headers if key.lower() == wanted]
+    def post(self, path: str, form=None, **kwargs) -> Result:
+        return self._call("POST", path, form=form, **kwargs)
 
-    @property
-    def text(self) -> str:
-        return self.body.decode("utf-8", errors="replace")
+    def _call(self, method: str, path: str, **kwargs) -> Result:
+        options = dict(self.options)
+        options.update(kwargs)
+        cookies = dict(options.pop("cookies", self.cookies))
+        result = request(method, path, cookies=cookies, **options)
+        self.cookies.update(result.cookies)
+        # 清除 Cookie（Max-Age=0）要从罐里删掉
+        for name, value in list(result.cookies.items()):
+            if value.strip('"') == "":      # Max-Age=0 的清除指令（SimpleCookie 会加引号）
+                self.cookies.pop(name, None)
+        return result
 
-    @property
-    def content_type(self) -> str:
-        return self.header("content-type") or ""
+    # ---------- 令牌与账号流程 ----------
+    def csrf(self, path: str) -> str | None:
+        """从页面隐藏域取 CSRF 令牌（同时确保令牌 Cookie 已下发）。"""
+        match = re.search(r'name="csrf_token" value="([^"]+)"', self.get(path).text())
+        return match.group(1) if match else None
 
+    def register(self, nickname: str, email: str, password: str) -> Result:
+        return self.post("/register", {
+            "nickname": nickname, "email": email, "password": password,
+            "confirm_password": password, "csrf_token": self.csrf("/register"),
+        })
 
-class AppHarness:
-    """把 elenvind.app.app 当作真实 WSGI 应用来调用。"""
+    def login(self, email: str, password: str) -> Result:
+        return self.post("/login", {
+            "email": email, "password": password, "csrf_token": self.csrf("/login"),
+        })
 
-    #: 默认直连对端：模拟"应用前面有一台受信代理"（127.0.0.1 在默认白名单内）
-    DEFAULT_PEER = ("127.0.0.1", 44321)
+    def comment(self, slug: str, content: str, reply_to=None) -> Result:
+        form = {"content": content, "csrf_token": self.csrf(f"/article/{slug}")}
+        if reply_to is not None:
+            form["reply_to"] = str(reply_to)
+        return self.post(f"/article/{slug}/comment", form)
 
-    def __init__(self, host="example.com", scheme="https", client=None):
-        self.host = host
-        self.scheme = scheme
-        self.client = client or self.DEFAULT_PEER
-        self.started = False
-        self.jar = {}          # use_jar=True 时的浏览器式 Cookie 罐
+    def delete_comment(self, slug: str, comment_id: int) -> Result:
+        return self.post(f"/article/{slug}/comment/delete/{comment_id}",
+                         {"csrf_token": self.csrf(f"/article/{slug}")})
 
-    # ---------- 启动 ----------
-    def startup(self):
-        """跑一次完整的启动流程（配置/日志/i18n/建库/缓存）。
-
-        启动钩子与生产路径同源（装配层的 `STARTUP_HOOKS`），因此测试覆盖的
-        就是真实的启动序列；启动失败时异常直接向上抛（不会出现"夹具断言失败
-        掩盖配置错误"的情况）。
-        """
-        from elenvind.app import STARTUP_HOOKS, prepare_database
-        from elenvind.core.lifespan import startup
-
-        startup(STARTUP_HOOKS, prepare_database=prepare_database)
-        self.started = True
-
-    # ---------- HTTP ----------
-    # ---------- 便捷操作 ----------
-    def set_cookie_value(self, response, name: str) -> str:
-        """从响应的多个 Set-Cookie 头里取出指定 Cookie 的值。"""
-        return self.set_cookies(response).get(name, "")
-
-    def set_cookies(self, response) -> dict:
-        """把响应里所有 Set-Cookie 解析成 {name: value}（含清除用的空值）。"""
-        jar = {}
-        for header in response.headers_all("set-cookie"):
-            pair = header.split(";", 1)[0]
-            key, _, value = pair.strip().partition("=")
-            jar[key] = value.strip().strip('"')
-        return jar
-
-    def raw_request(self, method, path, query_string=b"", headers=(),
-                    body=b"", client=None, stream=None):
-        """最底层调用：environ 完全由调用方给定，与 gunicorn 的填法一致。
-
-        - `headers`：[(name, value)]，写进 environ 时按 WSGI 约定转换
-          （`CONTENT_TYPE` / `CONTENT_LENGTH` 走独立键，其余走 `HTTP_*`）；
-        - `stream`：替换 `wsgi.input`（见 `StreamInput`），用于短读 / 截断 /
-          "一个字节都不给"等边界；默认按 `body` 造一个 BytesIO。
-        """
-        from elenvind.app import app
-
-        peer = client if client is not None else self.client
-        environ = build_environ(method, path, query_string=query_string,
-                                headers=headers, body=body, host=self.host,
-                                scheme=self.scheme, peer=peer, stream=stream)
-        return call_wsgi(app, environ)
-
-    def request(self, method, path, *, query=None, form=None, cookies=None,
-                headers=None, content_type="application/x-www-form-urlencoded",
-                body=None, send_content_length=True, extra_headers=(),
-                use_jar=False):
-        """构造一个"正常浏览器"风格的请求。
-
-        `use_jar=True` 时使用浏览器式 Cookie 罐：响应 Set-Cookie 会被记住并
-        自动带入后续请求。这更接近真实浏览器行为（也是 CSRF Double-Submit
-        能正常工作的前提——令牌 Cookie 是随表单页一起下发的）。
-        """
-        if use_jar:
-            merged = dict(self.jar)
-            merged.update(cookies or {})
-            cookies = merged
-        header_list = [("host", self.host)]
-        if cookies:
-            header_list.append(("cookie", "; ".join(f"{k}={v}" for k, v in cookies.items())))
-        for key, value in (headers or {}).items():
-            header_list.append((key, value))
-        header_list.extend(extra_headers)
-
-        raw_query = ""
-        if query:
-            raw_query = urlencode({k: v for k, v in query.items() if v is not None})
-
-        # 与 Core 的 `http._FORM_METHODS` 对齐：这四种方法都会被解析表单，
-        # 也都要求 Content-Length。曾经这里漏了 DELETE，于是
-        # "DELETE 无 body" 在测试里表现为 400/405 而在真实请求里是 411，
-        # 让方法级的测试写出与生产不符的期望。
-        if method in ("POST", "PUT", "PATCH", "DELETE"):
-            if body is None:
-                body = urlencode(form or {}).encode("utf-8")
-            if content_type is not None:
-                header_list.append(("content-type", content_type))
-            if send_content_length:
-                header_list.append(("content-length", str(len(body))))
-
-        response = self.raw_request(method, path, raw_query.encode("latin-1"),
-                                    header_list, body)
-        if use_jar:
-            self.jar.update(self.set_cookies(response))
-        return response
-
-
-class ElenvindTestCase(unittest.TestCase):
-    """所有测试的基类：提供临时数据库 + 临时内容目录 + 应用夹具。"""
-
-    #: 子类可覆盖：是否需要真实加载 config.toml
-    use_real_config = False
-
-    def setUp(self):
-        # 注意：不用 tempfile.mkdtemp —— 它在 Windows 上会给出仅创建者可写的 ACL，
-        # 在受限沙箱里连自己的子目录都建不了。手工建目录继承父目录权限即可。
-        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-        self.tmpdir = TEST_TMP_ROOT / f"case-{uuid.uuid4().hex[:12]}"
-        (self.tmpdir / "articles").mkdir(parents=True)
-        (self.tmpdir / "custom_pages").mkdir(parents=True)
-        self.db_path = self.tmpdir / "test.db"
-
-        # 每个测试独立的数据库文件：所有模块都通过 db_connection.DB_PATH 取路径
-        self._original_db_path = db_connection.DB_PATH
-        self._original_db_env = os.environ.get("ELENVIND_DB")
-        db_connection.DB_PATH = self.db_path
-        os.environ["ELENVIND_DB"] = str(self.db_path)
-
-        # 内容目录也隔离，避免读到真实 articles/custom_pages（setUp 已建好）
-        self.articles_dir = self.tmpdir / "articles"
-        self.custom_pages_dir = self.tmpdir / "custom_pages"
-
-        self._original_config = dict(config_module.config)
-        config_module.config.clear()
-        config_module.config.update(self.base_config())
-        #: 当前测试生效的配置字典（与 elenvind.config.config 是同一个对象）
-        self._config = config_module.config
-
-        # 夹具自带配置：启动阶段不要读磁盘上的 config.toml
-        lifespan_module.SKIP_CONFIG_LOAD["value"] = True
-
-        self.app = AppHarness()
-        self._prepare_runtime()
-        self.app.startup()
-
-    def _prepare_runtime(self):
-        """测试环境的额外准备工作（子类可覆盖，如加载真实 config.toml）。"""
-
-    def tearDown(self):
-        lifespan_module.SKIP_CONFIG_LOAD["value"] = False
-        db_connection.DB_PATH = self._original_db_path
-        if self._original_db_env is None:
-            os.environ.pop("ELENVIND_DB", None)
-        else:
-            os.environ["ELENVIND_DB"] = self._original_db_env
-        config_module.config.clear()
-        config_module.config.update(self._original_config)
-        # 清掉模块级缓存与启动钩子，避免测试之间串数据
-        blog_logic._articles_cache = None
-        blog_logic._file_stats = None
-        blog_logic._body_cache.clear()
-        blog_logic._failed_stats = {}
-        pages_logic._pages_cache = None
-        pages_logic._file_stats = None
-        # 机会式清理的"上次清理时间"是模块级内存状态：不重置的话，
-        # 前一个用例刚清理过会让后一个用例的清理被节流跳过（顺序耦合）。
-        from elenvind.db.maintenance import reset_state as reset_prune_state
-        reset_prune_state()
-        from elenvind.core.templating import reset_environment
-        reset_environment()
-        from elenvind.db.user import _invalidate_user_count
-        _invalidate_user_count()
-        _remove_tmpdir(self.tmpdir)
-
-    def base_config(self) -> dict:
-        """测试用的最小可用配置（等价于 config.toml 的结构）。"""
-        return {
-            "locale": "en",
-            "title": "Test Site",
-            "copyright": "Test",
-            "description": "Test site",
-            "site_url": "https://example.com",
-            "admin_user_id": 1,
-            "admin_badge": "ADMIN",
-            "deleted_user_nickname": "Journeyed On",
-            "max_length": 1000,
-            "max_comment_depth": 8,
-            "max_comments_per_article": 500,
-            "registration_enabled": True,
-            "max_body_size": 1024 * 1024,
-            "database": "sqlite.db",
-            "articles_dir": str(self.articles_dir),
-            "custom_pages_dir": str(self.custom_pages_dir),
-            "server": {
-                "host": "127.0.0.1",
-                "port": 6789,
-                "trusted_proxies": ["127.0.0.1", "::1"],
-                "cookie_prefix": False,
-            },
-            "pagination": {"per_page": 6},
-            "params": {"intro": "", "nav": [], "social": [], "projects": []},
-            "comment_limits": {"max_per_user": 5, "max_per_ip": 10, "window_seconds": 60},
-            "login_limits": {
-                "max_email_failures": 5, "email_window_seconds": 86400,
-                "max_ip_failures": 20, "ip_window_seconds": 900,
-                "max_global_failures": 200, "global_window_seconds": 900,
-            },
-            "register_limits": {"max_per_ip": 5, "window_seconds": 3600},
-            "logging": {"level": "critical", "file": str(self.tmpdir / "app.log")},
-        }
-
-    # ---------- 便捷操作 ----------
-    def write_article(self, slug, body, meta=None, *, touch=True):
-        """写一篇测试文章：TOML front matter（+++ 包裹）+ Markdown 正文。
-
-        默认推进 mtime：缓存失效基于 (mtime, size)，同一文件系统 tick 内
-        连续写入会得到相同 mtime，让"内容变了"看起来像"没变"。
-        这是文件系统精度问题而非产品行为，测试需要确定性。
-        """
-        fields = dict(meta or {"title": slug.title(), "date": "2026-01-01"})
-        header_lines = ["+++"]
-        for key, value in fields.items():
-            if isinstance(value, str):
-                header_lines.append(f'{key} = "{value}"')
-            elif isinstance(value, bool):
-                header_lines.append(f"{key} = {'true' if value else 'false'}")
-            elif isinstance(value, (int, float)):
-                header_lines.append(f"{key} = {value}")
-            elif isinstance(value, list):
-                items = ", ".join(f'"{v}"' for v in value)
-                header_lines.append(f"{key} = [{items}]")
-            else:
-                raise TypeError(f"unsupported metadata value for {key}: {value!r}")
-        header_lines.append("+++")
-        path = self.articles_dir / f"{slug}.md"
-        path.write_text("\n".join(header_lines) + "\n\n" + body + "\n", encoding="utf-8")
-        return self.touch(path) if touch else path
-
-    def write_page(self, slug, body, *, touch=True):
-        """自定义页面：纯 Markdown 正文（无 front matter）。"""
-        path = self.custom_pages_dir / f"{slug}.md"
-        path.write_text(body, encoding="utf-8")
-        return self.touch(path) if touch else path
-
-    @staticmethod
-    def touch(path, seconds=120):
-        """显式推进文件 mtime（见 write_article 的说明）。
-
-        偏移取 120 秒而不是几秒：小偏移在某些文件系统/时钟精度下会被
-        近似成原值，导致缓存失效判定不触发。
-        """
-        stat = Path(path).stat()
-        os.utime(path, (stat.st_atime + seconds, stat.st_mtime + seconds))
-        return path
-
-    def create_user(self, nickname="Alice", email="alice@example.com",
-                    password="correct horse battery", is_admin=False):
-        """直接建用户，返回 (user_id, password)。"""
-        from elenvind.db.user import create_user
-        from elenvind.core.security import hash_password
-
-        user_id = create_user(nickname, email, hash_password(password))
-        return user_id, password
-
-    def login(self, email, password, csrf=None):
-        """走真实的 POST /login 流程，返回响应（成功时响应里有 Set-Cookie）。"""
-        token = csrf or self.fetch_csrf()
-        return self.app.request("POST", "/login",
-                                form={"email": email, "password": password,
-                                      "csrf_token": token},
-                                cookies=self.csrf_cookies(token))
-
-    def login_ok(self, email, password):
-        """登录并返回 (session_token, csrf_token)；失败时断言失败。"""
-        response = self.login(email, password)
-        self.assertEqual(response.status, 302, response.text[:400])
-        session = self.app.set_cookie_value(response, self.session_cookie_name())
-        self.assertTrue(session, "login did not issue a session cookie")
-        return session, self.fetch_csrf()
-
-    def new_session(self):
-        """为一个全新客户端取出 (csrf_token, cookies 字典)。"""
-        token = self.fetch_csrf()
-        return token, self.csrf_cookies(token)
-
-    def app_cookies(self, session=None, csrf=None, theme=None):
-        jar = {}
-        if session:
-            jar[self.session_cookie_name()] = session
-        if csrf:
-            jar[self.csrf_cookie_name()] = csrf
-        if theme:
-            jar["theme"] = theme
-        return jar
-
-    def fetch_csrf(self):
-        """GET /login 拿一个 CSRF 令牌（含 Cookie 下发）。
-
-        必须按**当前**的 Cookie 命名取（cookie_prefix 开启时是 `__Host-csrf`），
-        否则开启前缀后所有依赖本方法的测试都会因令牌不匹配而失败。
-        """
-        from elenvind.core.security import CSRF_COOKIE, cookie_name
-
-        response = self.app.request("GET", "/login")
-        token = self.app.set_cookie_value(response, cookie_name(CSRF_COOKIE))
-        if not token:
-            token = self.app.set_cookie_value(response, CSRF_COOKIE)
-        self.assertTrue(token, "login page did not issue a CSRF cookie")
-        return token
-
-    def csrf_cookies(self, token):
-        """返回携带当前命名 CSRF Cookie 的 cookies 字典。"""
-        from elenvind.core.security import CSRF_COOKIE, cookie_name
-        return {cookie_name(CSRF_COOKIE): token}
-
-    def csrf_cookie_name(self):
-        from elenvind.core.security import CSRF_COOKIE, cookie_name
-        return cookie_name(CSRF_COOKIE)
-
-    def session_cookie_name(self):
-        from elenvind.core.security import SESSION_COOKIE, cookie_name
-        return cookie_name(SESSION_COOKIE)
-
-
-def _cookie_value(set_cookie: str, name: str) -> str:
-    """从 Set-Cookie 头里取出指定 Cookie 的值（测试辅助）。"""
-    for part in set_cookie.split(";"):
-        key, _, value = part.strip().partition("=")
-        if key == name:
-            return value
-    return ""
+    def create_account(self, nickname="Tester", email="tester@example.test",
+                       password="correct-horse-1") -> Result:
+        result = self.register(nickname, email, password)
+        if result.status == 302:
+            self.login(email, password)
+        return result
