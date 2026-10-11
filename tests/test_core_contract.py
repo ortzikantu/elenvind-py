@@ -81,6 +81,21 @@ class MarkdownSanitizer(unittest.TestCase):
         self.assertIn("&lt;script&gt;", rendered)
         self.assertNotIn("&amp;lt;", rendered)
 
+    def test_percent_encoded_control_characters_are_rejected(self):
+        """`java%09script:` 这类编码后的协议混淆没有正当用途，净化层直接拒绝。
+
+        浏览器/中间层会在解析 URL 前剥离 TAB/LF/CR，因此这类 href 属于"要靠
+        浏览器行为才能证明安全"的面。拒绝它的同时保留 `%20` / `%2F` 这类正常编码。
+        """
+        for payload, absent in (("[t](java%09script:alert(1))", "href"),
+                                ("[t](java%0ascript:alert(1))", "href"),
+                                ("[t](java%0dscript:alert(1))", "href"),
+                                ("[t](java%1fscript:alert(1))", "href"),
+                                ("@video(https://ok.test/x%09.mp4)", "<video")):
+            rendered = self._render(payload)
+            self.assertNotIn(absent, rendered, f"{payload} → {rendered}")
+        self.assertIn("a%20b", self._render("[t](https://ok.test/a%20b)"))
+
     def test_plain_angle_brackets_are_preserved(self):
         rendered = self._render("a < b and c > d")
         self.assertIn("a &lt; b", rendered)

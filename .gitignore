@@ -9,6 +9,9 @@ dist/
 *.egg-info/
 *.db
 *.db-*
+# 数据库目录（data/sqlite.db 及其 -wal/-shm）与在线备份：都不进版本库
+data/
+backups/
 # C0 写协调的锁文件（<database>.write.lock）：稳定路径，不应提交
 *.write.lock
 logs/

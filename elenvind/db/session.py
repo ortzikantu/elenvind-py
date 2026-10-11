@@ -21,6 +21,7 @@ import math
 import secrets
 import time
 
+from .connection import connect
 from .transaction import write_tx
 
 #: 兜底默认值（配置缺失时使用）。config.toml 里的同名键是实际生效来源。
@@ -104,51 +105,83 @@ def _as_timestamp(value):
     return candidate
 
 
-def create_session(user_id: int) -> str:
-    """为用户颁发新会话 token 并入库，返回 token（由调用方写入 Cookie）。"""
+def _insert_session(conn, user_id: int, now: float) -> str:
+    """在给定连接上插入一条新会话，返回 token（调用方负责事务边界）。"""
     token = secrets.token_urlsafe(32)
+    conn.execute(
+        "INSERT OR REPLACE INTO session "
+        "(token, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)",
+        (token, user_id, now, now),
+    )
+    return token
+
+
+def create_session(user_id: int) -> str:
+    """为用户颁发新会话 token 并入库，返回 token（不清除该用户已有会话）。"""
     now = time.time()
     with write_tx() as conn:
         # 顺带清理已过期会话（低成本，不需要额外定时任务）
         _delete_expired(conn, now)
-        conn.execute(
-            "INSERT OR REPLACE INTO session "
-            "(token, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)",
-            (token, user_id, now, now)
-        )
+        token = _insert_session(conn, user_id, now)
     return token
+
+
+def rotate_session(user_id: int) -> str:
+    """作废该账号**全部**旧会话并颁发新 token —— **同一个写事务**。
+
+    登录/提权专用（防会话固定）。为什么必须是一个事务：
+    旧实现是 `delete_user_sessions()` + `create_session()` 两次独立写事务，
+    两个并发登录会交错成"各自留下一行会话"（实测 session 行数 = 2）。
+    合并后，同一账号在任何并发下都只剩最后颁发的那一个会话。
+    """
+    now = time.time()
+    with write_tx() as conn:
+        _delete_expired(conn, now)
+        conn.execute("DELETE FROM session WHERE user_id = ?", (user_id,))
+        token = _insert_session(conn, user_id, now)
+    return token
+
+
+def touch_session(token: str, now: float | None = None) -> None:
+    """刷新 `last_seen`（滑动过期）。由 `get_session_user()` 按节流调用。"""
+    with write_tx() as conn:
+        conn.execute("UPDATE session SET last_seen = ? WHERE token = ?",
+                     (time.time() if now is None else now, token))
 
 
 def get_session_user(token: str):
     """按 token 查会话所属用户 id；过期会话顺手删除并视为未登录。
 
-    有效访问会刷新 `last_seen`（滑动窗口）——这正是"常用设备不被踢"的来源。
-    刷新按 `LAST_SEEN_REFRESH_SECONDS` 节流：窗口是"天"级的，没必要每个请求
-    都写一次库（见该常量的说明）。
+    **读取走只读路径**（`connect()`，不参与 flock）：绝大多数带会话的请求
+    只是问"这条会话还有效吗"，不该为此 acquire 全局写锁 —— 实测那会让静态
+    资源吞吐掉到一半（1961 rps → 1015 rps），并让所有写操作排在同一个瓶颈后。
+    只有真的需要写入时才升级到 `write_tx()`：
 
-    为什么**整段**放在 `write_tx()` 里（而不是"先 connect 读、再 write_tx 写"）：
-    这是"读取 + 业务判断 + 写入"的复合操作，判定（是否过期、要不要续期）与
-    相应的写入必须处于同一临界区，否则判断依据可能在两者之间被别的进程改掉。
+    - 会话已过期 → 删除该行（`delete_session`）；
+    - `last_seen` 超过 `LAST_SEEN_REFRESH_SECONDS` → 刷新它（`touch_session`）。
+
+    并发下最坏情形是多个线程同时刷新到相近的 `now`（幂等，无副作用），
+    或者对一个刚被别的进程删掉的会话多做一次 0 行的 DELETE —— 都不影响语义。
     匿名请求（没有会话 Cookie）在第一行就返回，完全不碰数据库。
     """
     if not token:
         return None
     absolute_days, idle_days = _session_limits()
     now = time.time()
-    with write_tx() as conn:
+    with connect() as conn:
         row = conn.execute(
             "SELECT user_id, created_at, last_seen FROM session WHERE token = ?",
             (token,)
         ).fetchone()
-        if not row:
-            return None
-        if _is_expired(row, absolute_days, idle_days, now):
-            conn.execute("DELETE FROM session WHERE token = ?", (token,))
-            return None
-        last_seen = _as_timestamp(row["last_seen"])
-        if last_seen is None or now - last_seen >= LAST_SEEN_REFRESH_SECONDS:
-            conn.execute("UPDATE session SET last_seen = ? WHERE token = ?", (now, token))
-        return row["user_id"]
+    if not row:
+        return None
+    if _is_expired(row, absolute_days, idle_days, now):
+        delete_session(token)
+        return None
+    last_seen = _as_timestamp(row["last_seen"])
+    if last_seen is None or now - last_seen >= LAST_SEEN_REFRESH_SECONDS:
+        touch_session(token, now)
+    return row["user_id"]
 
 
 def delete_session(token: str):

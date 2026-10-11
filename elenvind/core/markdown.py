@@ -109,7 +109,8 @@ def safe_media_url(value: str):
     """校验视频/媒体地址：允许 http(s) 与站内路径，其余返回 None。
 
     与链接白名单一致的思路——`javascript:`、`data:` 之类一律拒绝，
-    并且拒绝控制字符与所有可能闭合 HTML/CSS 语法的字符。
+    并且拒绝控制字符（含百分号编码形式的控制字符）与所有可能闭合
+    HTML/CSS 语法的字符。
 
     注意：`render_markdown` 在交给解析器**之前**已经把裸 HTML 转义了，
     所以这里拿到的可能是 `&lt;script&gt;` 这种实体文本。因此除了 `<`/`>`
@@ -118,7 +119,7 @@ def safe_media_url(value: str):
     if not isinstance(value, str):
         return None
     url = value.strip()
-    if not url or _CONTROL_RE.search(url):
+    if not url or _CONTROL_RE.search(url) or _ENCODED_CONTROL_RE.search(url):
         return None
     if any(character in url for character in ("\"", "'", "<", ">", "&", "`", "\\")):
         return None
@@ -211,7 +212,7 @@ def _safe_url(value: str):
     if not isinstance(value, str):
         return None
     url = value.strip()
-    if not url or _CONTROL_RE.search(url):
+    if not url or _CONTROL_RE.search(url) or _ENCODED_CONTROL_RE.search(url):
         return None
     if url.startswith("//"):
         # 协议相对 URL（//evil.test/x）会继承页面协议去请求**任意第三方**：
@@ -301,6 +302,14 @@ def escape_raw_html_outside_code(source: str) -> str:
 
 #: 看起来像"标签开头"的 `<`（与逐个字符版本保持完全一致的判定）
 _TAG_START_RE = re.compile(r"<(?=[a-zA-Z/!?])")
+
+#: 百分号编码的**控制字符**（`%00`–`%1f`、`%7f`）。
+#: 浏览器与中间层在解析 URL 前会剥离 TAB / LF / CR，于是 `java%09script:alert(1)`
+#: 这类"编码后的协议混淆"是一类长期争议面：本项目的净化器会保留它（不像
+#: `javascript:` 那样命中黑名单）。这类 URL 在正文里没有任何正当用途
+#: （`%20` 空格、`%2F` 斜杠不受影响），因此直接在净化层拒绝，不把
+#: "浏览器到底怎么解析"留成一条待验证假设。
+_ENCODED_CONTROL_RE = re.compile(r"%(0[0-9a-fA-F]|1[0-9a-fA-F]|7[fF])")
 
 
 def _escape_line(line: str) -> str:

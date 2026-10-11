@@ -39,10 +39,21 @@ _RATE_LIMITED_OUTCOMES = frozenset({"rate_user", "rate_ip", "too_many"})
 
 
 def _comment_error(request, slug, outcome):
-    """按 outcome 渲染带提示的文章页（文案走 i18n）。"""
+    """按 outcome 渲染提示。
+
+    **限流类** outcome（单用户 / 单 IP / 单篇配额）不渲染文章页：那会为每一次
+    被拒请求读回整棵评论树并渲染整页（实测 429 响应体积 = 文章页的 102%）。
+    改为轻量错误页，把"达到限制之后"的每次请求成本压到与普通错误页等价。
+    其它 outcome（空内容 / 超长 / 非法回复目标 / 超层）仍保留文章页上的就地提示。
+    """
     key = _COMMENT_ERROR_KEYS.get(outcome, "comment_err_generic")
-    status = 429 if outcome in _RATE_LIMITED_OUTCOMES else 400
-    return _article_error(request, slug, t(current_lang(), key), status=status)
+    if outcome in _RATE_LIMITED_OUTCOMES:
+        lang = current_lang()
+        return html(render_template("errors/error.html", {
+            "error_title": t(lang, "comment_err_rate_title"),
+            "error_message": t(lang, key),
+        }), status=429)
+    return _article_error(request, slug, t(current_lang(), key), status=400)
 
 
 def _safe_int(value, default=None):

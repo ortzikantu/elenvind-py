@@ -38,7 +38,7 @@ session_absolute_days = 30         # 绝对过期：30 天（默认）
 session_idle_days = 15             # 滑动过期：15 天不活跃即失效（默认）
 
 max_body_size = 1048576            # POST 表单体积上限（1 MB），超出返回 413
-database = "sqlite.db"             # 相对项目根；也可用环境变量 ELENVIND_DB 覆盖
+database = "data/sqlite.db"             # 相对项目根；也可用环境变量 ELENVIND_DB 覆盖
 articles_dir = "articles"          # 文章目录（相对项目根）
 custom_pages_dir = "custom_pages"      # 自定义页面目录（相对项目根）
 templates_dir = "elenvind/templates"  # Jinja2 模板目录（相对项目根）

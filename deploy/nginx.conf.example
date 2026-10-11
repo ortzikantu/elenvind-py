@@ -1,16 +1,20 @@
 # Elenvind 反向代理示例（Nginx）
 #
-# 复制到 /etc/nginx/conf.d/elenvind.conf 后按需改域名与证书路径，再
-#   nginx -t && systemctl reload nginx
+#   sudo cp deploy/nginx.conf.example /etc/nginx/conf.d/elenvind.conf
+#   sudo nginx -t && sudo systemctl reload nginx
 #
 # 这份配置不是"可选优化"，而是生产必需：
-#   * 应用只监听 127.0.0.1，TLS/HSTS 由这里终结；
+#   * 应用只监听 127.0.0.1，TLS/HSTS 在这里终结；
 #   * Gunicorn 用的是 sync worker（默认 2 个），**慢连接必须在这里掐掉**
 #     —— 两个只声明 Content-Length 却不发正文的连接就足以让整站停摆
 #     到 worker 超时（30s）。所以 client_*_timeout 与 limit_conn 是硬要求；
-#   * 登录/注册在这里再做一层请求速率限制（应用内还有按邮箱/IP 的限流）。
+#   * 登录/注册在这里再做一层请求速率限制（应用内还有按邮箱/IP 的闸门）。
+#
+# 关于两个 zone 指令：它们只允许出现在 **http** 上下文。本文件被
+# `conf.d/*.conf` 或站点配置 include 进 http 块，因此位置正确；但**不要**在
+# 多个站点文件里重复定义同名 zone（nginx 会报 duplicate zone），把这两行留在
+# 第一个站点即可。
 
-# 以下两个 zone 必须写在 http { } 块里（本文件若被 include 进 http 块则直接可用）
 limit_req_zone $binary_remote_addr zone=elenvind_auth:10m rate=20r/m;
 limit_conn_zone $binary_remote_addr zone=elenvind_conn:10m;
 
@@ -24,6 +28,7 @@ server {
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
+    # nginx >= 1.25.1 的写法；旧版本请改用 `listen 443 ssl http2;` 并删掉这一行
     http2 on;
     server_name example.com;
 
@@ -32,10 +37,10 @@ server {
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
 
-    # 不要泄漏上游/自身版本
+    # 不泄漏自身/上游版本
     server_tokens off;
 
-    # 与 config.toml 的 max_body_size 保持一致（略大一点，让应用返回 413 而不是 Nginx 413）
+    # 与 config.toml 的 max_body_size 保持一致（略大一点，让应用返回 413）
     client_max_body_size 1m;
 
     # 慢连接防线（关键）
@@ -44,60 +49,56 @@ server {
     send_timeout          10s;
     keepalive_timeout     30s;
 
-    # 访问日志：不记查询串可能带 token 的路径请自行裁剪
     access_log /var/log/nginx/elenvind.access.log;
     error_log  /var/log/nginx/elenvind.error.log warn;
 
+    # ------------------------------------------------------------------
+    # 公共代理参数：在 server 级设置一次，所有 location 继承
+    # （早期版本在每个 location 里重复整套头，容易改漏其中一处）
+    # ------------------------------------------------------------------
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Connection        "";
+    # 上游是 gunicorn，隐藏它的 Server 头
+    proxy_hide_header Server;
+    proxy_connect_timeout 5s;
+    # 必须 **大于** Gunicorn 的 timeout（默认 30s）：让应用先失败并给出明确响应，
+    # 而不是两边同时超时（客户端只看到 504，而 worker 仍被占着）
+    proxy_read_timeout 40s;
+    proxy_send_timeout 40s;
+
     location / {
         limit_conn elenvind_conn 20;
-
         proxy_pass http://127.0.0.1:6789;
-        proxy_http_version 1.1;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Connection        "";
-
-        # 上游是 gunicorn，隐藏它的 Server 头
-        proxy_hide_header Server;
-
-        # 上游同步渲染，正常都在毫秒级；超过就说明卡住了
-        proxy_connect_timeout 5s;
-        proxy_read_timeout    30s;
-        proxy_send_timeout    30s;
-
-        # 不要缓冲大型上传（本站没有上传，保守设置即可）
-        proxy_request_buffering on;
     }
 
-    # 认证入口再做一层边缘限流（应用内还有邮箱/IP/全站三道闸门）
+    # 静态资源：不记访问日志（应用侧已经逐请求记了一行；这里再记一遍只会
+    # 让磁盘随请求量线性增长），并放宽连接数
+    location ~* \.(css|js|mjs|png|jpe?g|gif|svg|ico|webp|avif|woff2?|map)$ {
+        access_log off;
+        limit_conn elenvind_conn 40;
+        proxy_pass http://127.0.0.1:6789;
+    }
+
+    # 认证入口的边缘限流（应用内还有邮箱/IP/全站三道闸门）
     location = /login {
         limit_req zone=elenvind_auth burst=5 nodelay;
         limit_conn elenvind_conn 10;
         proxy_pass http://127.0.0.1:6789;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_hide_header Server;
     }
 
     location = /register {
         limit_req zone=elenvind_auth burst=3 nodelay;
         limit_conn elenvind_conn 10;
         proxy_pass http://127.0.0.1:6789;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_hide_header Server;
     }
 
     # 健康检查：不新增应用端点，直接用静态的 robots.txt
     location = /healthz {
         access_log off;
         proxy_pass http://127.0.0.1:6789/robots.txt;
-        proxy_set_header Host $host;
     }
 }

@@ -24,6 +24,10 @@ custom_pages/   自定义页面（纯 Markdown，文件名即路由）
 i18n/           界面文案（en / zh / ja）
 deploy/         Nginx / systemd / logrotate 示例
 tests/          标准库 unittest 测试（含架构守卫）
+
+data/           运行时数据（sqlite.db 及 -wal/-shm）—— 不进版本库
+logs/           日志 —— 不进版本库
+backups/        `run.py --backup` 的默认输出目录 —— 不进版本库
 ```
 
 ## 快速开始
@@ -35,9 +39,9 @@ cp config.example.toml config.toml     # 至少改 site_url 与 admin_user_id
 .venv/bin/python run.py                # 默认 127.0.0.1:6789
 ```
 
-首次启动会自动建库、建表、迁移，并在 `logs/app.log` 里记账。第一个注册的账号
-是 `admin_user_id` 指向的用户（默认 1）——**先注册自己的账号**，或把
-`admin_user_id` 改成你的 id、把 `registration_enabled` 先设为 `false`。
+首次启动会自动建库（默认 `data/sqlite.db`）、建表、迁移，并在 `logs/app.log`
+里记账。第一个注册的账号是 `admin_user_id` 指向的用户（默认 1）——**先注册自己的
+账号**，或把 `admin_user_id` 改成你的 id、把 `registration_enabled` 先设为 `false`。
 
 常用启动参数：
 
@@ -57,13 +61,30 @@ cp config.example.toml config.toml     # 至少改 site_url 与 admin_user_id
   2 个"声明了 Content-Length 却不发正文"的连接就能让整站停摆到 worker 超时（30s）。
   Nginx 侧的 `client_body_timeout` / `client_header_timeout` / `limit_conn` 是必需的。
 
+### 目录布局（代码只读、数据可写）
+
+服务账号**只能写**数据库 / 日志 / 备份三个子目录，代码、模板与配置保持只读 ——
+这样即使将来出现代码执行，攻击者也无法持久化后门或篡改模板。
+
 ```bash
+sudo useradd --system --home /srv/elenvind --shell /usr/sbin/nologin elenvind
+sudo chown -R root:elenvind /srv/elenvind
+sudo chmod 750 /srv/elenvind && sudo chmod 640 /srv/elenvind/config.toml
+sudo install -d -o elenvind -g elenvind -m 750 /srv/elenvind/{data,logs,backups}
+
 sudo cp deploy/elenvind.service /etc/systemd/system/
 sudo cp deploy/logrotate.conf /etc/logrotate.d/elenvind
 sudo systemctl daemon-reload && sudo systemctl enable --now elenvind
+systemd-analyze verify /etc/systemd/system/elenvind.service    # 期望无输出
 ```
 
-Nginx 配置见 `deploy/nginx.conf.example`（含 `proxy_hide_header Server`、限流与超时）。
+> 迁移旧部署：把原来的 `sqlite.db`（及 `-wal`/`-shm`）移进 `data/`，并把
+> `config.toml` 的 `database` 改成 `data/sqlite.db`，否则应用会在只读的根目录里
+> 尝试建库并启动失败。
+
+Nginx 配置见 `deploy/nginx.conf.example`：`client_*_timeout` + `limit_conn` 挡慢连接、
+`limit_req` 给 `/login`、`/register` 加边缘限流、`proxy_hide_header Server`、
+`proxy_read_timeout 40s`（**必须大于** Gunicorn 默认的 30s，让应用先失败）。
 配套的 `config.toml` 建议：
 
 ```toml
@@ -84,15 +105,19 @@ hsts_enabled = true
 ```
 
 备份走 SQLite 的在线 backup API（WAL 模式下 `cp sqlite.db` 会丢掉还在 `-wal`
-里的事务），并默认做 `PRAGMA quick_check`；失败会删掉半成品并返回非零退出码。
-放进 cron 即可：
+里的事务），默认做 `PRAGMA quick_check`，权限收紧到 `0600`（含用户与会话数据），
+失败会删掉半成品并返回非零退出码。放进 cron 即可：
 
 ```cron
 0 4 * * * cd /srv/elenvind && .venv/bin/python run.py --backup >> logs/backup.log 2>&1
 ```
 
-恢复：停服 → 把当前 `sqlite.db` 挪走 → 用备份替换 → **删除 `sqlite.db-wal` 与
-`sqlite.db-shm`** → 启动。
+恢复（可重复演练）：停服 → 把当前 `data/sqlite.db` 及 `-wal`/`-shm` **一起**挪走
+→ 把备份放到 `data/sqlite.db` → 启动。
+
+> 注意 `data/` 下的三个文件权限必须**一致**：只读/权限不匹配时 SQLite 会报
+> `attempt to write a readonly database`（表现为写请求 500、读请求正常），
+> 权限恢复一致后应用会自愈。恢复流程必须删除 `-wal`/`-shm`（它们是旧库的状态）。
 
 ## 测试
 
@@ -101,16 +126,18 @@ hsts_enabled = true
 .venv/bin/python -m unittest tests.test_auth_lockout -v    # 单个模块
 ```
 
-测试只用标准库 `unittest`，**不会碰仓库里的 `config.toml` / `sqlite.db` / `logs/`**
+测试只用标准库 `unittest`，**不会碰仓库里的 `config.toml` / `data/sqlite.db` / `logs/`**
 （配置由夹具注入，数据库与日志落在临时目录）。覆盖：
 
 | 文件 | 守什么 |
 |---|---|
 | `test_architecture.py` | 依赖方向、`sqlite3`/`jinja2`/`markdown` 只能在允许的层、写 SQL 只能在 db |
-| `test_core_contract.py` | Markdown 净化、CSRF、回跳地址、静态资源穿越、请求 framing、安全头 |
+| `test_core_contract.py` | Markdown 净化（含编码控制字符与混淆载荷）、CSRF、回跳地址、静态资源穿越、请求 framing、安全头 |
 | `test_comments.py` | 评论转义、深度硬约束、配额（涂黑即释放）、越权 |
-| `test_auth_lockout.py` | **登录闸门不得阻断正确凭据**、会话轮换/节流、口令策略 |
+| `test_auth_lockout.py` | **登录闸门不得阻断正确凭据**、闸门期不写库、会话读取不占写锁、轮换/过期/节流、口令策略 |
+| `test_concurrency.py` | **真正并发**：评论不超发、同邮箱只注册一次、并发登录只留一个会话 |
 | `test_logging_proxy.py` | 日志不含凭据/查询串、XFF/XFP 只在受信对端生效、Host 头不投毒 |
+| `test_operations.py` | 备份一致性/0600/拒绝覆盖、限流响应成本、迁移幂等与残留拒绝启动、systemd 单元与 nginx 示例的机械校验 |
 | `test_doc_consistency.py` | 配置校验（含 CSP 只许收窄）、i18n 三语一致、交付件与依赖声明 |
 | `test_styles.py` | 模板/代码用到的 class 必须都在内置样式表里 |
 
@@ -140,21 +167,28 @@ hsts_enabled = true
 - **代理信任**：`X-Forwarded-For` / `X-Forwarded-Proto` 只在直连对端属于
   `[server].trusted_proxies` 时采信，且取最右非受信跳。
 - **Host 头**：绝对地址只来自 `site_url` 配置，绝不从请求推导。
-- **限流**：登录（邮箱 / IP / 全站三闸门 + 渐进冷却）、注册（IP）、评论（用户 / IP / 单篇配额）。
-  **闸门只约束错误凭据**：正确密码永远不会被限流挡住（回归测试见 `test_auth_lockout.py`）。
+- **限流**：登录（邮箱 / IP / 全站三闸门 + 渐进冷却）、注册（只读预检 + 原子判定）、
+  评论（用户 / IP / 单篇配额）。**闸门只约束错误凭据**：正确密码永远不会被限流挡住；
+  被限流的请求既不写库、也不渲染整页（回归见 `test_auth_lockout.py` / `test_operations.py`）。
+- **会话读取**：带会话的请求走**只读连接**，只有"刷新 `last_seen`"或"删除过期行"才
+  进入写事务 —— 静态资源因此不会挤占全局写锁。
+- **备份**：`run.py --backup` 走 SQLite 在线备份 API、落盘后 `quick_check`、权限 `0600`、
+  拒绝覆盖已有文件。
 - **日志**：访问日志不记查询串、请求体、Cookie 与凭据，非打印字符一律转义。
 
 ## 排障
 
 | 现象 | 原因 / 处理 |
 |---|---|
-| 登录提示"稍后再试" | 触发登录闸门。**用正确密码仍可登录**；错误密码需等 `Retry-After` 秒。想立刻清空某邮箱的失败流水：`sqlite3 sqlite.db "DELETE FROM login_attempts WHERE email='x@y';"` |
+| 登录提示"稍后再试" | 触发登录闸门。**用正确密码仍可登录**（登录成功会当场清空该邮箱的失败流水）；错误密码需等 `Retry-After` 秒。要立刻清空流水：`sqlite3 data/sqlite.db "DELETE FROM login_attempts WHERE email='x@y';"`（库路径以 `[database]` 或 `ELENVIND_DB` 为准） |
 | 表单提交返回 400 | CSRF 令牌与 Cookie 不匹配（页面开太久 / 清过 Cookie）。刷新页面重试即可，页面会给出提示 |
 | 返回 413 | 请求体超过 `max_body_size`（默认 1 MB） |
 | 返回 411 | 表单方法没带 `Content-Length`（多为自写客户端） |
+| 写请求 500 且日志出现 `attempt to write a readonly database` | 数据库文件权限不一致（`data/sqlite.db`、`-wal`、`-shm` 三者必须同权限且可写），或挂载变只读。权限恢复一致后应用会自愈；读请求在此期间仍正常 |
 | 文章/页面改了不生效 | 内容缓存最多 2 秒节流；也可重启或等待自动重扫（日志会记 "Article directory changed"） |
 | 评论提示"已达上限" | 该文章未涂黑评论达到 `max_comments_per_article`；管理员涂黑旧评论即可释放名额 |
 | 启动报"检测到上次迁移未完成" | 数据库里残留 `*_legacy` 表：先备份再按提示处理，绝不静默继续 |
+| `systemd-analyze verify` 报 `ignoring: Invalid argument` | 单元文件里出现了**行尾注释**（systemd 只认行首 `#`）。把注释移到独立行 —— 仓库示例已修正，`tests/test_operations.py` 有守卫 |
 | 非回环地址监听告警 | 你 bind 到了 `0.0.0.0` 且信任转发头：请改回 `127.0.0.1` 并让反代回源，或给端口加防火墙 |
 
 ## 许可

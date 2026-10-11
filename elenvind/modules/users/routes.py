@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from ... import db
 from ...core.config import config
 from ...core.context import current_lang
 from ...core.http import html, redirect
@@ -25,7 +24,6 @@ from ...core.security import (
     is_weak_password,
     verify_password,
 )
-from ...core.session import invalidate_user_sessions
 from ...core.templating import render_template
 from ...core.utils import format_datetime
 
@@ -33,10 +31,10 @@ from ...core.utils import format_datetime
 # 模块不需要（也不该）import sqlite3 —— 见 Core Contract 守卫。
 from ...db import IntegrityError
 from ...db.user import (
-    delete_user,
+    change_password_and_logout_all,
+    delete_user_account,
     get_user_by_email,
     normalize_email,
-    update_user_password,
     update_user_profile,
 )
 
@@ -89,10 +87,11 @@ def register(router):
         elif action == "change_password":
             result = _change_password(request, user, lang)
             if result is None:
-                # Core 语义：改密后该账号全部会话失效，强制重新登录。
-                # 传入 request 让 Core 同时清除浏览器 Cookie ——
-                # 模块不 delete_cookie、不 import SESSION_COOKIE。
-                invalidate_user_sessions(user["id"], request=request, store=db)
+                # 密码与"该账号全部会话"在**同一个写事务**里更新
+                # （见 db.user.change_password_and_logout_all），因此"改密即全端
+                # 下线"不会留下"密码已改、旧会话仍有效"的窗口；这里只负责让
+                # 当前浏览器也丢掉 Cookie（模块不拼 Cookie）。
+                request.invalidate_session_cookie()
                 logger.info("Password changed: user_id=%s ip=%s",
                             user["id"], request.client_ip)
                 return redirect("/login")
@@ -104,12 +103,10 @@ def register(router):
                 logger.warning("Account deletion rejected (wrong password): "
                                "user_id=%s ip=%s", user["id"], request.client_ip)
             else:
-                # 身份删除：先把**可关联**的登录流水按原邮箱清掉（里面含 IP），
-                # 再逻辑删除用户行。顺序不能反 —— 删号会把邮箱替换成占位值。
-                deleted_email = user["email"]
-                delete_user(user["id"])
-                db.clear_login_attempts(deleted_email)
-                invalidate_user_sessions(user["id"], request=request, store=db)
+                # 清登录流水（按**旧**邮箱，里面含 IP）+ 逻辑删除 + 作废全部会话：
+                # 同一个写事务，中途失败不会留下"删了一半"的账号。
+                delete_user_account(user["id"], user["email"])
+                request.invalidate_session_cookie()
                 logger.info("Account deleted: user_id=%s ip=%s",
                             user["id"], request.client_ip)
                 return redirect("/")
@@ -205,7 +202,11 @@ def _nickname_change_error(user, lang):
 
 
 def _change_password(request, user, lang):
-    """返回 None 表示成功；否则返回错误文案。"""
+    """返回 None 表示成功；否则返回错误文案。
+
+    成功路径由调用方收尾（`request.invalidate_session_cookie()`）；密码更新与
+    "作废该账号全部会话"在 `change_password_and_logout_all()` 的**同一个事务**里完成。
+    """
     old_password = request.form.get("old_password", "")
     new_password = request.form.get("new_password", "")
     confirm_password = request.form.get("confirm_password", "")
@@ -222,5 +223,6 @@ def _change_password(request, user, lang):
     # 否则"注册时不许 12345678，改密时随便设"就成了绕过口。
     if is_weak_password(new_password, email=user["email"], nickname=user["nickname"]):
         return t(lang, "auth_err_password_weak")
-    update_user_password(user["id"], hash_password(new_password))
+    # 一个事务：更新哈希 + 作废该账号全部会话（改密即全端下线）
+    change_password_and_logout_all(user["id"], hash_password(new_password))
     return None

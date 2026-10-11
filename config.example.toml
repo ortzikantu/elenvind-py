@@ -55,8 +55,11 @@ session_idle_days = 15             # 默认 15 天不活跃即失效
 # 请求体上限（字节）：POST 表单最大体积，超出返回 413
 max_body_size = 1048576            # 1 MB
 
-# 数据库文件（相对项目根目录；也可用环境变量 ELENVIND_DB 覆盖，用于多环境隔离）
-database = "sqlite.db"
+# 数据库文件（相对项目根目录；也可用环境变量 ELENVIND_DB 覆盖，用于多环境隔离）。
+# 默认放在 data/ 子目录：systemd 单元只把 data/logs/backups 授予服务账号写权限，
+# 代码与配置目录保持只读（见 deploy/elenvind.service）。
+# 目录需要预先存在（应用会创建它，但只读根目录下创建不了；systemd 单元里有说明）。
+database = "data/sqlite.db"
 
 # 内容目录（相对项目根目录）
 articles_dir = "articles"

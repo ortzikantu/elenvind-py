@@ -33,7 +33,7 @@ from ...core.templating import render_template
 from ...db import IntegrityError
 from ...db.auth import (
     complete_login_success,
-    record_login_attempt,
+    register_attempt_exceeded,
     reserve_login_attempt,
     try_register_attempt,
 )
@@ -214,8 +214,12 @@ def _try_login(request, email, password, lang):
 
     - 密码正确 → 放行并由 `complete_login_success()` 清空该邮箱的失败流水，
       等于当场自解封；
-    - 密码错误 → 才按闸门返回冷却提示，并**补记**这次失败（否则闸门期内
-      "拒绝即不记账"会把计数冻住，攻击者能用固定等待时间无限试探）。
+    - 密码错误 → 才按闸门返回冷却提示（该次失败**不补记账**，理由见下方）。
+
+    为什么闸门期的失败不再补记账：补记账的唯一收益是"计数在冷却期内继续增长"，
+    而冷却到期后 `allowed=True` 的那次尝试本来就会正常记账，冷却会照旧逐次加深；
+    代价却是每个公开可达的失败请求都要**再取一次全局写锁**（此刻已经付过一次
+    scrypt）。在公开路径上，这笔买不到的收益不值得。
 
     代价：闸门期内的错误尝试仍要付一次 scrypt（约 240ms）。这本来就是爆破
     需要支付的单价，换来的是"合法用户永远不会被锁在门外"。
@@ -258,7 +262,7 @@ def _try_login(request, email, password, lang):
         dummy_verify(password)
 
     if not allowed:
-        record_login_attempt(email, ip, success=False)
+        # 闸门命中：只返回冷却提示，**不补记账**（见 docstring 的说明）。
         # 三个闸门都记 WARNING：它们是"有人在爆破"的唯一信号来源
         logger.warning("Login blocked (%s failure limit): ip=%s retry_after=%ss",
                        reason, ip, retry_after)
@@ -293,7 +297,14 @@ def _try_register(request, lang):
         return _message(lang, "auth_err_password_weak")
 
     limits = register_limits()
-    if not try_register_attempt(request.client_ip or "unknown",
+    ip = request.client_ip or "unknown"
+    # 只在只读连接上挡住"已经明显超限"的请求：注册是公开路径，不能让被限流的
+    # 洪水白白占着全局写锁；判定权威仍是下面的原子事务（并发下不会超发）。
+    if register_attempt_exceeded(ip, max_per_ip=limits["max_per_ip"],
+                                 window_seconds=limits["window_seconds"]):
+        logger.warning("Registration rate limit hit (pre-check): ip=%s", request.client_ip)
+        return _message(lang, "auth_err_register_rate")
+    if not try_register_attempt(ip,
                                 max_per_ip=limits["max_per_ip"],
                                 window_seconds=limits["window_seconds"]):
         logger.warning("Registration rate limit hit: ip=%s", request.client_ip)

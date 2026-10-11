@@ -57,12 +57,28 @@ class LoginGate(unittest.TestCase):
         self.assertIn("minute", again.text().lower())
         self.assertNotIn(EMAIL, again.text())          # 不泄漏账号是否存在
 
-    def test_gate_failures_are_still_recorded(self):
+    def test_blocked_attempts_do_not_write_to_the_database(self):
+        """闸门命中后的失败尝试**不写库**：公开路径不该白占一次全局写锁。
+
+        计数在冷却期内保持冻结并不危险：冷却到期后允许的那次尝试会正常记账，
+        冷却照样逐次加深（见 `test_cooldown_expiry_records_and_escalates`）。
+        """
         self._fail_login(4)
         before = self._failure_rows()
         support.Session().login(EMAIL, "wrong-password")
-        self.assertEqual(self._failure_rows(), before + 1,
-                         "a failed attempt during the cooldown must still be counted")
+        self.assertEqual(self._failure_rows(), before,
+                         "a blocked attempt must not touch the database")
+
+    def test_cooldown_expiry_records_and_escalates(self):
+        """冷窗过去后，闸门会放行一次并**正常记账**（冷却据此继续加深）。"""
+        from elenvind import db
+
+        self._fail_login(4)
+        with db.write_tx() as conn:            # 把流水时间拨回 1 小时：冷窗已过
+            conn.execute("UPDATE login_attempts SET attempted_at = attempted_at - 3600")
+        before = self._failure_rows()
+        support.Session().login(EMAIL, "wrong-password")
+        self.assertEqual(self._failure_rows(), before + 1)
 
     def test_successful_login_is_audited(self):
         support.Session().login(EMAIL, PASSWORD)
@@ -113,6 +129,35 @@ class Sessions(unittest.TestCase):
         session = self._login_session()
         self.assertEqual(session.post("/logout", {"csrf_token": "x" * 43}).status, 400)
         self.assertEqual(session.post("/logout", {}).status, 400)
+
+    def test_session_lookup_does_not_take_the_write_lock(self):
+        """会话有效且不需要刷新时，读取**不走写事务**（不占 flock）。
+
+        这是"带会话请求不再让静态资源吞吐掉一半"的机械保证：把 session 模块里的
+        `write_tx` 换成会爆炸的替身，读取仍然必须成功。
+        """
+        from unittest import mock
+
+        from elenvind import db
+
+        session = self._login_session()
+        token = session.cookies["session"]
+        with mock.patch("elenvind.db.session.write_tx",
+                        side_effect=AssertionError("session lookup must not write")):
+            self.assertIsNotNone(db.session.get_session_user(token))
+
+    def test_expired_session_is_deleted(self):
+        """过期会话必须被删除（走写路径）并视为未登录。"""
+        from elenvind import db
+
+        session = self._login_session()
+        token = session.cookies["session"]
+        with db.write_tx() as conn:            # 造一个 40 天前的会话（绝对过期 30 天）
+            conn.execute("UPDATE session SET created_at = created_at - 40*86400, "
+                         "last_seen = last_seen - 40*86400 WHERE token = ?", (token,))
+        self.assertIsNone(db.session.get_session_user(token))
+        self.assertEqual(
+            support.query("SELECT COUNT(*) FROM session WHERE token=?", (token,))[0][0], 0)
 
     def test_last_seen_refresh_is_throttled(self):
         from elenvind import db

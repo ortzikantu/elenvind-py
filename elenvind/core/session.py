@@ -5,8 +5,12 @@
 
 持久化由注入的 `store` 完成（本项目是 `elenvind.db` 包）—— core 不认识 db，
 "会话表怎么存、写锁怎么加"不属于这一层。store 需提供：
-`get_session_user(token)`、`get_user_by_id(user_id)`、`create_session(user_id)`、
-`delete_session(token)`、`delete_user_sessions(user_id)`。
+`get_session_user(token)`、`get_user_by_id(user_id)`、`rotate_session(user_id)`、
+`delete_session(token)`。
+
+其中 `rotate_session(user_id)` 必须是**原子**的（同一个写事务里"作废旧会话 +
+颁发新会话"），否则并发登录会留下多个有效会话；`create_session(user_id)` 只负责
+颁发（不清旧会话），供脚本/测试使用。
 
 安全语义（集中且唯一）：
 - 会话是 32 字节随机 token，只存服务端表里，客户端只拿 Cookie；
@@ -31,7 +35,6 @@ __all__ = [
     "DEFAULT_ABSOLUTE_DAYS",
     "SESSION_MAX_AGE",
     "current_user",
-    "invalidate_user_sessions",
     "load_user",
     "login_user",
     "logout_user",
@@ -98,9 +101,11 @@ def rotate_session(request, user_id: int, *, store):
 
     返回新 token（由 Core 写进 Cookie）。必须走 `request.set_session_token()`：
     它同时把"Cookie 需要下发"标脏，`pending_cookies()` 才会真正发出 Set-Cookie。
+
+    "作废 + 颁发"由 `store.rotate_session()` 在**一个写事务**内完成 —— 分两次
+    写事务会让并发登录各自留下一个有效会话。
     """
-    store.delete_user_sessions(user_id)
-    token = store.create_session(user_id)
+    token = store.rotate_session(user_id)
     request.set_session_token(token)
     return token
 
@@ -117,19 +122,14 @@ def logout_user(request, *, store):
 
     Cookie 的清除由 Core 统一完成（`request.invalidate_session_cookie()` 会把
     token 置空并标记"需要清除 Cookie"）—— 模块不需要、也不应该自己 delete_cookie()。
+
+    "改密 / 删号 ⇒ 作废该账号全部会话"不走这里：那条路径必须与密码更新/账号删除
+    处于**同一个写事务**（见 `db.user.change_password_and_logout_all()` 与
+    `db.user.delete_user_account()`），模块再调用 `request.invalidate_session_cookie()`
+    清浏览器 Cookie。core 曾经提供 `invalidate_user_sessions()`，两个调用点改用
+    事务合并版本后它就没有消费者了，已删除。
     """
     token = request.session_token
     if token:
         store.delete_session(token)
     request.invalidate_session_cookie()
-
-
-def invalidate_user_sessions(user_id: int, *, store, request=None):
-    """改密 / 删号：删除该账号**全部**会话。
-
-    传入 `request` 时同时清掉当前浏览器会话（否则当前请求结束时
-    `pending_cookies()` 会把已作废的 token 又写回 Cookie，把显式删除抵消掉）。
-    """
-    store.delete_user_sessions(user_id)
-    if request is not None:
-        request.invalidate_session_cookie()

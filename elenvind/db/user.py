@@ -107,32 +107,36 @@ def update_user_profile(user_id: int, nickname=None, email=None):
     return updated
 
 
-def update_user_password(user_id: int, new_password_hash: str):
-    """覆盖密码哈希（改密与新格式渐进式 rehash 共用）。"""
-    with write_tx() as conn:
-        conn.execute("UPDATE user SET password = ? WHERE id = ?", (new_password_hash, user_id))
+def change_password_and_logout_all(user_id: int, new_password_hash: str) -> None:
+    """改密 + 作废该账号**全部**会话 —— **同一个写事务**。
 
-
-def delete_user(user_id: int):
-    """逻辑删除：昵称置为 Ghost、邮箱与密码清空，is_deleted=1。
-
-    email 列有 UNIQUE 约束，因此用占位地址避免与新注册冲突。
-    占位地址必须**不可预测、也不可注册**：
-
-    - 旧实现是 `deleted_<user_id>@example.com` —— user_id 是公开的
-      （评论区渲染 `(#id)`）且连续递增，任何人都能在受害者删号**之前**
-      抢注 `deleted_<id>@example.com`；于是受害者删号时撞 UNIQUE 约束、
-      请求 500，账号被永久锁死删不掉。
-    - 现在用随机 UUID + `.invalid`（RFC 2606 保留、永不解析的顶级域）：
-      攻击者无法预知 UUID，`.invalid` 也不可能有真实邮箱与之冲突。
-
-    已注销账号的评论仍保留在站内（评论区显示占位昵称）。
+    分成两步（先 `update_user_password()` 再清会话）会留下一个窗口：密码已经
+    生效、旧会话却仍然有效 —— "改密即全端下线"的承诺在这段时间里不成立。
+    浏览器侧的 Cookie 由 Core 清理（模块调用 `request.invalidate_session_cookie()`）。
     """
     with write_tx() as conn:
-        placeholder_email = f"deleted+{uuid.uuid4().hex}@deleted.invalid"
-        # WHERE 里带 is_deleted = 0：否则重复删号会再次命中同一行，
-        # rowcount 恒为 1，下面那句"already deleted"的报错永远不会触发
-        # （行会被反复改写，占位邮箱也跟着变，属于无意义写入）。
+        conn.execute("UPDATE user SET password = ? WHERE id = ? AND is_deleted = 0",
+                     (new_password_hash, user_id))
+        conn.execute("DELETE FROM session WHERE user_id = ?", (user_id,))
+
+
+def delete_user_account(user_id: int, email: str) -> None:
+    """删号：清登录流水 + 逻辑删除账号 + 作废全部会话 —— **同一个写事务**。
+
+    步骤顺序有意义：先按**旧邮箱**清 `login_attempts`（里面带 IP），再改写邮箱为
+    占位值 —— 顺序反了就再也按邮箱找不到那些流水了。
+
+    逻辑删除的语义：昵称置为 `Ghost`、邮箱与密码清空、`is_deleted = 1`。
+    `email` 列有 UNIQUE 约束，因此用占位地址避免与新注册冲突；占位地址必须
+    **不可预测、也不可注册**：随机 UUID + `.invalid`（RFC 2606 保留、永不解析）。
+    已注销账号的评论仍保留在站内（评论区显示占位昵称）。
+
+    `WHERE ... AND is_deleted = 0` 让"重复删号"明确报错（回滚整个事务），
+    而不是反复改写同一行。
+    """
+    placeholder_email = f"deleted+{uuid.uuid4().hex}@deleted.invalid"
+    with write_tx() as conn:
+        conn.execute("DELETE FROM login_attempts WHERE email = ? COLLATE NOCASE", (email,))
         cursor = conn.execute(
             "UPDATE user SET nickname = 'Ghost', email = ?, password = '', is_deleted = 1 "
             "WHERE id = ? AND is_deleted = 0",
@@ -141,6 +145,7 @@ def delete_user(user_id: int):
         if cursor.rowcount == 0:
             # 抛出去 → write_tx() 回滚整个事务，调用方拿到 ValueError
             raise ValueError(f"User {user_id} does not exist or is already deleted")
+        conn.execute("DELETE FROM session WHERE user_id = ?", (user_id,))
     _invalidate_user_count()
 
 

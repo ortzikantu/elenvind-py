@@ -85,11 +85,26 @@ class ConfigValidation(unittest.TestCase):
         self._reject(static={"favicon": "mailto:me@example.com"})
 
     def test_shipped_configs_are_valid(self):
-        """仓库自带的 config.toml 与 config.example.toml 都必须能启动。"""
+        """仓库自带的 config.toml 与 config.example.toml 都必须能启动。
+
+        `config.toml` 允许被部署者删除（只留 example），此时跳过而不是失败 ——
+        测试不该依赖"恰好存在的文件"。
+        """
         from elenvind.core.config import validate_config
 
-        for name in ("config.toml", "config.example.toml"):
+        names = ["config.example.toml"]
+        if (PROJECT_ROOT / "config.toml").is_file():
+            names.append("config.toml")
+        for name in names:
             validate_config(_load_toml(PROJECT_ROOT / name))
+
+    @unittest.skipUnless((PROJECT_ROOT / "config.toml").is_file(), "config.toml not present")
+    def test_example_and_shipped_config_agree_on_keys(self):
+        """两份配置的键集合应当一致（避免示例文档漂移成"另一套配置"）。"""
+        shipped = _load_toml(PROJECT_ROOT / "config.toml")
+        example = _load_toml(PROJECT_ROOT / "config.example.toml")
+        missing = sorted(set(shipped) - set(example))
+        self.assertEqual(missing, [], f"config.example.toml is missing top-level keys: {missing}")
 
 
 class I18nConsistency(unittest.TestCase):
