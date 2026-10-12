@@ -37,7 +37,7 @@
 | `registration_enabled` | bool | `true` | 是否开放公开注册 |
 | `session_absolute_days` | int | `30` | 绝对过期：会话创建后活够这么多天必须重新登录（token 泄露的风险窗口硬上限）。`0` = 该维度不过期 |
 | `session_idle_days` | int | `15` | 滑动过期：闲置这么多天即失效；有效访问会刷新 `last_seen`（刷新按 5 分钟节流）。`0` = 不过期 |
-| `max_body_size` | int | `1048576` | POST 表单体积上限（字节），超出返回 413 |
+| `max_body_size` | int | `1048576` | POST 表单体积上限（字节），超出返回 413。反向代理侧（示例 `client_max_body_size 2m`）应设得**更大**，这样应用先触发 413 并留下日志，代理侧只是兜底 |
 | `database` | string | `data/sqlite.db` | SQLite 文件路径（相对项目根）。默认落在 `data/` 子目录：systemd 单元只把 `data/`、`logs/`、`backups/` 授予服务账号写权限，代码与配置保持只读。环境变量 `ELENVIND_DB` 优先级更高（多环境隔离用）。目录需预先存在（应用会尝试创建，但只读根目录下创建不了） |
 | `articles_dir` | string | `articles` | 文章目录（`*.md`，TOML front matter） |
 | `custom_pages_dir` | string | `custom_pages` | 自定义页面目录（`*.md`，文件名即路由） |

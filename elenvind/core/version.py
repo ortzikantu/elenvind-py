@@ -6,7 +6,7 @@
 major = 1
 minor = 0
 patch = 0
-stage = ""
+stage = "rc1"
 
 
 def get_version() -> str:

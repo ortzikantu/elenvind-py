@@ -85,6 +85,9 @@ systemd-analyze verify /etc/systemd/system/elenvind.service    # 期望无输出
 Nginx 配置见 `deploy/nginx.conf.example`：`client_*_timeout` + `limit_conn` 挡慢连接、
 `limit_req` 给 `/login`、`/register` 加边缘限流、`proxy_hide_header Server`、
 `proxy_read_timeout 40s`（**必须大于** Gunicorn 默认的 30s，让应用先失败）。
+请求体上限分两层且有明确顺序：应用的 `max_body_size`（默认 1 MiB）先触发 413 并在日志里留痕，
+Nginx 侧 `client_max_body_size 2m` 只作兜底 —— **不要**把它设得比应用更小，否则 Nginx 会抢先
+返回、应用自己的 413 路径在反代后面永远观察不到（`tests/test_operations.py` 有守卫）。
 配套的 `config.toml` 建议：
 
 ```toml

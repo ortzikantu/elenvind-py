@@ -40,8 +40,14 @@ server {
     # 不泄漏自身/上游版本
     server_tokens off;
 
-    # 与 config.toml 的 max_body_size 保持一致（略大一点，让应用返回 413）
-    client_max_body_size 1m;
+    # 请求体上限分两层，顺序是明确的：
+    #   * 应用的 max_body_size（config.toml，默认 1 MiB）**先**触发 —— 返回应用
+    #     自己的 413 文本，日志里能看到这次请求；
+    #   * 这里的 2m 是**兜底硬上限**：明显异常的请求连读都不读，直接由 Nginx 413。
+    # 因此这里必须**大于**应用上限（写成 1m 会让 Nginx 抢在应用前面返回，
+    # 应用侧的 413 路径在反代后面就永远观察不到）。
+    # tests/test_operations.py 有一条守卫解析这两个值并要求 Nginx 侧更大。
+    client_max_body_size 2m;
 
     # 慢连接防线（关键）
     client_header_timeout 10s;

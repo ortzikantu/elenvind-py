@@ -53,6 +53,40 @@ class Backup(unittest.TestCase):
         with self.assertRaises(db.BackupError):
             db.backup_to(target)
 
+    def test_failed_backup_never_touches_the_existing_copy(self):
+        """备份失败绝不能破坏已有的有效备份（逐字节比对）。"""
+        import hashlib
+
+        from elenvind import db
+
+        target = self.directory / "keep.db"
+        db.backup_to(target)
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        with self.assertRaises(db.BackupError):
+            db.backup_to(target)                     # 目标已存在 → 直接拒绝
+        self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), digest)
+
+    def test_restored_database_supports_reads_and_writes(self):
+        """恢复后的库必须能正常读写（走应用层真实路径，而不只是 PRAGMA）。"""
+        import shutil
+
+        from elenvind import db
+
+        support.Session().create_account("Restore", "restore@example.test", "correct-horse-1")
+        backup = self.directory / "restore.db"
+        db.backup_to(backup)
+
+        restored = Path(support.WORKSPACE.root) / "restored.db"
+        shutil.copyfile(backup, restored)            # 模拟"把备份放回去"
+        original = db.DB_PATH
+        try:
+            db.configure(restored)
+            self.assertIsNotNone(db.get_user_by_email("restore@example.test"))   # 读
+            user_id = db.create_user("After", "after@example.test", "hash")      # 写
+            self.assertIsNotNone(db.get_user_by_id(user_id))
+        finally:
+            db.configure(original)                   # 别影响其它用例
+
     def test_missing_database_is_reported(self):
         from elenvind import db
 
@@ -152,8 +186,95 @@ class MigrationSafety(unittest.TestCase):
                 conn.execute("DROP TABLE comment_legacy")
 
 
+class LogRotation(unittest.TestCase):
+    """日志被外部工具（logrotate）改名后，应用必须能继续写。
+
+    `[logging].rotate = false` 时用的是 `WatchedFileHandler`：它在每次写之前
+    检查 dev/ino，发现文件被换掉就重新打开 —— 这正是多 worker 部署下唯一安全
+    的做法。这里用真实的 handler 走一遍：写 → 改名 → 再写。
+    """
+
+    def setUp(self):
+        support.ensure_application()
+
+    def tearDown(self):
+        # 恢复测试夹具原本的日志目标，别影响其它用例对日志内容的断言
+        from elenvind.core.logging_config import setup_logging
+
+        config = support.live_config()["logging"]
+        setup_logging(level=config["level"], log_file=config["file"],
+                      max_bytes=config["max_bytes"], backup_count=config["backup_count"],
+                      rotate=config.get("rotate", False))
+
+    def test_handler_reopens_the_log_after_external_rotation(self):
+        import logging
+
+        from elenvind.core.logging_config import setup_logging
+
+        path = Path(support.WORKSPACE.root) / "rotation.log"
+        setup_logging(level="info", log_file=str(path), rotate=False)
+        logger = logging.getLogger("elenvind.tests.rotation")
+        try:
+            logger.info("before-rotation")
+            self._flush()
+            self.assertIn("before-rotation", path.read_text(encoding="utf-8"))
+
+            path.rename(path.with_suffix(".log.1"))          # 模拟 logrotate
+            logger.info("after-rotation")
+            self._flush()
+
+            self.assertTrue(path.exists(), "the log file must be recreated")
+            self.assertIn("after-rotation", path.read_text(encoding="utf-8"))
+        finally:
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+
+    @staticmethod
+    def _flush() -> None:
+        import logging
+
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+
 class DeploymentFiles(unittest.TestCase):
     """部署文件的机械校验（能跑外部工具就跑，跑不了退化为静态断言）。"""
+
+    def _nginx_directive(self, name: str) -> str:
+        text = NGINX_EXAMPLE.read_text(encoding="utf-8")
+        line = next((item for item in text.splitlines() if item.strip().startswith(name)),
+                    None)
+        self.assertIsNotNone(line, f"{name} is missing from deploy/nginx.conf.example")
+        return line.split(None, 1)[1].strip().rstrip(";")
+
+    @staticmethod
+    def _to_bytes(value: str) -> int:
+        suffixes = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
+        text = value.strip().lower()
+        if text[-1] in suffixes:
+            return int(float(text[:-1]) * suffixes[text[-1]])
+        return int(text)
+
+    def test_nginx_body_limit_leaves_room_for_the_application_limit(self):
+        """请求体上限必须"应用先触发、Nginx 兜底"。
+
+        若 Nginx 的上限 ≤ 应用上限，Nginx 会抢先返回 413，应用自己的 413
+        （有日志、有测试）在反代后面永远观察不到 —— 这条守的就是那个顺序。
+        """
+        import tomllib
+
+        with open(PROJECT_ROOT / "config.example.toml", "rb") as handle:
+            example = tomllib.load(handle)
+        application_limit = int(example["max_body_size"])
+        nginx_limit = self._to_bytes(self._nginx_directive("client_max_body_size"))
+        self.assertGreater(nginx_limit, application_limit,
+                           f"nginx {nginx_limit} must exceed the application limit "
+                           f"{application_limit}")
+
+    def test_nginx_proxy_read_timeout_exceeds_gunicorn_timeout(self):
+        """代理读超时必须大于 Gunicorn 的 worker 超时（默认 30s），否则两边同时超时。"""
+        timeout = int(self._nginx_directive("proxy_read_timeout").rstrip("s"))
+        self.assertGreater(timeout, 30, "proxy_read_timeout must exceed gunicorn's 30s")
 
     def test_systemd_unit_has_no_trailing_comments(self):
         """systemd **不**把行尾 `#` 当注释：整行会被并入参数值并被静默忽略。"""

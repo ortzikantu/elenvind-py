@@ -134,6 +134,38 @@ class StaticAssets(unittest.TestCase):
         self.assertIsNotNone(resolved)
         self.assertTrue(resolved.is_file())
 
+    def test_rejects_symlinks_that_escape_or_hide(self):
+        """符号链接必须同样受约束：resolve() 之后仍要在内置目录内、且不得是隐藏文件。
+
+        （`resolve_asset` 用 `resolve(strict=True)` + `is_relative_to(root)`
+        处理软链；这条测试用真实文件系统把这个保证钉住。）
+        """
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from elenvind.core import assets
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ok.txt").write_text("fine", encoding="utf-8")
+            (root / ".hidden.txt").write_text("secret", encoding="utf-8")
+            outside = Path(tmp).parent / "elenvind-outside.txt"
+            outside.write_text("outside", encoding="utf-8")
+            try:
+                (root / "escape.txt").symlink_to(outside)
+                (root / "hidden-link.txt").symlink_to(root / ".hidden.txt")
+                (root / "etc").symlink_to("/etc")
+            except (OSError, NotImplementedError):
+                self.skipTest("symbolic links are not available in this environment")
+            with mock.patch.object(assets, "STATIC_DIR", root):
+                self.assertIsNotNone(assets.resolve_asset("ok.txt"))
+                self.assertIsNone(assets.resolve_asset(".hidden.txt"))
+                self.assertIsNone(assets.resolve_asset("escape.txt"))
+                self.assertIsNone(assets.resolve_asset("hidden-link.txt"))
+                # 目录软链指向外部：即使目标真实存在（/etc/passwd），也必须拒绝
+                self.assertIsNone(assets.resolve_asset("etc/passwd"))
+
     def test_rejects_traversal_and_hidden_paths(self):
         for relative in ("../config.toml", "..%2fconfig.toml", "css/../../config.toml",
                          ".git/config", ".env", "", "..", "css/./style.css/.."):

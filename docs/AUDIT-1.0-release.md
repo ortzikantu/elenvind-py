@@ -1,9 +1,30 @@
 # Elenvind 1.0 上线前审查与收束（第三轮）
 
-- 审查对象：本仓库当前工作树（版本 `v1.0.0`）
+- 审查对象：本仓库工作树（版本 `v1.0.0`）
 - 审查方式：全量代码走查 + 在 `/tmp` 副本上的动态取证（真实 Gunicorn 多 worker、用户态 Nginx、真实 SQLite 文件操作、并发线程、`systemd-analyze`、`nginx -t`）
 - 约束：不换依赖、不改分层、不引入新基础设施；只做修复已证实缺陷所必需的最小改动
 - 范围外（按约定）：管理员初始化策略、监听地址与 Host 策略、依赖选型、架构重构
+
+## 0. RC 最终轮（本轮）增量
+
+第三轮修复落地后，又做了一轮独立核查（基于提交 `d71a843`，工作区干净），确认没有 P0/P1 级的遗留问题，并补齐了 6 条守卫：
+
+| 事项 | 证据 | 处理 |
+|---|---|---|
+| Nginx 与应用请求体限制的**顺序** | 示例原为 `client_max_body_size 1m` 而注释写"略大一点，让应用返回 413" —— 实际两者**相等**，>1 MiB 的请求由 Nginx 抢先 413，应用侧 413 在反代后观察不到（文档与行为矛盾） | 改为应用先触发（1 MiB）、Nginx `2m` 兜底，注释写明两层分工；新增守卫 `test_nginx_body_limit_leaves_room_for_the_application_limit` |
+| 代理读超时余量 | 示例已为 40s（> Gunicorn 默认 30s），没有守卫防止被改回 | 新增 `test_nginx_proxy_read_timeout_exceeds_gunicorn_timeout` |
+| 符号链接处理 | `resolve_asset()` 有 `resolve(strict=True)` + `is_relative_to(root)` + 隐藏段二次检查，但**没有测试** | 新增 `test_rejects_symlinks_that_escape_or_hide`（指向外部文件 / 指向隐藏文件 / 目录软链到 `/etc` 三种形态） |
+| 日志轮转后能否继续写 | 此前只做过手工验证 | 固化为 `test_operations.py::LogRotation`（真实 handler：写 → 改名 → 再写） |
+| 恢复后的库能否读写 | 此前只有手工演练 | 固化为 `test_restored_database_supports_reads_and_writes`（走应用层 `db.configure()` 切换后读 + 写） |
+| 失败备份是否会破坏有效备份 | 此前只覆盖"拒绝覆盖" | 新增 sha256 逐字节比对：`test_failed_backup_never_touches_the_existing_copy` |
+
+本轮验证快照（实测）：
+
+```
+python -m unittest discover -s tests -t .   → Ran 109 tests ... OK   （0 skipped；上一轮 103）
+ruff check .                                → All checks passed!
+python -m compileall -q elenvind tests run.py → exit 0
+```
 
 ## 1. 结论
 
@@ -14,15 +35,8 @@
 | P0 严重 | 0 | — |
 | P1 高优先级 | 0 | — |
 | P2 中优先级 | 5 | 已修复（含守卫测试） |
-| P3 低优先级 | 6 | 已修复（4 项）／已记录并缓解（2 项） |
+| P3 低优先级 | 6 | 已修复（6 项，含守卫测试或逐字节验证） |
 | 待验证风险 | 5 | 消除 1、端到端验证 1、给出验证方法 3 |
-
-验证快照（本轮实测）：
-
-```
-python -m unittest discover -s tests -t .   → Ran 103 tests ... OK      （修复前 82）
-ruff check .                                → All checks passed!        （修复前 58 条）
-```
 
 ## 2. P2：已修复
 
@@ -93,7 +107,7 @@ ruff check .                                → All checks passed!        （修
 - 日志轮转（`mv app.log app.log.1`）后 `WatchedFileHandler` 自动重建并继续写。
 - 并发写入（60 条评论）期间的在线备份：`integrity_check=ok`、`foreign_key_check` 空、快照行数与时刻一致。
 - 恢复演练：备份 0600 → 移走 `sqlite.db*` → 放回备份 → 启动 `200`、评论数 = 快照、启动日志 0 错误、恢复后写路径可用。
-- 注册限流**确实**省掉 scrypt（超限请求 803 rps，无 240ms 哈希）。
+- 注册限流**确实**省掉 scrypt：旧实现下被限流的注册请求已跑到 803 rps（证明没有执行 240ms 哈希），本轮又加了只读预检，连全局写锁都不再获取（机械证明见 `RegisterPreCheck`）。
 - 文件权限受 umask 控制（027 → `640`），锁文件恒 `600`；`db/backup.py` 现在固定 `600`。
 - 日志不含密码 / 令牌 / 查询串；XFF / XFP 仅在受信对端生效；未知权限 fail-closed。
 
@@ -134,11 +148,12 @@ ab -n 60 -c 10 https://your.domain/login | tail -5      # 期望出现 503（lim
 
 ## 7. 仍可记录后接受的事项
 
-1. **2 个 sync worker 的排队争用**：8 线程洪水下正常写请求 p50 会升高（实测 2.4ms → 10.7ms）。这是 Gunicorn 同步 worker 的容量事实，不是逻辑缺陷；缓解手段是 Nginx 边缘限流（已配）与按机器调 `--workers`。
-2. **`SIGKILL` 中断备份会留下不完整目标文件**：下一次备份会拒绝覆盖它（保守设计）。运维只需删除或改名；如需自动化，可在 cron 里先清理超过 N 天的 `.db`。
-3. **锁定提示区分维度**：可推断"该邮箱近期被尝试过"，接受。
-4. **日志随请求量线性增长**（约 135 B/行）：`[logging].rotate = false` + `deploy/logrotate.conf` 已经处理；静态资源在 Nginx 侧已 `access_log off`。
-5. **真实 ENOSPC 与真实 systemd 运行环境**未在本机演练（无 root / 无目标目录），命令已列在 §6。
+1. **登录闸门命中后仍会执行一次 scrypt**（≈94 ms/次，2 worker 下约 10 次/秒，实测）：这是"验证优先"的必然代价 —— 闸门必须先校验密码才能判断"这次到底该不该拦"。它是**刻意**保留的取舍，因为替代方案（闸门命中即拒绝）会让正确密码也被锁在门外。缓解：Nginx `/login` 边缘限流（示例 `20r/m`，实测 12 次请求触发 6 个 503）+ 邮箱/IP/全站三闸门只降级不阻断 + 失败尝试不再额外写库（P2-5）。压力评估方法：`ab -n 200 -c 20 https://your.domain/login` 观察 CPU 与响应时间。
+2. **2 个 sync worker 的排队争用**：8 线程洪水下正常写请求 p50 会升高（实测 2.4ms → 10.7ms）。这是 Gunicorn 同步 worker 的容量事实，不是逻辑缺陷；缓解手段是 Nginx 边缘限流（已配）与按机器调 `--workers`。
+3. **`SIGKILL` 中断备份会留下不完整目标文件**：下一次备份会拒绝覆盖它（保守设计）。运维只需删除或改名；如需自动化，可在 cron 里先清理超过 N 天的 `.db`。
+4. **锁定提示区分维度**：可推断"该邮箱近期被尝试过"，接受。
+5. **日志随请求量线性增长**（约 135 B/行）：`[logging].rotate = false` + `deploy/logrotate.conf` 已经处理；静态资源在 Nginx 侧已 `access_log off`。
+6. **真实 ENOSPC 与真实 systemd 运行环境**未在本机演练（无 root / 无目标目录），命令已列在 §6。
 
 ## 8. 本轮改动清单（文件 → 目的）
 
