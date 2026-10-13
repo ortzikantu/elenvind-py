@@ -1,7 +1,7 @@
 # ============================================================
 # Elenvind 配置模板
-# 复制为 config.toml 后按需修改：cp config.example.toml config.toml
-# 所有键的作用见 docs/CONFIGURATION.md；配置在启动时校验一次，
+# 复制为 config.toml 后按需修改：cp ops/config.example.toml config.toml
+# 所有键的作用见 ops/CONFIGURATION.md；配置在启动时校验一次，
 # 不合法会直接拒绝启动（不会跑到某个页面才报错）。
 # 路径类配置一律相对项目根目录。
 # ============================================================
@@ -57,13 +57,13 @@ max_body_size = 1048576            # 1 MB
 
 # 数据库文件（相对项目根目录；也可用环境变量 ELENVIND_DB 覆盖，用于多环境隔离）。
 # 默认放在 data/ 子目录：systemd 单元只把 data/logs/backups 授予服务账号写权限，
-# 代码与配置目录保持只读（见 deploy/elenvind.service）。
+# 代码与配置目录保持只读（见 ops/elenvind.service）。
 # 目录需要预先存在（应用会创建它，但只读根目录下创建不了；systemd 单元里有说明）。
 database = "data/sqlite.db"
 
 # 内容目录（相对项目根目录）
 articles_dir = "articles"
-custom_pages_dir = "custom_pages"
+custom_pages_dir = "custom"
 
 # Jinja2 模板目录（相对项目根目录）；默认即包内 elenvind/templates。
 # 仅当你要把自己的一套模板整体替换掉时才有必要改这里。
@@ -129,7 +129,7 @@ use_builtin_css = true
     #           （/css/style.css），false 则完全不加载样式
     #
     # 默认留空 = 用内置样式，开箱即有完整排版。
-    # 想完全自定义外观：把仓库根的 style.example.css 改好放到你的 Web 服务器，
+    # 想完全自定义外观：把 ops/style.example.css 改好放到你的 Web 服务器，
     # 再把地址填到下面（例如 "/static/site.css"）。
     css = ""
 
@@ -182,7 +182,7 @@ use_builtin_css = true
     file = "logs/app.log"        # 日志文件路径（相对项目根目录）
     # 应用内轮转开关。默认 false = 只写当前文件、由外部 logrotate 负责轮转
     # （多 worker 各持一个 RotatingFileHandler 时同时轮转会互相截断/丢行；
-    #  仓库的 deploy/logrotate.conf 是一份可直接用的示例）。
+    #  仓库的 ops/logrotate.conf 是一份可直接用的示例）。
     # 单 worker 或本地开发可以设 true，此时下面两项生效。
     rotate = false
     max_bytes = 10485760         # 10 MB（rotate = true 时生效）

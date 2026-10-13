@@ -5,7 +5,7 @@
 - 所有键必须能通过 `core/config.py:validate_config()`，非法值**直接拒绝启动**
   （不会先跑起来、再在某个页面 500）；
 - 路径类配置一律相对**项目根目录**解析，与启动时的 cwd 无关；
-- 文件不存在 → 启动失败。复制模板：`cp config.example.toml config.toml`；
+- 文件不存在 → 启动失败。复制模板：`cp ops/config.example.toml config.toml`；
 - TOML 的表（`[table]`）会"吃掉"它之后的所有顶层键，因此**所有表都写在顶层键之后**。
 
 启动时的告警（不阻止启动，但要处理）：
@@ -40,7 +40,7 @@
 | `max_body_size` | int | `1048576` | POST 表单体积上限（字节），超出返回 413。反向代理侧（示例 `client_max_body_size 2m`）应设得**更大**，这样应用先触发 413 并留下日志，代理侧只是兜底 |
 | `database` | string | `data/sqlite.db` | SQLite 文件路径（相对项目根）。默认落在 `data/` 子目录：systemd 单元只把 `data/`、`logs/`、`backups/` 授予服务账号写权限，代码与配置保持只读。环境变量 `ELENVIND_DB` 优先级更高（多环境隔离用）。目录需预先存在（应用会尝试创建，但只读根目录下创建不了） |
 | `articles_dir` | string | `articles` | 文章目录（`*.md`，TOML front matter） |
-| `custom_pages_dir` | string | `custom_pages` | 自定义页面目录（`*.md`，文件名即路由） |
+| `custom_pages_dir` | string | `custom` | 自定义页面目录（`*.md`，文件名即路由）；键名是历史命名，值改成你的目录即可 |
 | `templates_dir` | string | `elenvind/templates` | Jinja2 模板目录；只有整体替换模板时才需要改 |
 | `use_builtin_css` | bool | `true` | `[static].css` 为空时是否使用内置样式表（`/css/style.css`）。`false` 则完全不输出 `<link>` |
 
@@ -137,7 +137,7 @@ description = "一句话说明"
 |---|---|---|
 | `level` | `info` | `debug` / `info` / `warning` / `error` / `critical` |
 | `file` | `logs/app.log` | 日志文件（相对项目根目录） |
-| `rotate` | `false` | `false`（推荐）：只写当前文件，由外部 `logrotate` 轮转（多 worker 下唯一安全的做法，见 `deploy/logrotate.conf`）。`true`：应用内轮转，仅在**单 worker**或本地开发时使用 |
+| `rotate` | `false` | `false`（推荐）：只写当前文件，由外部 `logrotate` 轮转（多 worker 下唯一安全的做法，见 `ops/logrotate.conf`）。`true`：应用内轮转，仅在**单 worker**或本地开发时使用 |
 | `max_bytes` | `10485760` | 仅 `rotate = true` 时生效 |
 | `backup_count` | `5` | 仅 `rotate = true` 时生效 |
 

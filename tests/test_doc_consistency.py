@@ -1,7 +1,7 @@
 """文档 / 配置 / 文案一致性守卫。
 
 `config.toml` 的注释写着"守卫（tests/test_doc_consistency.py）只允许'收窄'：
-拒绝裸 `http:` / `https:` / `*`"，`config.example.toml` 引用 `docs/CONFIGURATION.md`
+拒绝裸 `http:` / `https:` / `*`"，`ops/config.example.toml` 引用 `ops/CONFIGURATION.md`
 —— 本文件让这些承诺真的成立：配置校验、CSP 收窄、i18n 键一致、交付件存在、
 依赖声明与代码实际 import 一致、模板保持 Zero-JS。
 """
@@ -92,7 +92,7 @@ class ConfigValidation(unittest.TestCase):
         """
         from elenvind.core.config import validate_config
 
-        names = ["config.example.toml"]
+        names = ["ops/config.example.toml"]
         if (PROJECT_ROOT / "config.toml").is_file():
             names.append("config.toml")
         for name in names:
@@ -102,9 +102,9 @@ class ConfigValidation(unittest.TestCase):
     def test_example_and_shipped_config_agree_on_keys(self):
         """两份配置的键集合应当一致（避免示例文档漂移成"另一套配置"）。"""
         shipped = _load_toml(PROJECT_ROOT / "config.toml")
-        example = _load_toml(PROJECT_ROOT / "config.example.toml")
+        example = _load_toml(PROJECT_ROOT / "ops" / "config.example.toml")
         missing = sorted(set(shipped) - set(example))
-        self.assertEqual(missing, [], f"config.example.toml is missing top-level keys: {missing}")
+        self.assertEqual(missing, [], f"ops/config.example.toml is missing top-level keys: {missing}")
 
 
 class I18nConsistency(unittest.TestCase):
@@ -140,11 +140,11 @@ class I18nConsistency(unittest.TestCase):
 class Deliverables(unittest.TestCase):
     def test_readme_and_configuration_doc_exist(self):
         self.assertTrue((PROJECT_ROOT / "README.md").is_file())
-        self.assertTrue((PROJECT_ROOT / "docs" / "CONFIGURATION.md").is_file())
+        self.assertTrue((PROJECT_ROOT / "ops" / "CONFIGURATION.md").is_file())
 
     def test_deployment_examples_exist(self):
         for name in ("nginx.conf.example", "elenvind.service", "logrotate.conf"):
-            self.assertTrue((PROJECT_ROOT / "deploy" / name).is_file(), name)
+            self.assertTrue((PROJECT_ROOT / "ops" / name).is_file(), name)
 
     def test_requirements_cover_third_party_imports(self):
         names: set[str] = set()
@@ -178,7 +178,7 @@ class Deliverables(unittest.TestCase):
         """注释里点名的守卫测试必须真的存在（否则又是"文档说谎"）。"""
         referenced: set[str] = set()
         sources = [*PACKAGE.rglob("*.py"), PROJECT_ROOT / "config.toml",
-                   PROJECT_ROOT / "config.example.toml"]
+                   PROJECT_ROOT / "ops" / "config.example.toml"]
         for path in sources:
             text = path.read_text(encoding="utf-8")
             referenced |= set(re.findall(r"tests/([a-z_]+\.py)", text))

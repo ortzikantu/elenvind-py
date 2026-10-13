@@ -27,7 +27,7 @@ summary = "一句话摘要"        # 可选
 
 - `title` 必填；缺失或 front matter 未闭合的文章会被索引跳过，并在日志里点名文件。
 - `date` 决定首页排序（倒序），也能被 `lastmod` 覆盖更新日期。
-- 自定义页面（`custom_pages/`）**不需要** front matter，直接写正文。
+- 自定义页面（`custom/`）**不需要** front matter，直接写正文。
 
 ## 2. 基础语法
 

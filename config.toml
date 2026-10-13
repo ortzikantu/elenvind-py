@@ -40,7 +40,7 @@ session_idle_days = 15             # 滑动过期：15 天不活跃即失效（�
 max_body_size = 1048576            # POST 表单体积上限（1 MB），超出返回 413
 database = "data/sqlite.db"             # 相对项目根；也可用环境变量 ELENVIND_DB 覆盖
 articles_dir = "articles"          # 文章目录（相对项目根）
-custom_pages_dir = "custom_pages"      # 自定义页面目录（相对项目根）
+custom_pages_dir = "custom"            # 自定义页面目录（相对项目根）
 templates_dir = "elenvind/templates"  # Jinja2 模板目录（相对项目根）
 
 # 内置样式表回落：当 [static].css 为空时，是否使用应用自带的样式表
@@ -53,7 +53,7 @@ use_builtin_css = true
 # TOML 的表会"吃掉"它之后的所有顶层键，所以所有表都必须排在这些顶层键之后。
 
 [server]
-    host = "0.0.0.0"
+    host = "127.0.0.1"
     port = 6789
     # Gunicorn worker 进程数（`python run.py` 会读它；也可用 --workers 覆盖）。
     # 2 是出厂值：多 worker 是设计的一部分。所有写事务经过 Core 的 write_tx()
@@ -95,7 +95,7 @@ use_builtin_css = true
     # 填值 -> 用你指定的地址。注意这个地址由**你的 Web 服务器**负责提供
     #        （应用只发内置样式表，不托管任意静态文件），例如
     #        "/static/site.css" 或 "https://cdn.example.com/site.css"。
-    # 想自定义外观：拿仓库根的 style.example.css 改好放到 Nginx，再把地址填这里。
+    # 想自定义外观：拿 ops/style.example.css 改好放到 Nginx，再把地址填这里。
     css = ""
 
     # 站点图标；留空则回落到包内缺省图标（elenvind/static/imgs/）。

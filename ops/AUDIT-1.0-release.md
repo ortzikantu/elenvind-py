@@ -4,6 +4,10 @@
 - 审查方式：全量代码走查 + 在 `/tmp` 副本上的动态取证（真实 Gunicorn 多 worker、用户态 Nginx、真实 SQLite 文件操作、并发线程、`systemd-analyze`、`nginx -t`）
 - 约束：不换依赖、不改分层、不引入新基础设施；只做修复已证实缺陷所必需的最小改动
 - 范围外（按约定）：管理员初始化策略、监听地址与 Host 策略、依赖选型、架构重构
+- **路径说明**：本文写于目录合并之前（`deploy/` + `docs/` + 示例文件 → `ops/`）。
+  文中出现的 `deploy/…`、`docs/CONFIGURATION.md`、`config.example.toml`、
+  `style.example.css`、根目录 `AUDIT.md`，现在都在 `ops/` 下；代码路径（`elenvind/…`、
+  `tests/…`、`data/…`、`logs/…`）未变。
 
 ## 0. RC 最终轮（本轮）增量
 
@@ -25,6 +29,31 @@ python -m unittest discover -s tests -t .   → Ran 109 tests ... OK   （0 skip
 ruff check .                                → All checks passed!
 python -m compileall -q elenvind tests run.py → exit 0
 ```
+
+## 0.2 第四轮：发布前完整源码审查（HEAD `18648b4`）
+
+对当前检出提交做的一轮独立源码审查（10 762 行一方 Python、16 个模板），结论与增量：
+
+**结论**：未发现 Critical/High/Medium 级缺陷；发现 1 个可观测性/API 缺陷（已修）、4 处注释与实现漂移（已修）、2 处死代码（已修）。
+
+| 发现 | 证据 | 处理 |
+|---|---|---|
+| `db.DB_PATH` 是 import 时刻的**快照**，`configure()` 后不更新 → 启动日志报告的是默认路径而不是 `config.toml` 指定的路径（实际库文件、锁文件都在正确位置，仅日志与任何使用该名的调用方被误导；`tests/test_operations.py` 也用了它） | 复现：`db.configure("/tmp/x/other.db")` 后 `db.DB_PATH` 不变、`db.connection.DB_PATH` 变；启动日志显示 `<root>/sqlite.db` 而实际文件在 `<root>/data/sqlite.db` | 移除快照导出，改为实时函数 `db.db_path()`；`app.py` 日志与测试改用它；新增 3 条守卫（`DatabasePathAPI`）。修复后启动日志显示 `/tmp/xcheck3/data/sqlite.db` 与实际文件一致 |
+| `elenvind/db/session.py` 顶部 docstring 声称"本模块**全是写操作**…统一走 write_tx"，与实现相反（`get_session_user()` 走只读 `connect()`） | 源码对照 | 已修正（并说明读写分路径） |
+| `modules/users/routes.py` docstring 引用已删除的 `db.user.update_user_password` 与 `core.session.invalidate_user_sessions` | 源码对照 | 已修正为实际的单事务原语 |
+| `db/auth.py` 注释引用"第 209 行"（该行已不存在）、`db/migration.py` 两处引用已删除的 `delete_user_sessions()` / `count_global_recent_failures()` | 源码对照 | 已修正措辞 |
+| 死代码：`db.auth.record_login_attempt`、`db.session.delete_user_sessions`（均无任何调用者，属上两轮修复的遗留） | `grep` 引用计数为 0 | 已删除并同步导出面（`migrate()` 保留：它是公开迁移入口，无内部调用者但属运维可用 API） |
+
+**本轮动态验证（新增证据）**
+
+- **多进程并发写入**（8 进程 × 5 用户 + 5 评论，独立临时库）：0.16 s 内 40 用户 + 40 评论，**零异常、零丢失、零重复邮箱、零外键孤儿、`integrity_check=ok`**；8 进程抢注同一邮箱恰好 1 成功 + 7 个 `IntegrityError`。
+- **只读路径不占写锁**：在持有 `write_tx()` 的同一线程内用 `connect()` 读成功（若只读路径也取 flock 会自死锁）—— 机制级证明。
+- **事务异常**：`write_tx()` 内抛异常 → 行数不变（回滚）→ 锁立即可再次获取；嵌套 `write_tx()` 抛 `RuntimeError`（不死锁）；`init_db()` 重复调用幂等。
+- **绕过锁协议的外部写入者**（`sqlite3` CLI）：应用持有 `BEGIN IMMEDIATE` 时 CLI 写入立刻得到 `database is locked`（不损坏、不部分写入），事务结束后可正常写入 —— 说明 flock 失效也不会导致数据损坏（SQLite 自身锁兜底）。
+- **只读数据库**（`chmod 444` 三个文件）：写请求 HTTP 500、读请求 HTTP 200，权限恢复后注册即自愈 HTTP 302。
+- 启动/停止：2 worker 正常启动（schema v6 / WAL）、9 条路径冒烟 200/404 符合预期、SIGTERM 后残留进程 0、端口释放。
+
+**第四轮结束后的验证快照**：`Ran 112 tests ... OK`（新增 3 条）、`ruff check .` → All checks passed、`compileall` 通过。
 
 ## 1. 结论
 

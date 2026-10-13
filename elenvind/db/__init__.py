@@ -51,7 +51,6 @@ from .auth import (
     cleanup_old_attempts,
     cleanup_old_login_attempts,
     complete_login_success,
-    record_login_attempt,
     register_attempt_exceeded,
     reserve_login_attempt,
     try_register_attempt,
@@ -67,7 +66,6 @@ from .comment import (
 )
 from .comment_rate import cleanup_old_comment_attempts, try_post_comment
 from .connection import (
-    DB_PATH,
     DEFAULT_DB_PATH,
     IntegrityError,
     configure,
@@ -77,14 +75,13 @@ from .connection import (
     lock_path_for,
 )
 from .maintenance import prune
-from .migration import SCHEMA_VERSION, MigrationError, init_db, migrate
+from .migration import SCHEMA_VERSION, MigrationError, init_db
 from .session import (
     DEFAULT_ABSOLUTE_DAYS,
     DEFAULT_IDLE_DAYS,
     cleanup_expired_sessions,
     create_session,
     delete_session,
-    delete_user_sessions,
     get_session_user,
     rotate_session,
 )
@@ -100,10 +97,22 @@ from .user import (
     update_user_profile,
 )
 
+
+def db_path():
+    """**当前生效**的数据库路径（实时读取）。
+
+    为什么是函数而不是常量：`configure()` 会替换连接层里的路径，而
+    `from .connection import DB_PATH` 这种再导出只是 **import 时刻的快照**。
+    用它打日志/做判断会拿到过期值 —— 真实案例：启动日志打印的是默认路径
+    `<项目根>/sqlite.db`，而实际库在 `config.toml` 指定的 `data/sqlite.db`，
+    排障时按日志去找文件会扑空。需要路径就调用本函数（它读的是真值）。
+    """
+    return connection.DB_PATH
+
+
 __all__ = [
     "COOLDOWN_BASE_SECONDS",
     "COOLDOWN_MAX_SECONDS",
-    "DB_PATH",
     "DEFAULT_ABSOLUTE_DAYS",
     "DEFAULT_DB_PATH",
     "DEFAULT_IDLE_DAYS",
@@ -130,9 +139,9 @@ __all__ = [
     "connection",
     "create_session",
     "create_user",
+    "db_path",
     "delete_session",
     "delete_user_account",
-    "delete_user_sessions",
     "flatten_comment_tree",
     "get_comment_by_id",
     "get_comments_by_article",
@@ -145,11 +154,9 @@ __all__ = [
     "journal_mode",
     "lock_path_for",
     "maintenance",
-    "migrate",
     "migration",
     "normalize_email",
     "prune",
-    "record_login_attempt",
     "redact_comment",
     "register_attempt_exceeded",
     "reserve_login_attempt",

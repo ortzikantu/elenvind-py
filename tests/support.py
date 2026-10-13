@@ -63,7 +63,7 @@ class Workspace:
 
 
 def test_config(workspace: Workspace) -> dict:
-    """注入 `core.config.config` 的配置：与 config.example.toml 同构且更严格。
+    """注入 `core.config.config` 的配置：与 ops/config.example.toml 同构且更严格。
 
     刻意把限流阈值调小（锁定 3 次、评论配额 3 条、评论深度 3 层），
     这样"上限行为"可以在几次请求内被验证，而不必灌 1000 条数据。

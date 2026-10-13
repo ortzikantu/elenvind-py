@@ -1,4 +1,4 @@
-"""Pages 模块：自定义页面（custom_pages/*.md）。
+"""Pages 模块：自定义页面（custom/*.md）。
 
 页面是**纯 Markdown 正文**（无文档头），文件名即路由：`about.md` -> `/about`。
 路径安全：slug 先过白名单校验；页面内容是扫描目录得到的，URL 只做字典查表，
@@ -23,15 +23,15 @@ MAX_PAGE_SIZE = 512 * 1024
 _pages_cache = None       # slug -> Markup
 _file_stats = None
 #: 目录状态检查的最小间隔（秒）：命中缓存的 `/<slug>` 兜底请求不该每次都
-#: glob 整个 custom_pages 目录（与 blog 模块同一策略）。
+#: glob 整个 custom 目录（与 blog 模块同一策略）。
 _SCAN_INTERVAL_SECONDS = 2.0
 _last_scan_at = 0.0
 
 
 def custom_pages_dir() -> Path:
     """自定义页面目录：config.toml 顶层 `custom_pages_dir`（
-    键名沿用历史命名以保持配置兼容），默认 `custom_pages/`。"""
-    return resolve_path(config.get("custom_pages_dir"), ROOT / "custom_pages")
+    键名沿用历史命名以保持配置兼容），默认 `custom/`。"""
+    return resolve_path(config.get("custom_pages_dir"), ROOT / "custom")
 
 
 def _get_file_stats(dir_path: Path):

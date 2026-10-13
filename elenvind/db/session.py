@@ -3,10 +3,12 @@
 安全说明：
 - token 是 32 字节 cryptographically-secure 随机串，仅存在于服务端表与用户 Cookie 中，
   攻击者无法预测，也不像 JWT 那样携带可伪造的载荷。
-- 登录成功会先 delete_user_sessions(user_id) 再发新证，防止会话固定攻击。
-- 每次发证与每次校验都顺带清理过期会话，避免长运行后表无限增长。
-- 本模块**全是写操作**（含读-判断-写复合操作），因此统一走 `write_tx()`：
-  flock 保证跨 worker 互斥，BEGIN IMMEDIATE 保证事务原子性。
+- 登录成功由 `rotate_session()` 在**一个写事务**里作废该账号全部旧会话并颁发新证
+  （防会话固定；两段式实现会让并发登录各自留下一个有效会话）。
+- 发证与校验都会顺带清理过期会话，避免长运行后表无限增长。
+- **读写分路径**：`get_session_user()` 走只读连接（`connect()`，不参与 flock），
+  只有"刷新 `last_seen`"与"删除过期行"才升级到 `write_tx()`
+  （flock 保证跨 worker 互斥，BEGIN IMMEDIATE 保证事务原子性）。
 
 过期策略（两个维度，都需要满足才有效）：
 - **绝对过期** `created_at + absolute_days`：会话无论多活跃，活够这么久就必须重新登录。
@@ -130,7 +132,7 @@ def rotate_session(user_id: int) -> str:
     """作废该账号**全部**旧会话并颁发新 token —— **同一个写事务**。
 
     登录/提权专用（防会话固定）。为什么必须是一个事务：
-    旧实现是 `delete_user_sessions()` + `create_session()` 两次独立写事务，
+    旧实现是"删除全部旧会话"与"插入新会话"两次独立写事务，
     两个并发登录会交错成"各自留下一行会话"（实测 session 行数 = 2）。
     合并后，同一账号在任何并发下都只剩最后颁发的那一个会话。
     """
@@ -188,12 +190,6 @@ def delete_session(token: str):
     """注销单个会话（退出登录时使用）。"""
     with write_tx() as conn:
         conn.execute("DELETE FROM session WHERE token = ?", (token,))
-
-
-def delete_user_sessions(user_id: int):
-    """删除某用户全部会话：登录防会话固定、改密后强制重新登录、删号时使用。"""
-    with write_tx() as conn:
-        conn.execute("DELETE FROM session WHERE user_id = ?", (user_id,))
 
 
 def _delete_expired(conn, now: float) -> int:

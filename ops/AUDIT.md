@@ -3,8 +3,12 @@
 > **文档状态：历史归档（第二轮审查）。**
 > 本文件记录的是第二轮审查的发现与当时的修复过程，其中的问题**均已修复**。
 > 当前状态（1.0 上线前的第三轮审查、逐项状态列与验收清单）见
-> [`docs/AUDIT-1.0-release.md`](docs/AUDIT-1.0-release.md) —— 请以那一份为准，
+> [`AUDIT-1.0-release.md`](AUDIT-1.0-release.md) —— 请以那一份为准，
 > 避免把"历史问题"与"当前未解决问题"混读。
+>
+> **路径说明**：本文件写于目录合并之前（`deploy/` + `docs/` + 示例文件 → `ops/`），
+> 文中出现的 `deploy/…`、`docs/…`、根目录的 `AUDIT.md` / `config.example.toml` /
+> `style.example.css`，现在都位于 `ops/` 下。
 
 审查对象：`/home/hao/Dev/elenvind`（v0.3.1-dev，Python 3.14.7）
 审查方式：全量源码走查（8137 行 Python + 525 行模板 + 配置 + i18n）+ 在 `/tmp` 副本上进行黑盒动态验证（Gunicorn 3 个实例、2 workers / 1 worker，共 8 组探针）。

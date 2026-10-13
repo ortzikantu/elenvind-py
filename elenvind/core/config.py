@@ -289,7 +289,7 @@ def validate_config(cfg=None):
     # 注意 `templates_dir` 允许指向包内默认目录（elenvind/templates）。
     from .templating import DEFAULT_TEMPLATES_DIR
     for key, default in (("articles_dir", ROOT / "articles"),
-                         ("custom_pages_dir", ROOT / "custom_pages"),
+                         ("custom_pages_dir", ROOT / "custom"),
                          ("templates_dir", DEFAULT_TEMPLATES_DIR)):
         raw = cfg.get(key)
         if raw is None:

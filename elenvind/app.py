@@ -102,8 +102,8 @@ def prepare_database() -> None:
     db.cleanup_old_attempts(days=7)
 
     logger.info("Database: %s (schema v%s, journal_mode=%s, write lock %s)",
-                db.DB_PATH, db.SCHEMA_VERSION, db.journal_mode(),
-                db.lock_path_for(db.DB_PATH))
+                db.db_path(), db.SCHEMA_VERSION, db.journal_mode(),
+                db.lock_path_for(db.db_path()))
     logger.info("Expired sessions and rate-limit history cleaned "
                 "(%s session(s) removed)", removed_sessions)
 

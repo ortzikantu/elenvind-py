@@ -20,9 +20,9 @@ elenvind/
   templates/    Jinja2 模板
   static/       内置静态资源（图标、样式表）
 articles/       文章（TOML front matter + Markdown）
-custom_pages/   自定义页面（纯 Markdown，文件名即路由）
+custom/         自定义页面（纯 Markdown，文件名即路由）
 i18n/           界面文案（en / zh / ja）
-deploy/         Nginx / systemd / logrotate 示例
+ops/            部署 / 文档 / 示例（Nginx、systemd、logrotate、配置与样式模板、说明文档）
 tests/          标准库 unittest 测试（含架构守卫）
 
 data/           运行时数据（sqlite.db 及 -wal/-shm）—— 不进版本库
@@ -35,7 +35,7 @@ backups/        `run.py --backup` 的默认输出目录 —— 不进版本库
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-cp config.example.toml config.toml     # 至少改 site_url 与 admin_user_id
+cp ops/config.example.toml config.toml  # 至少改 site_url 与 admin_user_id
 .venv/bin/python run.py                # 默认 127.0.0.1:6789
 ```
 
@@ -72,8 +72,8 @@ sudo chown -R root:elenvind /srv/elenvind
 sudo chmod 750 /srv/elenvind && sudo chmod 640 /srv/elenvind/config.toml
 sudo install -d -o elenvind -g elenvind -m 750 /srv/elenvind/{data,logs,backups}
 
-sudo cp deploy/elenvind.service /etc/systemd/system/
-sudo cp deploy/logrotate.conf /etc/logrotate.d/elenvind
+sudo cp ops/elenvind.service /etc/systemd/system/
+sudo cp ops/logrotate.conf /etc/logrotate.d/elenvind
 sudo systemctl daemon-reload && sudo systemctl enable --now elenvind
 systemd-analyze verify /etc/systemd/system/elenvind.service    # 期望无输出
 ```
@@ -82,7 +82,7 @@ systemd-analyze verify /etc/systemd/system/elenvind.service    # 期望无输出
 > `config.toml` 的 `database` 改成 `data/sqlite.db`，否则应用会在只读的根目录里
 > 尝试建库并启动失败。
 
-Nginx 配置见 `deploy/nginx.conf.example`：`client_*_timeout` + `limit_conn` 挡慢连接、
+Nginx 配置见 `ops/nginx.conf.example`：`client_*_timeout` + `limit_conn` 挡慢连接、
 `limit_req` 给 `/login`、`/register` 加边缘限流、`proxy_hide_header Server`、
 `proxy_read_timeout 40s`（**必须大于** Gunicorn 默认的 30s，让应用先失败）。
 请求体上限分两层且有明确顺序：应用的 `max_body_size`（默认 1 MiB）先触发 413 并在日志里留痕，
@@ -152,7 +152,7 @@ hsts_enabled = true
 
 ## 配置
 
-全部配置项与语义见 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)。几个要点：
+全部配置项与语义见 [`ops/CONFIGURATION.md`](ops/CONFIGURATION.md)。几个要点：
 
 - 配置只在**启动时**加载一次并整体校验，非法配置直接拒绝启动（不会跑到某个页面才 500）；
 - 路径类配置一律相对**项目根目录**解析，与启动时的 cwd 无关；

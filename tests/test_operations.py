@@ -15,8 +15,48 @@ from pathlib import Path
 from tests import support
 from tests.support import ARTICLE_SLUG, PROJECT_ROOT
 
-SERVICE_FILE = PROJECT_ROOT / "deploy" / "elenvind.service"
-NGINX_EXAMPLE = PROJECT_ROOT / "deploy" / "nginx.conf.example"
+SERVICE_FILE = PROJECT_ROOT / "ops" / "elenvind.service"
+NGINX_EXAMPLE = PROJECT_ROOT / "ops" / "nginx.conf.example"
+
+
+class DatabasePathAPI(unittest.TestCase):
+    """`db.db_path()` 必须**实时**反映 `configure()` 的结果。
+
+    历史缺陷：`db/__init__.py` 用 `from .connection import DB_PATH` 再导出，
+    那只是 import 时刻的**快照** —— `configure()` 之后它不更新，于是启动日志
+    打印的是默认路径而不是 config.toml 里 `database` 指定的路径
+    （排障时按日志去找文件会扑空）。现在只暴露函数，不暴露快照常量。
+    """
+
+    def setUp(self):
+        support.ensure_application()
+
+    def test_db_path_tracks_configure(self):
+        from elenvind import db
+
+        original = Path(db.db_path())
+        alternative = Path(support.WORKSPACE.root) / "path-api.db"
+        try:
+            db.configure(alternative)
+            self.assertEqual(Path(db.db_path()), alternative,
+                             "db_path() must follow configure(), not a stale snapshot")
+        finally:
+            db.configure(original)
+        self.assertEqual(Path(db.db_path()), original)
+
+    def test_package_does_not_export_a_stale_path_snapshot(self):
+        """`db.DB_PATH` 这类 import 期快照不得再暴露（它只会误导调用方）。"""
+        from elenvind import db
+
+        self.assertFalse(hasattr(db, "DB_PATH"))
+        self.assertTrue(callable(db.db_path))
+
+    def test_startup_log_reports_the_active_path(self):
+        support.ensure_application()
+        from elenvind import db
+
+        log = Path(support.WORKSPACE.log).read_text(encoding="utf-8")
+        self.assertIn(str(db.db_path()), log)
 
 
 class Backup(unittest.TestCase):
@@ -78,7 +118,7 @@ class Backup(unittest.TestCase):
 
         restored = Path(support.WORKSPACE.root) / "restored.db"
         shutil.copyfile(backup, restored)            # 模拟"把备份放回去"
-        original = db.DB_PATH
+        original = db.db_path()
         try:
             db.configure(restored)
             self.assertIsNotNone(db.get_user_by_email("restore@example.test"))   # 读
@@ -244,7 +284,7 @@ class DeploymentFiles(unittest.TestCase):
         text = NGINX_EXAMPLE.read_text(encoding="utf-8")
         line = next((item for item in text.splitlines() if item.strip().startswith(name)),
                     None)
-        self.assertIsNotNone(line, f"{name} is missing from deploy/nginx.conf.example")
+        self.assertIsNotNone(line, f"{name} is missing from ops/nginx.conf.example")
         return line.split(None, 1)[1].strip().rstrip(";")
 
     @staticmethod
@@ -263,7 +303,7 @@ class DeploymentFiles(unittest.TestCase):
         """
         import tomllib
 
-        with open(PROJECT_ROOT / "config.example.toml", "rb") as handle:
+        with open(PROJECT_ROOT / "ops" / "config.example.toml", "rb") as handle:
             example = tomllib.load(handle)
         application_limit = int(example["max_body_size"])
         nginx_limit = self._to_bytes(self._nginx_directive("client_max_body_size"))
@@ -298,10 +338,10 @@ class DeploymentFiles(unittest.TestCase):
             self.assertIn(expected, paths)
 
     def test_shipped_default_database_lives_in_the_writable_subdirectory(self):
-        """`config.example.toml` 的默认库路径必须落在 systemd 允许写的目录里。"""
+        """`ops/config.example.toml` 的默认库路径必须落在 systemd 允许写的目录里。"""
         import tomllib
 
-        with open(PROJECT_ROOT / "config.example.toml", "rb") as handle:
+        with open(PROJECT_ROOT / "ops" / "config.example.toml", "rb") as handle:
             example = tomllib.load(handle)
         self.assertTrue(str(example.get("database", "")).startswith("data/"),
                         f"database must default to data/: {example.get('database')!r}")

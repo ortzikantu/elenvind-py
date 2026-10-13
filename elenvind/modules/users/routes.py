@@ -1,9 +1,9 @@
 """Users 模块：个人中心（资料查看/修改、改密、删号）。
 
-认证由 Core 完成（`auth="required"`）；密码与会话操作由 Core 提供：
-- 改密 -> `db.user.update_user_password` + `core.security.hash_password`，
-  随后 `core.session.invalidate_user_sessions()` 强制全端重登（Core 语义）；
-- 删号 -> 逻辑删除 + 清理全部会话。
+认证由 Core 完成（`auth="required"`）；密码与会话操作走 db 层的**单事务**组合原语：
+- 改密 -> `db.user.change_password_and_logout_all()`（更新哈希 + 作废该账号全部会话，
+  同一个写事务），随后模块调用 `request.invalidate_session_cookie()` 清掉浏览器 Cookie；
+- 删号 -> `db.user.delete_user_account()`（清登录流水 + 逻辑删除 + 作废会话，同一个写事务）。
 本模块不写任何 session cookie / CSRF / 密码逻辑。
 """
 from __future__ import annotations

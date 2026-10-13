@@ -24,27 +24,9 @@ logger = logging.getLogger(__name__)
 RETENTION_DAYS = 30
 #: 注册尝试流水的保留期（天）。与登录流水**分开**命名：注册限流窗口只有
 #: 一小时，留 7 天足够排查。历史上两个用途共用一个模块级 `RETENTION_DAYS`，
-#: 且第 209 行又把 30 就地覆盖成 7 —— 结果是"运行期清理按 7 天、启动清理按
+#: 那个常量后来又被就地覆盖成 7 —— 结果是"运行期清理按 7 天、启动清理按
 #: 30 天"的隐形不一致（同名常量有两个值）。
 REGISTER_RETENTION_DAYS = 7
-
-
-def record_login_attempt(email: str, ip: str, success: bool):
-    """记录一次登录尝试（成败都记，成功记录用于审计）。
-
-    提交后做一次机会式清理（每小时最多一次，见 `db.maintenance`）：
-    登录失败是攻击者最容易制造的行增长来源，只靠启动清理在长跑进程上
-    会让表无限膨胀。
-
-    `prune()` 必须在 `write_tx()` 块**之外**调用：它自己也要写（取同一把
-    flock），嵌套会立刻触发重入守卫（否则就是自死锁）。
-    """
-    with write_tx() as conn:
-        conn.execute(
-            "INSERT INTO login_attempts (email, ip, attempted_at, success) VALUES (?, ?, ?, ?)",
-            (email, ip, time.time(), 1 if success else 0)
-        )
-    prune("login_attempts", "attempted_at", RETENTION_DAYS)
 
 
 #: 渐进 backoff 的默认参数（模块层可通过参数覆盖）

@@ -1,6 +1,6 @@
 # Elenvind 反向代理示例（Nginx）
 #
-#   sudo cp deploy/nginx.conf.example /etc/nginx/conf.d/elenvind.conf
+#   sudo cp ops/nginx.conf.example /etc/nginx/conf.d/elenvind.conf
 #   sudo nginx -t && sudo systemctl reload nginx
 #
 # 这份配置不是"可选优化"，而是生产必需：

@@ -1,4 +1,4 @@
-"""pages 模块：自定义页面（`custom_pages/*.md`）与主题偏好入口。
+"""pages 模块：自定义页面（`custom/*.md`）与主题偏好入口。
 
 公开入口：
 - `logic`：扫描/缓存 `custom_pages_dir` 下的 Markdown，提供 `get_page(slug)`；

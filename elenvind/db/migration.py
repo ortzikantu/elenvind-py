@@ -246,8 +246,9 @@ def _migrate_to_4(conn):
 
     两个性能问题（都是全表扫描，而其中一条每次登录都跑）：
 
-    1. `session.user_id` 没有索引 —— `delete_user_sessions()` 是
-       `DELETE FROM session WHERE user_id = ?`，每次登录轮换都会全表扫描。
+    1. `session.user_id` 没有索引 —— "按 user_id 删除会话"
+       （`DELETE FROM session WHERE user_id = ?`）每次登录轮换都会跑，
+       没有索引就是全表扫描。
 
     2. `user.email` 的隐式 UNIQUE 索引是 **BINARY** 排序规则，而查询写的是
        `WHERE email = ? COLLATE NOCASE` —— 排序规则不匹配，索引用不上，
@@ -280,9 +281,9 @@ def _migrate_to_4(conn):
 def _migrate_to_5(conn):
     """v5：为"全站失败计数"补索引。
 
-    `count_global_recent_failures()` 按 `attempted_at` 过滤、不带 email/ip
-    条件，而 v4 的两个索引都以 email/ip 为前导列，因此它会退化成全表扫描 ——
-    每个 POST /login 都会跑一次。这里补一个单纯的时间索引。
+    "全站失败计数"（`reserve_login_attempt` 的 global 闸门：按 `attempted_at`
+    过滤、不带 email/ip 条件）而 v4 的两个索引都以 email/ip 为前导列，因此它
+    会退化成全表扫描 —— 每个 POST /login 都会跑一次。这里补一个单纯的时间索引。
     """
     conn.execute("CREATE INDEX IF NOT EXISTS idx_login_attempts_time "
                  "ON login_attempts(attempted_at)")
